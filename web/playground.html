@@ -233,6 +233,27 @@
   }
   .save-status.success { color: var(--success); }
   .save-status.error { color: var(--danger); }
+
+  .write-token-prompt {
+    display: none; flex-direction: column; gap: 8px;
+    padding: 10px; border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--warning) 8%, transparent);
+  }
+  .write-token-prompt.visible { display: flex; }
+  .write-token-prompt-hint {
+    font-size: 11px; color: var(--text-mid); line-height: 1.4;
+  }
+  .write-token-prompt-row {
+    display: flex; align-items: center; gap: 8px;
+  }
+  .write-token-prompt-row input[type="password"] {
+    flex: 1; background: var(--glass-bg); border: 1px solid var(--glass-border);
+    font-family: var(--font-mono); font-size: 12px; color: var(--text);
+    padding: 7px 10px; border-radius: var(--radius-sm);
+    outline: none; transition: border-color 0.2s;
+  }
+  .write-token-prompt-row input[type="password"]:focus { border-color: var(--accent); }
   .save-meta {
     display: flex; flex-direction: column; gap: 8px;
     padding: 10px; border: 1px dashed var(--warning);
@@ -331,6 +352,13 @@
       <div class="option-row">
         <input type="checkbox" id="saveOverwrite">
         <label for="saveOverwrite">Overwrite if exists</label>
+      </div>
+      <div class="write-token-prompt" id="writeTokenPrompt">
+        <div class="write-token-prompt-hint">This server requires a write token to save pages. Enter it below to retry.</div>
+        <div class="write-token-prompt-row">
+          <input type="password" id="writeTokenInput" placeholder="Write token..." autocomplete="off">
+          <button class="btn-save" id="writeTokenRetry">Retry Save</button>
+        </div>
       </div>
       <div class="save-status" id="saveStatus"></div>
     </div>
@@ -585,21 +613,29 @@ Suggested palette: #0a0a0f background, #e0e0e8 text, #00d4ff accent.
     showSaveSection(html);
   });
 
-  // ── Save Page ──
-  saveBtn.addEventListener('click', function() {
-    var html = previewInput.value.trim();
-    var filename = saveFilename.value.trim();
-    if (!html) { saveStatus.textContent = 'No HTML to save'; saveStatus.className = 'save-status error'; return; }
-    if (!filename) { saveStatus.textContent = 'Enter a filename'; saveStatus.className = 'save-status error'; return; }
+  // ── Write Token ──
+  var WRITE_TOKEN_KEY = 'tr-engine-write-token';
+  var writeTokenPrompt = document.getElementById('writeTokenPrompt');
+  var writeTokenInput = document.getElementById('writeTokenInput');
+  var writeTokenRetry = document.getElementById('writeTokenRetry');
 
-    // Inject meta tags if the HTML was missing them
+  function getWriteToken() {
+    return localStorage.getItem(WRITE_TOKEN_KEY) || '';
+  }
+
+  // ── Save Page ──
+  function prepareSaveHtml() {
+    var html = previewInput.value.trim();
+    if (!html) { saveStatus.textContent = 'No HTML to save'; saveStatus.className = 'save-status error'; return null; }
+    var filename = saveFilename.value.trim();
+    if (!filename) { saveStatus.textContent = 'Enter a filename'; saveStatus.className = 'save-status error'; return null; }
+
     if (_needsMetaInjection) {
       var title = saveTitle.value.trim();
-      if (!title) { saveStatus.textContent = 'Enter a page title'; saveStatus.className = 'save-status error'; saveTitle.focus(); return; }
+      if (!title) { saveStatus.textContent = 'Enter a page title'; saveStatus.className = 'save-status error'; saveTitle.focus(); return null; }
       var desc = saveDesc.value.trim();
       var metaTags = '\n<meta name="card-title" content="' + title.replace(/"/g, '&quot;') + '">';
       if (desc) metaTags += '\n<meta name="card-description" content="' + desc.replace(/"/g, '&quot;') + '">';
-      // Insert after <head> or after first <meta> tag
       if (html.match(/<head[^>]*>/i)) {
         html = html.replace(/(<head[^>]*>)/i, '$1' + metaTags);
       } else {
@@ -608,27 +644,43 @@ Suggested palette: #0a0a0f background, #e0e0e8 text, #00d4ff accent.
     }
 
     if (!/<meta\s+name="card-title"\s+content="[^"]*"/.test(html)) {
-      saveStatus.textContent = 'HTML must contain a card-title meta tag'; saveStatus.className = 'save-status error'; return;
+      saveStatus.textContent = 'HTML must contain a card-title meta tag'; saveStatus.className = 'save-status error'; return null;
     }
 
+    return { html: html, filename: filename };
+  }
+
+  function doSave(payload) {
     saveBtn.disabled = true;
+    writeTokenRetry.disabled = true;
     saveStatus.textContent = 'Saving...';
     saveStatus.className = 'save-status';
 
+    var headers = { 'Content-Type': 'application/json' };
+    var wt = getWriteToken();
+    if (wt) headers['Authorization'] = 'Bearer ' + wt;
+
     fetch('/api/v1/pages', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename: filename, html: html, overwrite: saveOverwrite.checked })
+      headers: headers,
+      body: JSON.stringify({ filename: payload.filename, html: payload.html, overwrite: saveOverwrite.checked })
     })
     .then(function(resp) {
       return resp.json().then(function(data) { return { ok: resp.ok, status: resp.status, data: data }; });
     })
     .then(function(result) {
       saveBtn.disabled = false;
+      writeTokenRetry.disabled = false;
       if (result.ok) {
         saveStatus.textContent = 'Saved to ' + result.data.path;
         saveStatus.className = 'save-status success';
+        writeTokenPrompt.classList.remove('visible');
         if (window.trTheme && window.trTheme.invalidateNavCache) window.trTheme.invalidateNavCache();
+      } else if (result.status === 401 || result.status === 403) {
+        writeTokenPrompt.classList.add('visible');
+        writeTokenInput.focus();
+        saveStatus.textContent = 'Write token required';
+        saveStatus.className = 'save-status error';
       } else {
         var msg = result.data.error || 'Save failed';
         if (result.data.detail) msg += ' — ' + result.data.detail;
@@ -638,9 +690,28 @@ Suggested palette: #0a0a0f background, #e0e0e8 text, #00d4ff accent.
     })
     .catch(function(err) {
       saveBtn.disabled = false;
+      writeTokenRetry.disabled = false;
       saveStatus.textContent = 'Network error: ' + err.message;
       saveStatus.className = 'save-status error';
     });
+  }
+
+  saveBtn.addEventListener('click', function() {
+    var payload = prepareSaveHtml();
+    if (!payload) return;
+    doSave(payload);
+  });
+
+  writeTokenRetry.addEventListener('click', function() {
+    var val = writeTokenInput.value.trim();
+    if (val) localStorage.setItem(WRITE_TOKEN_KEY, val);
+    var payload = prepareSaveHtml();
+    if (!payload) return;
+    doSave(payload);
+  });
+
+  writeTokenInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') writeTokenRetry.click();
   });
 
   // Hide save section when mode changes to standalone

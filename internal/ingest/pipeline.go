@@ -62,6 +62,9 @@ type Pipeline struct {
 	transcribeIncludeTGs map[string]bool // allowlist: "tgid" or "systemID:tgid"
 	transcribeExcludeTGs map[string]bool // denylist: "tgid" or "systemID:tgid"
 
+	// Transcription backfill manager (optional, nil if transcription not configured)
+	backfill *BackfillManager
+
 	// File watcher (optional, nil if WATCH_DIR not set)
 	watcher *FileWatcher
 
@@ -293,6 +296,10 @@ func (p *Pipeline) Start(ctx context.Context) error {
 	go p.affiliationEvictionLoop()
 	if p.transcriber != nil {
 		p.transcriber.Start()
+	}
+	if p.transcriber != nil {
+		p.backfill = NewBackfillManager(p.ctx, p.db, p.transcriber, p.log)
+		p.backfill.Start()
 	}
 	if p.audioRouter != nil {
 		go p.audioRouter.Run(ctx)
@@ -797,6 +804,55 @@ func (p *Pipeline) MaintenanceStatus() *api.MaintenanceStatusData {
 // Returns the results, or an error if maintenance is already running.
 func (p *Pipeline) RunMaintenance(ctx context.Context) (*api.MaintenanceRunData, error) {
 	return p.runMaintenanceWithResult()
+}
+
+func (p *Pipeline) SubmitBackfill(ctx context.Context, filters api.BackfillFiltersData) (int, int, int, error) {
+	if p.backfill == nil {
+		return 0, 0, 0, fmt.Errorf("transcription not configured")
+	}
+	return p.backfill.Submit(ctx, BackfillFilters{
+		SystemID:  filters.SystemID,
+		Tgids:     filters.Tgids,
+		StartTime: filters.StartTime,
+		EndTime:   filters.EndTime,
+	})
+}
+
+func (p *Pipeline) BackfillStatus() *api.BackfillStatusData {
+	if p.backfill == nil {
+		return nil
+	}
+	s := p.backfill.Status()
+	result := &api.BackfillStatusData{
+		Queued: make([]api.BackfillJobData, 0, len(s.Queued)),
+	}
+	if s.Active != nil {
+		result.Active = &api.BackfillJobData{
+			JobID:     s.Active.JobID,
+			Filters:   api.BackfillFiltersData{SystemID: s.Active.Filters.SystemID, Tgids: s.Active.Filters.Tgids, StartTime: s.Active.Filters.StartTime, EndTime: s.Active.Filters.EndTime},
+			Total:     s.Active.Total,
+			Completed: s.Active.Completed,
+			Failed:    s.Active.Failed,
+			StartedAt: s.Active.StartedAt,
+			CreatedAt: s.Active.CreatedAt,
+		}
+	}
+	for _, q := range s.Queued {
+		result.Queued = append(result.Queued, api.BackfillJobData{
+			JobID:     q.JobID,
+			Filters:   api.BackfillFiltersData{SystemID: q.Filters.SystemID, Tgids: q.Filters.Tgids, StartTime: q.Filters.StartTime, EndTime: q.Filters.EndTime},
+			Total:     q.Total,
+			CreatedAt: q.CreatedAt,
+		})
+	}
+	return result
+}
+
+func (p *Pipeline) CancelBackfill(id int) bool {
+	if p.backfill == nil {
+		return false
+	}
+	return p.backfill.Cancel(id)
 }
 
 // talkgroupStatsLoop refreshes cached talkgroup stats on two cadences:

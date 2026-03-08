@@ -52,6 +52,15 @@ type LiveDataSource interface {
 	// RunMaintenance triggers an immediate maintenance run.
 	// Returns the results, or an error if maintenance is already running.
 	RunMaintenance(ctx context.Context) (*MaintenanceRunData, error)
+
+	// SubmitBackfill queues a transcription backfill job.
+	SubmitBackfill(ctx context.Context, filters BackfillFiltersData) (jobID, position, total int, err error)
+
+	// BackfillStatus returns the active and queued backfill jobs.
+	BackfillStatus() *BackfillStatusData
+
+	// CancelBackfill cancels a backfill job by ID. If id <= 0, cancels all.
+	CancelBackfill(id int) bool
 }
 
 // CallUploader processes an uploaded call (audio + metadata).
@@ -217,6 +226,31 @@ type MaintenanceRunData struct {
 type DecimationResult struct {
 	Phase1Deleted int64 `json:"phase1_deleted"`
 	Phase2Deleted int64 `json:"phase2_deleted"`
+}
+
+// BackfillFiltersData contains the user-provided filters for a backfill job.
+type BackfillFiltersData struct {
+	SystemID  *int       `json:"system_id,omitempty"`
+	Tgids     []int      `json:"tgids,omitempty"`
+	StartTime *time.Time `json:"start_time,omitempty"`
+	EndTime   *time.Time `json:"end_time,omitempty"`
+}
+
+// BackfillStatusData reports the state of the backfill manager.
+type BackfillStatusData struct {
+	Active *BackfillJobData  `json:"active"`
+	Queued []BackfillJobData `json:"queued"`
+}
+
+// BackfillJobData reports the state of a single backfill job.
+type BackfillJobData struct {
+	JobID     int                 `json:"job_id"`
+	Filters   BackfillFiltersData `json:"filters"`
+	Total     int                 `json:"total"`
+	Completed int64               `json:"completed,omitempty"`
+	Failed    int64               `json:"failed,omitempty"`
+	StartedAt *time.Time          `json:"started_at,omitempty"`
+	CreatedAt time.Time           `json:"created_at"`
 }
 
 // AudioStreamer provides live audio streaming capabilities.

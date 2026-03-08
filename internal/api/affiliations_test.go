@@ -27,6 +27,9 @@ func (m *mockLiveData) TranscriptionQueueStats() *TranscriptionQueueStatsData { 
 func (m *mockLiveData) IngestMetrics() *IngestMetricsData                     { return nil }
 func (m *mockLiveData) MaintenanceStatus() *MaintenanceStatusData             { return nil }
 func (m *mockLiveData) RunMaintenance(context.Context) (*MaintenanceRunData, error) { return nil, nil }
+func (m *mockLiveData) SubmitBackfill(context.Context, BackfillFiltersData) (int, int, int, error) { return 0, 0, 0, nil }
+func (m *mockLiveData) BackfillStatus() *BackfillStatusData { return nil }
+func (m *mockLiveData) CancelBackfill(int) bool { return false }
 
 // affiliationsResponse matches the JSON shape returned by ListAffiliations.
 type affiliationsResponse struct {

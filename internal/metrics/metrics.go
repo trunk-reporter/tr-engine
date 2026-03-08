@@ -1,6 +1,9 @@
 package metrics
 
 import (
+	"bufio"
+	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -112,6 +115,15 @@ func (w *statusWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack implements http.Hijacker by delegating to the wrapped writer.
+// Required for WebSocket upgrade through the metrics middleware.
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("wrapped ResponseWriter does not implement http.Hijacker")
 }
 
 // Unwrap supports http.ResponseController and middleware that check for

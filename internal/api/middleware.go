@@ -41,7 +41,15 @@ func Logger(log zerolog.Logger) func(http.Handler) http.Handler {
 				Dur("duration_ms", dur).
 				Msg("request")
 		})
-		return h(accessLog(next))
+		return h(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Skip access log wrapping for WebSocket endpoints — hlog's
+			// statusWriter doesn't implement http.Hijacker, breaking upgrades.
+			if strings.HasSuffix(r.URL.Path, "/audio/live") {
+				next.ServeHTTP(w, r)
+				return
+			}
+			accessLog(next).ServeHTTP(w, r)
+		}))
 	}
 }
 

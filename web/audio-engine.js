@@ -13,12 +13,13 @@ class AudioEngine {
     this.audioCtx = null;
     this.masterGain = null;
     this.masterCompressor = null;
-    this.tgNodes = new Map(); // tgid -> { worklet, gain, compressor, compressorEnabled, muted, lastActivity }
+    this.tgNodes = new Map(); // tgid -> { worklet, gain, compressor, panner, compressorEnabled, muted, lastActivity }
     this.reconnectDelay = 1000;
     this.lastSubscription = null;
     this.listeners = {};
     this._intentionalClose = false;
     this._serverAudioFormat = null; // set by server 'config' message; null = auto-detect
+    this._autoPan = true; // auto-distribute channels across stereo field
   }
 
   // Event emitter
@@ -42,7 +43,16 @@ class AudioEngine {
 
   async start() {
     this.audioCtx = new AudioContext({ sampleRate: 48000 });
-    await this.audioCtx.audioWorklet.addModule('audio-worklet.js');
+
+    // AudioWorklet requires a secure context (HTTPS or localhost).
+    // Fall back to ScriptProcessorNode on insecure origins (plain HTTP).
+    if (this.audioCtx.audioWorklet) {
+      await this.audioCtx.audioWorklet.addModule('audio-worklet.js');
+      this._useWorklet = true;
+    } else {
+      console.warn('AudioWorklet unavailable (insecure context). Using ScriptProcessor fallback — serve over HTTPS for best performance.');
+      this._useWorklet = false;
+    }
 
     // Master chain: compressor -> gain -> destination
     this.masterCompressor = this.audioCtx.createDynamicsCompressor();
@@ -108,6 +118,10 @@ class AudioEngine {
     if (nodes) {
       nodes.muted = muted;
       nodes.gain.gain.value = muted ? 0 : (this._loadSetting('vol_' + tgid) ?? 1.0);
+      if (!muted && this._autoPan && !nodes._panAssigned) {
+        nodes.panner.pan.value = this._panForTgid(tgid);
+        nodes._panAssigned = true;
+      }
     }
   }
 
@@ -135,15 +149,54 @@ class AudioEngine {
     this._saveSetting('comp_' + tgid, enabled);
   }
 
+  setPan(tgid, value) {
+    var nodes = this.tgNodes.get(tgid);
+    if (nodes && nodes.panner) nodes.panner.pan.value = Math.max(-1, Math.min(1, value));
+    this._saveSetting('pan_' + tgid, value);
+  }
+
+  getPan(tgid) {
+    var nodes = this.tgNodes.get(tgid);
+    return nodes && nodes.panner ? nodes.panner.pan.value : 0;
+  }
+
+  setAutoPan(enabled) {
+    this._autoPan = enabled;
+    this._saveSetting('auto_pan', enabled);
+    if (enabled) {
+      // Assign pan to all unmuted TGs that don't have one yet
+      var self = this;
+      this.tgNodes.forEach(function(nodes, tgid) {
+        if (!nodes.muted && !nodes._panAssigned) {
+          nodes.panner.pan.value = self._panForTgid(tgid);
+          nodes._panAssigned = true;
+        }
+      });
+    }
+  }
+
+  getAutoPan() {
+    return this._autoPan;
+  }
+
+  // Deterministic pan position from tgid — always the same, never moves
+  _panForTgid(tgid) {
+    // Hash tgid to spread across -0.8..0.8
+    var h = ((tgid * 2654435761) >>> 0) % 10000;
+    return -0.8 + (h / 10000) * 1.6;
+  }
+
   getActiveTGs() {
     var result = [];
     this.tgNodes.forEach(function (nodes, tgid) {
       result.push({
         tgid: tgid,
+        systemId: nodes.systemId || 0,
         volume: nodes.gain.gain.value,
         muted: !!nodes.muted,
         compressorEnabled: nodes.compressorEnabled,
         lastActivity: nodes.lastActivity,
+        pan: nodes.panner ? nodes.panner.pan.value : 0,
       });
     });
     return result;
@@ -158,7 +211,7 @@ class AudioEngine {
   _connect() {
     var self = this;
     var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    var token = window._authToken || '';
+    var token = (window.trAuth && window.trAuth.getToken()) || window._authToken || '';
     var url = protocol + '//' + location.host + this.wsPath + '?token=' + encodeURIComponent(token);
 
     this.ws = new WebSocket(url);
@@ -230,21 +283,28 @@ class AudioEngine {
     var audioLen = audioData.byteLength;
 
     if (!this.tgNodes.has(tgid)) {
-      this._createTG(tgid);
+      this._createTG(tgid, systemId);
+    } else {
+      // Update systemId on existing entry (defensive — shouldn't change)
+      var existing = this.tgNodes.get(tgid);
+      if (existing) existing.systemId = systemId;
     }
 
     // Determine format: use server-sent config if available, otherwise auto-detect.
-    // PCM frames are 320+ bytes (160+ int16 samples at 8kHz/20ms),
+    // PCM frames must be even-length (int16 pairs) and at least 20 bytes.
     // Opus frames are typically 10-80 bytes after compression.
+    // Default to PCM for ambiguous small frames to avoid mis-detecting
+    // trailing PCM fragments as Opus (which could corrupt the sample rate).
     var format = this._serverAudioFormat;
     if (!format) {
-      format = (audioLen >= 160) ? 'pcm' : 'opus';
+      // Only treat as Opus if very small AND odd-length (PCM is always even)
+      format = (audioLen < 120 && audioLen % 2 !== 0) ? 'opus' : 'pcm';
     }
 
-    if (format === 'pcm') {
+    if (format === 'pcm' && audioLen >= 2) {
       var pcmData = new Int16Array(audioData);
       this._feedPCM(tgid, pcmData, 8000);
-    } else if (audioLen > 0) {
+    } else if (format === 'opus' && audioLen > 0) {
       this._decodeOpus(tgid, new Uint8Array(audioData));
     }
   }
@@ -314,10 +374,15 @@ class AudioEngine {
     }
   }
 
-  _createTG(tgid) {
-    var worklet = new AudioWorkletNode(this.audioCtx, 'radio-audio-processor', {
-      outputChannelCount: [1],
-    });
+  _createTG(tgid, systemId) {
+    var worklet;
+    if (this._useWorklet) {
+      worklet = new AudioWorkletNode(this.audioCtx, 'radio-audio-processor', {
+        outputChannelCount: [1],
+      });
+    } else {
+      worklet = this._createScriptProcessorShim();
+    }
 
     var compressor = this.audioCtx.createDynamicsCompressor();
     compressor.threshold.value = -20;
@@ -326,7 +391,10 @@ class AudioEngine {
     compressor.attack.value = 0.003;
     compressor.release.value = 0.15;
 
+    var panner = this.audioCtx.createStereoPanner();
+
     var gain = this.audioCtx.createGain();
+    gain.gain.value = 0; // starts muted; setMute(tgid, false) enables
 
     // Load persisted settings
     var savedVol = this._loadSetting('vol_' + tgid);
@@ -336,21 +404,130 @@ class AudioEngine {
     var compEnabled = savedComp === true;
     if (compEnabled) compressor.ratio.value = 3;
 
-    // Chain: worklet -> compressor -> gain -> masterCompressor
+    var savedPan = this._loadSetting('pan_' + tgid);
+
+    // Chain: worklet -> compressor -> panner -> gain -> masterCompressor
     worklet.connect(compressor);
-    compressor.connect(gain);
+    compressor.connect(panner);
+    panner.connect(gain);
     gain.connect(this.masterCompressor);
 
     this.tgNodes.set(tgid, {
       worklet: worklet,
       compressor: compressor,
+      panner: panner,
       gain: gain,
       compressorEnabled: compEnabled,
-      muted: false,
+      muted: true,
       lastActivity: Date.now(),
+      systemId: systemId || 0,
     });
 
-    this.emit('tg_created', { tgid: tgid });
+    // Pan: deterministic position from tgid (assigned on unmute via setMute).
+    // For manual pan, restore saved position now.
+    if (!this._autoPan && savedPan !== null) {
+      panner.pan.value = savedPan;
+    }
+
+    this.emit('tg_created', { tgid: tgid, systemId: systemId || 0 });
+  }
+
+  // ScriptProcessorNode fallback for insecure contexts (no AudioWorklet).
+  // Returns an object with the same interface as AudioWorkletNode: .port.postMessage(), .connect(), .disconnect()
+  _createScriptProcessorShim() {
+    var ctx = this.audioCtx;
+    var bufferSize = 2048;
+    var scriptNode = ctx.createScriptProcessor(bufferSize, 0, 1);
+
+    // Ring buffer (mirrors audio-worklet.js logic)
+    var ringBuf = new Float32Array(16384);
+    var writePos = 0;
+    var readPos = 0;
+    var buffered = 0;
+    var inputSampleRate = 8000;
+    var resampleAccum = 0;
+    var playing = false;
+    var silentFrames = 0;
+
+    function enqueueSamples(int16Array, sr) {
+      if (sr && sr !== inputSampleRate) {
+        inputSampleRate = sr;
+      }
+      for (var i = 0; i < int16Array.length; i++) {
+        ringBuf[writePos] = int16Array[i] / 32768.0;
+        writePos = (writePos + 1) % ringBuf.length;
+        buffered = Math.min(buffered + 1, ringBuf.length);
+      }
+      var maxSamples = Math.floor(inputSampleRate * 1.5);
+      var targetSamples = Math.floor(inputSampleRate * 0.5);
+      if (buffered > maxSamples) {
+        var skip = buffered - targetSamples;
+        readPos = (readPos + skip) % ringBuf.length;
+        buffered -= skip;
+      }
+    }
+
+    scriptNode.onaudioprocess = function (e) {
+      var output = e.outputBuffer.getChannelData(0);
+      var outRate = e.outputBuffer.sampleRate;
+
+      if (!playing) {
+        var startThreshold = Math.floor(inputSampleRate * 0.3);
+        if (buffered >= startThreshold) {
+          playing = true;
+          silentFrames = 0;
+          resampleAccum = 0;
+        } else {
+          for (var i = 0; i < output.length; i++) output[i] = 0;
+          return;
+        }
+      }
+
+      var ratio = inputSampleRate / outRate;
+      var hadData = false;
+
+      for (var i = 0; i < output.length; i++) {
+        if (buffered > 0) {
+          hadData = true;
+          var idx0 = readPos;
+          var idx1 = (readPos + 1) % ringBuf.length;
+          var frac = resampleAccum;
+          output[i] = ringBuf[idx0] * (1 - frac) + (buffered > 1 ? ringBuf[idx1] : ringBuf[idx0]) * frac;
+          resampleAccum += ratio;
+          while (resampleAccum >= 1.0 && buffered > 0) {
+            resampleAccum -= 1.0;
+            readPos = (readPos + 1) % ringBuf.length;
+            buffered--;
+          }
+        } else {
+          output[i] = 0;
+        }
+      }
+
+      if (!hadData) {
+        silentFrames++;
+        if (silentFrames > 37) {
+          playing = false;
+          silentFrames = 0;
+        }
+      } else {
+        silentFrames = 0;
+      }
+    };
+
+    // Shim the AudioWorkletNode interface expected by the rest of the engine
+    var active = true;
+    scriptNode.port = {
+      postMessage: function (msg) {
+        if (msg.type === 'audio') {
+          enqueueSamples(msg.samples, msg.sampleRate);
+        } else if (msg.type === 'stop') {
+          active = false;
+        }
+      }
+    };
+
+    return scriptNode;
   }
 
   _removeTG(tgid) {
@@ -359,6 +536,7 @@ class AudioEngine {
     nodes.worklet.port.postMessage({ type: 'stop' });
     nodes.worklet.disconnect();
     nodes.compressor.disconnect();
+    if (nodes.panner) nodes.panner.disconnect();
     nodes.gain.disconnect();
     if (nodes.opusDecoder) {
       try { nodes.opusDecoder.close(); } catch (e) { /* ignore */ }
@@ -389,6 +567,9 @@ class AudioEngine {
   _loadSettings() {
     var masterVol = this._loadSetting('master_vol');
     if (masterVol !== null && this.masterGain) this.masterGain.gain.value = masterVol;
+
+    var autoPan = this._loadSetting('auto_pan');
+    if (autoPan !== null) this._autoPan = autoPan;
 
     var masterComp = this._loadSetting('master_comp');
     if (masterComp === false && this.masterCompressor) this.masterCompressor.ratio.value = 1;

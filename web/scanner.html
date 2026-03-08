@@ -635,6 +635,118 @@ body::after {
   cursor: pointer;
 }
 
+/* ── Live mode toggle ── */
+.live-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: 1px solid var(--text-faint);
+  color: var(--text-faint);
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+.live-toggle .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text-faint);
+  transition: background 0.2s;
+}
+.live-toggle.active {
+  border-color: var(--success);
+  color: var(--success);
+}
+.live-toggle.active .dot {
+  background: var(--success);
+  animation: pulse 1.5s infinite;
+}
+
+/* ── Active Streams Panel (live mode now-playing replacement) ── */
+.live-panel {
+  display: none;
+  padding: 12px 16px;
+  flex-direction: column;
+  gap: 10px;
+}
+.now-playing.live-mode .np-idle,
+.now-playing.live-mode .np-content { display: none; }
+.now-playing.live-mode .live-panel { display: flex; }
+
+.live-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.live-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--success);
+}
+.live-status {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.live-vol-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.live-vol-slider {
+  width: 100px; height: 4px;
+  -webkit-appearance: none; appearance: none;
+  background: var(--border); border-radius: 2px; outline: none;
+}
+.live-vol-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px; height: 16px;
+  background: var(--accent); border-radius: 50%; cursor: pointer;
+}
+.live-vol-slider::-moz-range-thumb {
+  width: 16px; height: 16px;
+  background: var(--accent); border-radius: 50%; cursor: pointer; border: none;
+}
+
+.live-streams {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 24px;
+}
+.live-stream-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: var(--radius-xs);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.live-stream-badge.muted { opacity: 0.35; }
+.live-stream-badge .badge-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--success);
+  flex-shrink: 0;
+}
+.live-stream-badge.muted .badge-dot { background: var(--text-faint); }
+.live-streams-empty {
+  font-size: 12px;
+  color: var(--text-faint);
+  font-style: italic;
+}
+
 /* ── Compact mode ── */
 body.compact .feed-item { padding: 5px 16px; min-height: 36px; gap: 8px; }
 body.compact .fi-play { width: 28px; height: 28px; font-size: 11px; }
@@ -716,6 +828,10 @@ body { overscroll-behavior-y: contain; }
     <span class="dot"></span>
     <span id="scanner-label">SCAN</span>
   </button>
+  <button class="live-toggle" id="live-toggle">
+    <span class="dot"></span>
+    <span id="live-label">LIVE</span>
+  </button>
   <button class="toolbar-btn" id="settings-btn" title="Settings">&#9881;</button>
 </div>
 
@@ -737,6 +853,19 @@ body { overscroll-behavior-y: contain; }
     </div>
     <div class="np-progress" id="np-progress">
       <div class="np-progress-fill" id="np-progress-fill"></div>
+    </div>
+  </div>
+  <div class="live-panel" id="live-panel">
+    <div class="live-header">
+      <span class="live-title">Active Streams</span>
+      <span class="live-status" id="live-status">connecting...</span>
+    </div>
+    <div class="live-vol-row">
+      <span>Vol</span>
+      <input type="range" class="live-vol-slider" id="live-vol" min="0" max="100" value="80">
+    </div>
+    <div class="live-streams" id="live-streams">
+      <span class="live-streams-empty">Waiting for audio streams...</span>
     </div>
   </div>
 </div>
@@ -2085,6 +2214,227 @@ async function init() {
 }
 
 init();
+</script>
+<script src="audio-engine.js"></script>
+<script>
+// ── Live Audio Mode ──
+(function() {
+  const liveToggle = document.getElementById('live-toggle');
+  const liveLabel = document.getElementById('live-label');
+  const livePanel = document.getElementById('live-panel');
+  const liveStreams = document.getElementById('live-streams');
+  const liveStatusEl = document.getElementById('live-status');
+  const liveVol = document.getElementById('live-vol');
+  const npEl = document.getElementById('now-playing');
+
+  let engine = null;
+  let liveActive = false;
+  const liveMutedTGs = new Set();
+
+  // Load persisted state
+  try {
+    const saved = JSON.parse(localStorage.getItem('scanner-live') || '{}');
+    if (saved.volume != null) liveVol.value = saved.volume;
+    if (Array.isArray(saved.muted)) saved.muted.forEach(function(t) { liveMutedTGs.add(t); });
+    if (saved.active === true) {
+      setTimeout(function() { if (!liveActive) toggleLive(); }, 500);
+    }
+  } catch (e) {}
+
+  function saveLiveState() {
+    try {
+      localStorage.setItem('scanner-live', JSON.stringify({
+        active: liveActive,
+        volume: parseInt(liveVol.value),
+        muted: Array.from(liveMutedTGs),
+      }));
+    } catch (e) {}
+  }
+
+  function getSelectedTgids() {
+    var tgids = [];
+    for (var ch of selectedChannels) {
+      var data = channels.get(ch);
+      if (data && data.tgid) tgids.push(data.tgid);
+    }
+    return tgids;
+  }
+
+  async function startLive() {
+    engine = new AudioEngine();
+
+    engine.on('status', function(s) {
+      if (s.connected) {
+        var count = s.active_streams || 0;
+        liveStatusEl.textContent = count > 0 ? count + ' streams' : 'connected';
+      } else {
+        liveStatusEl.textContent = 'reconnecting...';
+      }
+    });
+
+    engine.on('error', function() {
+      liveStatusEl.textContent = 'error';
+    });
+
+    engine.on('tg_created', function(ev) {
+      if (liveMutedTGs.has(ev.tgid)) {
+        engine.setMute(ev.tgid, true);
+      }
+      renderLiveStreams();
+    });
+
+    engine.on('tg_removed', function(ev) {
+      renderLiveStreams();
+    });
+
+    await engine.start();
+    engine.setMasterVolume(parseInt(liveVol.value) / 100);
+
+    var tgids = getSelectedTgids();
+    if (tgids.length > 0) {
+      engine.subscribe({ tgids: tgids });
+    } else {
+      engine.subscribe({});
+    }
+  }
+
+  function stopLive() {
+    if (engine) {
+      engine.stop();
+      engine = null;
+    }
+  }
+
+  function toggleLive() {
+    liveActive = !liveActive;
+
+    if (liveActive) {
+      // Disable recorded scanner mode
+      if (scannerActive) {
+        scannerActive = false;
+        scannerToggle.classList.remove('active');
+        scannerLabel.textContent = 'SCAN';
+        saveScannerState();
+      }
+      // Pause any recorded audio
+      audioEl.pause();
+
+      liveToggle.classList.add('active');
+      liveLabel.textContent = 'LIVE';
+      npEl.classList.add('live-mode');
+      startLive();
+    } else {
+      liveToggle.classList.remove('active');
+      liveLabel.textContent = 'LIVE';
+      npEl.classList.remove('live-mode');
+      stopLive();
+      updateNpIdleText();
+    }
+
+    saveLiveState();
+  }
+
+  liveToggle.addEventListener('click', toggleLive);
+
+  // When SCAN is toggled on, turn off LIVE
+  scannerToggle.addEventListener('click', function() {
+    if (liveActive && !scannerActive) {
+      // SCAN is about to become active — stop live
+      liveActive = false;
+      liveToggle.classList.remove('active');
+      liveLabel.textContent = 'LIVE';
+      npEl.classList.remove('live-mode');
+      stopLive();
+      saveLiveState();
+    }
+  }, true); // capture phase to run before the original handler
+
+  liveVol.addEventListener('input', function() {
+    if (engine) engine.setMasterVolume(parseInt(liveVol.value) / 100);
+    saveLiveState();
+  });
+
+  // Hook into channel selection changes to update live subscription
+  var _origOnChannelSelectionChanged = onChannelSelectionChanged;
+  window.onChannelSelectionChanged = function() {
+    _origOnChannelSelectionChanged();
+    if (engine && liveActive) {
+      var tgids = getSelectedTgids();
+      engine.subscribe(tgids.length > 0 ? { tgids: tgids } : {});
+    }
+  };
+
+  function renderLiveStreams() {
+    if (!engine) return;
+    var active = engine.getActiveTGs();
+
+    // Clear existing children safely
+    while (liveStreams.firstChild) liveStreams.removeChild(liveStreams.firstChild);
+
+    if (active.length === 0) {
+      var empty = document.createElement('span');
+      empty.className = 'live-streams-empty';
+      empty.textContent = 'Waiting for audio streams...';
+      liveStreams.appendChild(empty);
+      return;
+    }
+
+    for (var i = 0; i < active.length; i++) {
+      var tg = active[i];
+      var badge = document.createElement('span');
+      badge.className = 'live-stream-badge' + (tg.muted ? ' muted' : '');
+      badge.dataset.tgid = String(tg.tgid);
+
+      // Look up alpha tag from channel registry using systemId
+      var alpha = '';
+      if (tg.systemId) {
+        alpha = tgidToChannel.get(tgKey(tg.systemId, tg.tgid)) || '';
+      }
+      if (!alpha) {
+        // Fallback: scan all entries (in case systemId doesn't match)
+        for (var entry of tgidToChannel) {
+          if (entry[0].endsWith(':' + tg.tgid)) { alpha = entry[1]; break; }
+        }
+      }
+      if (!alpha) alpha = 'TG ' + tg.tgid;
+
+      var dot = document.createElement('span');
+      dot.className = 'badge-dot';
+      badge.appendChild(dot);
+      badge.appendChild(document.createTextNode(alpha));
+
+      (function(tgid) {
+        badge.addEventListener('click', function() {
+          if (liveMutedTGs.has(tgid)) {
+            liveMutedTGs.delete(tgid);
+            engine.setMute(tgid, false);
+          } else {
+            liveMutedTGs.add(tgid);
+            engine.setMute(tgid, true);
+          }
+          saveLiveState();
+          renderLiveStreams();
+        });
+      })(tg.tgid);
+
+      liveStreams.appendChild(badge);
+    }
+  }
+
+  // Periodic refresh of stream badges and status
+  setInterval(function() {
+    if (engine && liveActive) {
+      renderLiveStreams();
+      var active = engine.getActiveTGs();
+      var now = Date.now();
+      var liveCount = 0;
+      for (var i = 0; i < active.length; i++) {
+        if (now - active[i].lastActivity < 3000) liveCount++;
+      }
+      liveStatusEl.textContent = liveCount > 0 ? liveCount + ' streaming' : (active.length > 0 ? 'idle' : 'waiting...');
+    }
+  }, 2000);
+})();
 </script>
 <script src="theme-engine.js?v=2"></script>
 </body>

@@ -44,6 +44,11 @@ class AudioEngine {
   async start() {
     this.audioCtx = new AudioContext({ sampleRate: 48000 });
 
+    // Browsers suspend AudioContext until a user gesture triggers resume().
+    if (this.audioCtx.state === 'suspended') {
+      await this.audioCtx.resume();
+    }
+
     // AudioWorklet requires a secure context (HTTPS or localhost).
     // Fall back to ScriptProcessorNode on insecure origins (plain HTTP).
     if (this.audioCtx.audioWorklet) {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 var (
 	outputDir  = "/data/tr-engine/debug-reports"
 	listenAddr = ":8090"
+	webhookURL = ""
 	maxBody    = int64(1 << 20) // 1 MB
 )
 
@@ -48,12 +50,45 @@ func extractIP(r *http.Request) string {
 	return host
 }
 
+func notifyDiscord(ip, filename string, body []byte) {
+	if webhookURL == "" {
+		return
+	}
+
+	// Extract some summary fields from the report
+	var report map[string]interface{}
+	json.Unmarshal(body, &report)
+
+	sizeKB := float64(len(body)) / 1024
+	msg := fmt.Sprintf("<@139209424953802752> **Debug report received**\nFrom: `%s`\nFile: `%s`\nSize: %.1f KB", ip, filename, sizeKB)
+
+	if txCount, ok := report["transmissions"]; ok {
+		if arr, ok := txCount.([]interface{}); ok {
+			msg += fmt.Sprintf("\nTransmissions: %d", len(arr))
+		}
+	}
+	if ua, ok := report["user_agent"].(string); ok {
+		msg += fmt.Sprintf("\nUA: %s", ua)
+	}
+
+	payload, _ := json.Marshal(map[string]string{"content": msg})
+	resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		log.Printf("discord webhook error: %v", err)
+		return
+	}
+	resp.Body.Close()
+}
+
 func main() {
 	if dir := os.Getenv("DEBUG_REPORT_DIR"); dir != "" {
 		outputDir = dir
 	}
 	if addr := os.Getenv("LISTEN_ADDR"); addr != "" {
 		listenAddr = addr
+	}
+	if wh := os.Getenv("DISCORD_WEBHOOK_URL"); wh != "" {
+		webhookURL = wh
 	}
 
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -106,6 +141,7 @@ func main() {
 		}
 
 		log.Printf("saved report from %s → %s (%d bytes)", ip, filename, len(body))
+		go notifyDiscord(ip, filename, body)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"ok":true}`))
 	})

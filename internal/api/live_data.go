@@ -259,6 +259,7 @@ type AudioStreamer interface {
 	UpdateAudioFilter(ch <-chan audio.AudioFrame, filter audio.AudioFilter)
 	AudioStreamEnabled() bool
 	AudioStreamStatus() *AudioStreamStatusData
+	AudioJitterStats() map[string]audio.StreamJitterSnapshot
 }
 
 // AudioStreamStatusData reports the status of the live audio streaming subsystem.

@@ -38,6 +38,7 @@ func NewAudioStreamHandler(streamer AudioStreamer, maxClients int) *AudioStreamH
 // Routes registers audio stream routes on the given router.
 func (h *AudioStreamHandler) Routes(r chi.Router) {
 	r.Get("/audio/live", h.HandleStream)
+	r.Get("/audio/jitter", h.GetJitterStats)
 }
 
 // subscribeMsg is a client control message sent over the WebSocket.
@@ -188,4 +189,17 @@ func (h *AudioStreamHandler) HandleStream(w http.ResponseWriter, r *http.Request
 			}
 		}
 	}
+}
+
+// GetJitterStats returns per-stream audio jitter statistics.
+func (h *AudioStreamHandler) GetJitterStats(w http.ResponseWriter, r *http.Request) {
+	if h.streamer == nil || !h.streamer.AudioStreamEnabled() {
+		WriteError(w, http.StatusNotFound, "live audio streaming is not enabled")
+		return
+	}
+	stats := h.streamer.AudioJitterStats()
+	if stats == nil {
+		stats = make(map[string]audio.StreamJitterSnapshot)
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"streams": stats})
 }

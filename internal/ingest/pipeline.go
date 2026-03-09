@@ -440,6 +440,14 @@ func (p *Pipeline) AudioStreamStatus() *api.AudioStreamStatusData {
 	}
 }
 
+// AudioJitterStats returns per-stream jitter stats from the audio router.
+func (p *Pipeline) AudioJitterStats() map[string]audio.StreamJitterSnapshot {
+	if p.audioRouter == nil {
+		return nil
+	}
+	return p.audioRouter.GetJitterStats()
+}
+
 // AudioRouterInput returns the chunk input channel, or nil if streaming is disabled.
 func (p *Pipeline) AudioRouterInput() chan<- audio.AudioChunk {
 	if p.audioRouter == nil {

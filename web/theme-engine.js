@@ -221,10 +221,11 @@
 .eh-nav-dropdown {
   position: absolute; top: calc(100% + 10px); left: 0;
   min-width: 280px; max-width: 360px;
+  max-height: calc(100vh - 80px); overflow-y: auto;
   /* background: var(--glass-bg); border: 1px solid var(--glass-border); */
   background: color-mix(in srgb, var(--bg) 90%, transparent);
   border-radius: var(--radius-sm);
-  backdrop-filter: blur(72px); -webkit-backdrop-filter: blur(72px); 
+  backdrop-filter: blur(72px); -webkit-backdrop-filter: blur(72px);
   box-shadow: 0 4px 24px rgba(0,0,0,0.18);
   padding: 6px; z-index: 1000;
   opacity: 0; transform: translateY(-6px) scale(0.97);

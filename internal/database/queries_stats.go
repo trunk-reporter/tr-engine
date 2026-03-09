@@ -462,3 +462,135 @@ func (db *DB) GetDecodeRates(ctx context.Context, filter DecodeRateFilter) ([]De
 	}
 	return rates, rows.Err()
 }
+
+// RecorderUtilizationFilter specifies filters for recorder utilization bucketing.
+type RecorderUtilizationFilter struct {
+	Bucket     string // "hour" or "day"
+	Days       int    // lookback days (1–90)
+	SrcNum     *int
+	InstanceID *string
+}
+
+// RecorderUtilizationBucket represents one time bucket of recorder utilization.
+type RecorderUtilizationBucket struct {
+	Time         time.Time `json:"time"`
+	SrcNum       int       `json:"src_num"`
+	PctRecording float64   `json:"pct_recording"`
+	PctIdle      float64   `json:"pct_idle"`
+	PctAvailable float64   `json:"pct_available"`
+	PctIgnore    float64   `json:"pct_ignore"`
+	SampleCount  int       `json:"sample_count"`
+}
+
+// GetRecorderUtilization returns recorder utilization bucketed by hour or day.
+func (db *DB) GetRecorderUtilization(ctx context.Context, f RecorderUtilizationFilter) ([]RecorderUtilizationBucket, error) {
+	bucket := "hour"
+	if f.Bucket == "day" {
+		bucket = "day"
+	}
+	days := f.Days
+	if days < 1 {
+		days = 7
+	}
+
+	query := fmt.Sprintf(`
+		SELECT date_trunc('%s', "time") AS bucket,
+			src_num,
+			ROUND(AVG(CASE WHEN rec_state_type = 'RECORDING' THEN 1.0 ELSE 0.0 END) * 100, 1) AS pct_recording,
+			ROUND(AVG(CASE WHEN rec_state_type = 'IDLE'      THEN 1.0 ELSE 0.0 END) * 100, 1) AS pct_idle,
+			ROUND(AVG(CASE WHEN rec_state_type = 'AVAILABLE' THEN 1.0 ELSE 0.0 END) * 100, 1) AS pct_available,
+			ROUND(AVG(CASE WHEN rec_state_type = 'IGNORE'    THEN 1.0 ELSE 0.0 END) * 100, 1) AS pct_ignore,
+			COUNT(*) AS sample_count
+		FROM recorder_snapshots
+		WHERE "time" > now() - make_interval(days => $1)
+		  AND ($2::smallint IS NULL OR src_num = $2)
+		  AND ($3::text IS NULL OR instance_id = $3)
+		GROUP BY 1, src_num
+		ORDER BY 1, src_num
+	`, bucket)
+
+	rows, err := db.Pool.Query(ctx, query, days, f.SrcNum, f.InstanceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var buckets []RecorderUtilizationBucket
+	for rows.Next() {
+		var b RecorderUtilizationBucket
+		if err := rows.Scan(&b.Time, &b.SrcNum, &b.PctRecording, &b.PctIdle,
+			&b.PctAvailable, &b.PctIgnore, &b.SampleCount); err != nil {
+			return nil, err
+		}
+		buckets = append(buckets, b)
+	}
+	if buckets == nil {
+		buckets = []RecorderUtilizationBucket{}
+	}
+	return buckets, rows.Err()
+}
+
+// DecodeRateBucketFilter specifies filters for bucketed decode rate aggregation.
+type DecodeRateBucketFilter struct {
+	Bucket    string // "hour" or "day"
+	Days      int    // lookback days (1–90)
+	SystemIDs []int
+}
+
+// DecodeRateBucket represents one time bucket of decode rate aggregation.
+type DecodeRateBucket struct {
+	Time       time.Time `json:"time"`
+	SystemID   int       `json:"system_id"`
+	SystemName string    `json:"system_name"`
+	AvgRate    float64   `json:"avg_rate"`
+	MinRate    float64   `json:"min_rate"`
+	MaxRate    float64   `json:"max_rate"`
+	Samples    int       `json:"sample_count"`
+}
+
+// GetDecodeRateBuckets returns decode rates bucketed by hour or day.
+func (db *DB) GetDecodeRateBuckets(ctx context.Context, f DecodeRateBucketFilter) ([]DecodeRateBucket, error) {
+	bucket := "hour"
+	if f.Bucket == "day" {
+		bucket = "day"
+	}
+	days := f.Days
+	if days < 1 {
+		days = 7
+	}
+
+	query := fmt.Sprintf(`
+		SELECT date_trunc('%s', d."time") AS bucket,
+			d.system_id, COALESCE(s.name, d.sys_name, ''),
+			ROUND(AVG(d.decode_rate)::numeric, 1),
+			ROUND(MIN(d.decode_rate)::numeric, 1),
+			ROUND(MAX(d.decode_rate)::numeric, 1),
+			COUNT(*)
+		FROM decode_rates d
+		LEFT JOIN systems s ON s.system_id = d.system_id
+		WHERE d."time" > now() - make_interval(days => $1)
+		  AND ($2::int[] IS NULL OR d.system_id = ANY($2))
+		GROUP BY 1, d.system_id, COALESCE(s.name, d.sys_name, '')
+		ORDER BY 1, d.system_id
+	`, bucket)
+
+	rows, err := db.Pool.Query(ctx, query, days, pqIntArray(f.SystemIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var buckets []DecodeRateBucket
+	for rows.Next() {
+		var b DecodeRateBucket
+		if err := rows.Scan(&b.Time, &b.SystemID, &b.SystemName,
+			&b.AvgRate, &b.MinRate, &b.MaxRate, &b.Samples); err != nil {
+			return nil, err
+		}
+		buckets = append(buckets, b)
+	}
+	if buckets == nil {
+		buckets = []DecodeRateBucket{}
+	}
+	return buckets, rows.Err()
+}

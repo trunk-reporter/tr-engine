@@ -1,796 +1,691 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="card-title" content="Analytics">
-    <meta name="card-description" content="Historical activity charts and system metrics">
-    <title>Analytics — tr-engine</title>
-    <script src="auth.js?v=1"></script>
-    <script src="theme-config.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
-    <style>
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="auth.js?v=1"></script>
+  <meta name="card-title" content="Analytics">
+  <meta name="card-description" content="Recorder utilization and decode rate trends">
+  <meta name="card-order" content="8">
+  <title>Analytics — tr-engine</title>
 
-        body {
-            background: var(--bg);
-            color: var(--text);
-            font-family: var(--font-body);
-            line-height: 1.5;
-            min-height: 100vh;
-            padding-top: 72px;
-        }
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500;700&family=Outfit:wght@200;300;400;500;600;700;800;900&family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,600;1,9..144,300&family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&family=JetBrains+Mono:wght@300;400;500;600;700;800&family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400&family=Karla:wght@200;300;400;500&family=Syne:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Inter:wght@300;400;500;600;700;800&family=Roboto:wght@300;400;500;700&family=Roboto+Mono:wght@400;500;700&family=VT323&family=Share+Tech+Mono&family=Press+Start+2P&display=swap" rel="stylesheet">
 
-        .analytics-wrap {
-            max-width: 1440px;
-            margin: 0 auto;
-            padding: 24px 20px 60px;
-        }
+  <script src="theme-config.js"></script>
 
-        /* ── Page Header ── */
-        .page-header {
-            margin-bottom: 28px;
-        }
-        .page-header h1 {
-            font-family: var(--font-display);
-            font-size: 1.75rem;
-            font-weight: 700;
-            color: var(--text);
-            letter-spacing: -0.02em;
-        }
-        .page-header p {
-            color: var(--text-muted);
-            font-size: 0.875rem;
-            margin-top: 4px;
-        }
-        .page-header .timeframe {
-            display: inline-block;
-            background: var(--accent-dim);
-            color: var(--accent-light);
-            font-family: var(--font-mono);
-            font-size: 0.75rem;
-            padding: 2px 8px;
-            border-radius: var(--radius-sm);
-            margin-left: 6px;
-            vertical-align: middle;
-        }
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
-        /* ── Stat Cards ── */
-        .stat-row {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 14px;
-            margin-bottom: 28px;
-        }
-        .stat-card {
-            background: var(--bg-surface);
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            padding: 18px 20px;
-            transition: border-color 0.2s, box-shadow 0.2s;
-        }
-        .stat-card:hover {
-            border-color: var(--border-hover);
-            box-shadow: var(--shadow-panel-hover);
-        }
-        .stat-card .label {
-            font-size: 0.7rem;
-            font-family: var(--font-mono);
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-            color: var(--text-muted);
-            margin-bottom: 6px;
-        }
-        .stat-card .value {
-            font-family: var(--font-display);
-            font-size: 1.65rem;
-            font-weight: 700;
-            color: var(--text);
-            line-height: 1.1;
-        }
-        .stat-card .sub {
-            font-size: 0.75rem;
-            color: var(--text-faint);
-            margin-top: 4px;
-            font-family: var(--font-mono);
-        }
-        .stat-card .sub .up { color: var(--success); }
-        .stat-card .sub .dn { color: var(--danger); }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-body);
+      font-weight: var(--font-weight-body);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      transition: background 0.5s, color 0.4s;
+      -webkit-font-smoothing: antialiased;
+    }
 
-        /* ── Chart Grid ── */
-        .chart-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 18px;
-        }
-        .chart-grid .span-full { grid-column: 1 / -1; }
+    .analytics-wrap {
+      flex: 1;
+      padding: 80px 24px 40px;
+      max-width: 1400px;
+      margin: 0 auto;
+      width: 100%;
+    }
 
-        .chart-panel {
-            background: var(--bg-surface);
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            padding: 20px 22px 18px;
-            transition: border-color 0.2s, box-shadow 0.2s;
-            position: relative;
-            overflow: hidden;
-        }
-        .chart-panel:hover {
-            border-color: var(--border-hover);
-            box-shadow: var(--shadow-panel-hover);
-        }
-        .chart-panel h2 {
-            font-family: var(--font-display);
-            font-size: 0.95rem;
-            font-weight: 600;
-            color: var(--text);
-            margin-bottom: 4px;
-        }
-        .chart-panel .chart-sub {
-            font-size: 0.72rem;
-            color: var(--text-muted);
-            font-family: var(--font-mono);
-            margin-bottom: 16px;
-        }
-        .chart-panel canvas {
-            width: 100% !important;
-        }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+    }
 
-        /* ── Heatmap ── */
-        .heatmap-container {
-            position: relative;
-            width: 100%;
-            overflow-x: auto;
-        }
-        .heatmap-grid {
-            display: grid;
-            grid-template-columns: 42px repeat(24, 1fr);
-            gap: 3px;
-            min-width: 560px;
-        }
-        .hm-label {
-            font-size: 0.65rem;
-            font-family: var(--font-mono);
-            color: var(--text-muted);
-            display: flex;
-            align-items: center;
-            justify-content: flex-end;
-            padding-right: 6px;
-            white-space: nowrap;
-        }
-        .hm-label.top {
-            justify-content: center;
-            padding: 0;
-        }
-        .hm-cell {
-            aspect-ratio: 1;
-            border-radius: 3px;
-            min-height: 22px;
-            transition: transform 0.15s, opacity 0.15s;
-            cursor: default;
-            position: relative;
-        }
-        .hm-cell:hover {
-            transform: scale(1.2);
-            z-index: 2;
-        }
-        .hm-cell[data-tip]:hover::after {
-            content: attr(data-tip);
-            position: absolute;
-            bottom: calc(100% + 6px);
-            left: 50%;
-            transform: translateX(-50%);
-            background: var(--bg-elevated);
-            color: var(--text);
-            font-family: var(--font-mono);
-            font-size: 0.65rem;
-            padding: 3px 7px;
-            border-radius: var(--radius-sm);
-            border: 1px solid var(--border);
-            white-space: nowrap;
-            z-index: 10;
-            pointer-events: none;
-        }
-        .hm-legend {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            margin-top: 10px;
-            font-size: 0.65rem;
-            font-family: var(--font-mono);
-            color: var(--text-muted);
-            justify-content: flex-end;
-        }
-        .hm-legend-bar {
-            display: flex;
-            gap: 2px;
-        }
-        .hm-legend-bar span {
-            width: 14px;
-            height: 10px;
-            border-radius: 2px;
-        }
+    .controls label {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+    }
 
-        /* ── Top Talkgroups List ── */
-        .tg-list { list-style: none; }
-        .tg-list li {
-            display: grid;
-            grid-template-columns: 1fr auto;
-            align-items: center;
-            padding: 8px 0;
-            border-bottom: 1px solid var(--border);
-            gap: 12px;
-        }
-        .tg-list li:last-child { border-bottom: none; }
-        .tg-info .tg-name {
-            font-size: 0.82rem;
-            font-weight: 600;
-            color: var(--text);
-        }
-        .tg-info .tg-desc {
-            font-size: 0.7rem;
-            color: var(--text-muted);
-            font-family: var(--font-mono);
-        }
-        .tg-bar-wrap {
-            width: 120px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .tg-bar-track {
-            flex: 1;
-            height: 6px;
-            background: var(--bg-elevated);
-            border-radius: 3px;
-            overflow: hidden;
-        }
-        .tg-bar-fill {
-            height: 100%;
-            border-radius: 3px;
-            transition: width 0.6s cubic-bezier(0.22, 1, 0.36, 1);
-        }
-        .tg-bar-wrap .tg-count {
-            font-size: 0.72rem;
-            font-family: var(--font-mono);
-            color: var(--text-mid);
-            min-width: 36px;
-            text-align: right;
-        }
+    .controls select {
+      background: var(--tile-bg);
+      border: 1px solid var(--tile-border);
+      border-radius: var(--radius-xs);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      padding: 6px 10px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .controls select:focus { border-color: var(--accent); }
 
-        /* ── Loading / Error ── */
-        .chart-loading {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 180px;
-            color: var(--text-faint);
-            font-family: var(--font-mono);
-            font-size: 0.8rem;
-        }
-        .chart-loading .spinner {
-            width: 18px;
-            height: 18px;
-            border: 2px solid var(--border);
-            border-top-color: var(--accent);
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-            margin-right: 10px;
-        }
-        @keyframes spin { to { transform: rotate(360deg); } }
+    .control-group { display: flex; align-items: center; gap: 6px; }
 
-        .chart-error {
-            color: var(--danger);
-            font-size: 0.8rem;
-            font-family: var(--font-mono);
-            padding: 20px;
-            text-align: center;
-        }
+    .section { margin-bottom: 32px; }
 
-        /* ── Responsive ── */
-        @media (max-width: 900px) {
-            .chart-grid { grid-template-columns: 1fr; }
-            .chart-grid .span-full { grid-column: 1; }
-            .stat-row { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
-        }
-    </style>
+    .section-header {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .section-title {
+      font-family: var(--font-display);
+      font-weight: var(--font-weight-display);
+      font-size: 18px;
+      color: var(--text);
+    }
+
+    .section-subtitle {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .chart-container {
+      background: var(--tile-bg);
+      border: 1px solid var(--tile-border);
+      border-radius: var(--radius-sm);
+      padding: 20px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .chart-container + .chart-container { margin-top: 16px; }
+
+    canvas { width: 100% !important; height: 280px !important; display: block; }
+
+    .chart-loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 280px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-muted);
+      letter-spacing: 0.1em;
+    }
+
+    .chart-loading::after {
+      content: '';
+      width: 12px; height: 12px;
+      border: 2px solid var(--tile-border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      margin-left: 10px;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .chart-error {
+      color: var(--danger);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      padding: 20px;
+      text-align: center;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--tile-border);
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .legend-dot { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
+
+    .summary-row { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+
+    .summary-card {
+      flex: 1;
+      min-width: 140px;
+      background: var(--tile-bg);
+      border: 1px solid var(--tile-border);
+      border-radius: var(--radius-xs);
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .summary-label {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+    }
+
+    .summary-value {
+      font-family: var(--font-display);
+      font-weight: var(--font-weight-display);
+      font-size: 22px;
+      color: var(--text);
+    }
+
+    .summary-unit { font-size: 12px; font-weight: 400; color: var(--text-muted); }
+
+    .device-label {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--accent);
+      margin-bottom: 8px;
+      letter-spacing: 0.04em;
+    }
+
+    @media (max-width: 768px) {
+      .analytics-wrap { padding: 70px 12px 24px; }
+      canvas { height: 200px !important; }
+      .summary-card { min-width: 100px; }
+      .summary-value { font-size: 18px; }
+    }
+  </style>
 </head>
 <body>
-    <div class="analytics-wrap">
-        <div class="page-header">
-            <h1>Analytics</h1>
-            <p>System activity overview <span class="timeframe" id="timeframe-label">loading…</span></p>
-        </div>
 
-        <!-- Stat Cards -->
-        <div class="stat-row" id="stat-row">
-            <div class="stat-card"><div class="label">Total Calls</div><div class="value" id="s-total">—</div><div class="sub" id="s-total-sub"></div></div>
-            <div class="stat-card"><div class="label">Last 24 h</div><div class="value" id="s-24h">—</div><div class="sub" id="s-24h-sub"></div></div>
-            <div class="stat-card"><div class="label">Last Hour</div><div class="value" id="s-1h">—</div><div class="sub" id="s-1h-sub"></div></div>
-            <div class="stat-card"><div class="label">Talkgroups</div><div class="value" id="s-tg">—</div><div class="sub" id="s-tg-sub"></div></div>
-            <div class="stat-card"><div class="label">Units</div><div class="value" id="s-units">—</div><div class="sub" id="s-units-sub"></div></div>
-            <div class="stat-card"><div class="label">Audio Hours</div><div class="value" id="s-hours">—</div><div class="sub" id="s-hours-sub"></div></div>
-        </div>
-
-        <!-- Charts -->
-        <div class="chart-grid">
-
-            <!-- Hourly Call Volume (7d) -->
-            <div class="chart-panel span-full">
-                <h2>Call Volume</h2>
-                <div class="chart-sub">Hourly call count — last 7 days</div>
-                <div id="volume-loading" class="chart-loading"><span class="spinner"></span>Loading…</div>
-                <div id="volume-chart-wrap" style="display:none;position:relative;height:220px"><canvas id="chart-volume"></canvas></div>
-            </div>
-
-            <!-- Daily Overview -->
-            <div class="chart-panel">
-                <h2>Daily Overview</h2>
-                <div class="chart-sub">Calls &amp; active talkgroups per day</div>
-                <div id="daily-loading" class="chart-loading"><span class="spinner"></span>Loading…</div>
-                <div id="daily-chart-wrap" style="display:none;position:relative;height:260px"><canvas id="chart-daily"></canvas></div>
-            </div>
-
-            <!-- Category Breakdown (doughnut) -->
-            <div class="chart-panel">
-                <h2>Category Breakdown</h2>
-                <div class="chart-sub">Calls by talkgroup tag — 24 h</div>
-                <div id="cat-loading" class="chart-loading"><span class="spinner"></span>Loading…</div>
-                <div id="cat-chart-wrap" style="display:none;position:relative;height:260px"><canvas id="chart-category"></canvas></div>
-            </div>
-
-            <!-- Activity Heatmap -->
-            <div class="chart-panel span-full">
-                <h2>Activity Heatmap</h2>
-                <div class="chart-sub">Calls by hour &amp; day of week — last 7 days (ET)</div>
-                <div id="heatmap-loading" class="chart-loading"><span class="spinner"></span>Loading…</div>
-                <div id="heatmap-wrap" class="heatmap-container" style="display:none"></div>
-            </div>
-
-            <!-- Top Talkgroups -->
-            <div class="chart-panel span-full">
-                <h2>Top Talkgroups</h2>
-                <div class="chart-sub">Busiest channels — 24 h</div>
-                <div id="tg-loading" class="chart-loading"><span class="spinner"></span>Loading…</div>
-                <ul class="tg-list" id="tg-list" style="display:none"></ul>
-            </div>
-
-        </div>
+<div class="analytics-wrap">
+  <div class="controls">
+    <div class="control-group">
+      <label for="ctl-bucket">Bucket</label>
+      <select id="ctl-bucket">
+        <option value="hour" selected>Hourly</option>
+        <option value="day">Daily</option>
+      </select>
     </div>
+    <div class="control-group">
+      <label for="ctl-days">Days</label>
+      <select id="ctl-days">
+        <option value="1">1</option>
+        <option value="3">3</option>
+        <option value="7" selected>7</option>
+        <option value="14">14</option>
+        <option value="30">30</option>
+      </select>
+    </div>
+  </div>
 
-    <script src="theme-engine.js?v=2"></script>
-    <script>
-    (function () {
-        'use strict';
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">Recorder Utilization</span>
+      <span class="section-subtitle">% time in each state per SDR device</span>
+    </div>
+    <div class="summary-row" id="recorder-summary"></div>
+    <div id="recorder-chart-wrap">
+      <div class="chart-container"><div class="chart-loading">loading</div></div>
+    </div>
+  </div>
 
-        /* ─── Helpers ─── */
-        const $ = (s) => document.querySelector(s);
-        const fmt = (n) => n == null ? '—' : n.toLocaleString();
-        const pct = (a, b) => b ? ((a - b) / b * 100).toFixed(1) : null;
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">Decode Rates</span>
+      <span class="section-subtitle">control channel decode % per system</span>
+    </div>
+    <div class="summary-row" id="decode-summary"></div>
+    <div id="decode-chart-wrap">
+      <div class="chart-container"><div class="chart-loading">loading</div></div>
+    </div>
+  </div>
+</div>
 
-        function api(path) {
-            return fetch('/api/v1' + path).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); });
+<script src="theme-engine.js?v=2"></script>
+<script>
+(function() {
+  'use strict';
+
+  var COLORS = {
+    recording: { fill: 'rgba(239, 68, 68, 0.6)',  stroke: '#ef4444' },
+    idle:      { fill: 'rgba(251, 191, 36, 0.5)',  stroke: '#fbbf24' },
+    available: { fill: 'rgba(52, 211, 153, 0.45)', stroke: '#34d399' },
+    ignore:    { fill: 'rgba(148, 163, 184, 0.3)', stroke: '#94a3b8' },
+  };
+
+  var RATE_COLORS = [
+    { stroke: '#6366f1', band: 'rgba(99, 102, 241, 0.08)' },
+    { stroke: '#e879f9', band: 'rgba(232, 121, 249, 0.08)' },
+    { stroke: '#38bdf8', band: 'rgba(56, 189, 248, 0.08)' },
+    { stroke: '#fbbf24', band: 'rgba(251, 191, 36, 0.08)' },
+  ];
+
+  var ctlBucket = document.getElementById('ctl-bucket');
+  var ctlDays = document.getElementById('ctl-days');
+
+  function apiFetch(path) {
+    return fetch('/api/v1' + path).then(function(r) {
+      if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+      return r.json();
+    });
+  }
+
+  function queryStr() {
+    return '?bucket=' + ctlBucket.value + '&days=' + ctlDays.value;
+  }
+
+  function getCtx(canvas) {
+    var dpr = window.devicePixelRatio || 1;
+    var rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    var ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    return { ctx: ctx, w: rect.width, h: rect.height };
+  }
+
+  function fmtTime(iso, bucket) {
+    var d = new Date(iso);
+    if (bucket === 'day') return (d.getMonth()+1) + '/' + d.getDate();
+    var h = d.getHours();
+    return (d.getMonth()+1) + '/' + d.getDate() + ' ' + (h < 10 ? '0' : '') + h + ':00';
+  }
+
+  function fmtTimeFull(iso) { return new Date(iso).toLocaleString(); }
+
+  function cv(name) {
+    return getComputedStyle(document.body).getPropertyValue('--' + name).trim();
+  }
+
+  // ── DOM helpers (no innerHTML with data) ──
+  function clearEl(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+
+  function makeLoading() {
+    var wrap = document.createElement('div');
+    wrap.className = 'chart-container';
+    var inner = document.createElement('div');
+    inner.className = 'chart-loading';
+    inner.textContent = 'loading';
+    wrap.appendChild(inner);
+    return wrap;
+  }
+
+  function makeError(msg) {
+    var wrap = document.createElement('div');
+    wrap.className = 'chart-container';
+    var inner = document.createElement('div');
+    inner.className = 'chart-error';
+    inner.textContent = 'Failed: ' + msg;
+    wrap.appendChild(inner);
+    return wrap;
+  }
+
+  function makeSummaryCard(label, value, unit) {
+    var card = document.createElement('div');
+    card.className = 'summary-card';
+    var lbl = document.createElement('span');
+    lbl.className = 'summary-label';
+    lbl.textContent = label;
+    card.appendChild(lbl);
+    var val = document.createElement('span');
+    val.className = 'summary-value';
+    val.textContent = value;
+    if (unit) {
+      var u = document.createElement('span');
+      u.className = 'summary-unit';
+      u.textContent = ' ' + unit;
+      val.appendChild(u);
+    }
+    card.appendChild(val);
+    return card;
+  }
+
+  function makeLegendItem(label, color) {
+    var el = document.createElement('span');
+    el.className = 'legend-item';
+    var dot = document.createElement('span');
+    dot.className = 'legend-dot';
+    dot.style.background = color;
+    el.appendChild(dot);
+    el.appendChild(document.createTextNode(label));
+    return el;
+  }
+
+  // ── Stacked area chart (recorder utilization) ──
+  function drawStackedArea(container, buckets, bucket) {
+    clearEl(container);
+    if (!buckets.length) {
+      container.appendChild(makeError('No data for this time range.'));
+      return;
+    }
+
+    var devices = {};
+    buckets.forEach(function(b) {
+      if (!devices[b.src_num]) devices[b.src_num] = [];
+      devices[b.src_num].push(b);
+    });
+
+    Object.keys(devices).map(Number).sort(function(a,b){return a-b;}).forEach(function(srcNum) {
+      var data = devices[srcNum];
+
+      var label = document.createElement('div');
+      label.className = 'device-label';
+      label.textContent = 'SDR ' + srcNum + '  \u2014  ' + data.length + ' buckets';
+      container.appendChild(label);
+
+      var wrap = document.createElement('div');
+      wrap.className = 'chart-container';
+      container.appendChild(wrap);
+
+      var canvas = document.createElement('canvas');
+      wrap.appendChild(canvas);
+
+      var r = getCtx(canvas);
+      var ctx = r.ctx, w = r.w, h = r.h;
+      var pad = { top: 16, right: 12, bottom: 36, left: 44 };
+      var cw = w - pad.left - pad.right;
+      var ch = h - pad.top - pad.bottom;
+
+      var layers = ['pct_ignore', 'pct_idle', 'pct_available', 'pct_recording'];
+      var layerColors = [COLORS.ignore, COLORS.idle, COLORS.available, COLORS.recording];
+
+      var stacked = data.map(function(d) {
+        var sum = 0;
+        return layers.map(function(k) { sum += (d[k] || 0); return sum; });
+      });
+
+      function xPos(i) { return pad.left + (i / Math.max(data.length - 1, 1)) * cw; }
+      function yPos(v) { return pad.top + (1 - v / 100) * ch; }
+
+      ctx.strokeStyle = cv('tile-border') || 'rgba(128,128,128,0.15)';
+      ctx.lineWidth = 0.5;
+      for (var g = 0; g <= 4; g++) {
+        var gy = yPos(g * 25);
+        ctx.beginPath(); ctx.moveTo(pad.left, gy); ctx.lineTo(w - pad.right, gy); ctx.stroke();
+      }
+
+      for (var layer = layers.length - 1; layer >= 0; layer--) {
+        ctx.beginPath();
+        ctx.moveTo(xPos(0), yPos(stacked[0][layer]));
+        for (var i = 1; i < data.length; i++) ctx.lineTo(xPos(i), yPos(stacked[i][layer]));
+        if (layer > 0) {
+          for (var i = data.length - 1; i >= 0; i--) ctx.lineTo(xPos(i), yPos(stacked[i][layer - 1]));
+        } else {
+          ctx.lineTo(xPos(data.length - 1), yPos(0));
+          ctx.lineTo(xPos(0), yPos(0));
         }
-        /* ─── Theme-aware colours ─── */
-        function css(v) {
-            return getComputedStyle(document.documentElement).getPropertyValue(v).trim();
-        }
-        function palette() {
-            return {
-                accent:   css('--accent')       || '#6366f1',
-                accentL:  css('--accent-light')  || '#818cf8',
-                accentD:  css('--accent-dim')    || '#3730a3',
-                accentG:  css('--accent-glow')   || 'rgba(99,102,241,.35)',
-                success:  css('--success')       || '#22c55e',
-                warning:  css('--warning')       || '#eab308',
-                danger:   css('--danger')        || '#ef4444',
-                info:     css('--info')          || '#06b6d4',
-                text:     css('--text')          || '#e2e8f0',
-                textMid:  css('--text-mid')      || '#94a3b8',
-                textMute: css('--text-muted')    || '#64748b',
-                textFaint:css('--text-faint')    || '#475569',
-                border:   css('--border')        || '#334155',
-                bgSurf:   css('--bg-surface')    || '#1e293b',
-                bgElev:   css('--bg-elevated')   || '#334155',
-            };
-        }
+        ctx.closePath();
+        ctx.fillStyle = layerColors[layer].fill;
+        ctx.fill();
+      }
 
-        const CAT_COLORS = [
-            '#6366f1','#06b6d4','#22c55e','#f59e0b','#ef4444',
-            '#ec4899','#8b5cf6','#14b8a6','#f97316','#64748b',
-            '#a78bfa','#38bdf8'
-        ];
+      for (var layer = 0; layer < layers.length; layer++) {
+        ctx.beginPath();
+        ctx.moveTo(xPos(0), yPos(stacked[0][layer]));
+        for (var i = 1; i < data.length; i++) ctx.lineTo(xPos(i), yPos(stacked[i][layer]));
+        ctx.strokeStyle = layerColors[layer].stroke;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
 
-        /* ─── Chart.js defaults ─── */
-        function applyChartDefaults() {
-            const p = palette();
-            Chart.defaults.color = p.textMid;
-            Chart.defaults.borderColor = p.border;
-            Chart.defaults.font.family = css('--font-mono') || 'monospace';
-            Chart.defaults.font.size = 11;
-            Chart.defaults.plugins.legend.labels.boxWidth = 12;
-            Chart.defaults.plugins.legend.labels.padding = 14;
-            Chart.defaults.plugins.tooltip.backgroundColor = p.bgElev;
-            Chart.defaults.plugins.tooltip.titleColor = p.text;
-            Chart.defaults.plugins.tooltip.bodyColor = p.textMid;
-            Chart.defaults.plugins.tooltip.borderColor = p.border;
-            Chart.defaults.plugins.tooltip.borderWidth = 1;
-            Chart.defaults.plugins.tooltip.cornerRadius = 6;
-            Chart.defaults.plugins.tooltip.padding = 10;
-        }
+      ctx.fillStyle = cv('text-muted') || '#888';
+      ctx.font = '10px ' + (cv('font-mono') || 'monospace');
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      for (var g = 0; g <= 4; g++) ctx.fillText(g * 25 + '%', pad.left - 6, yPos(g * 25));
 
-        /* ─── 1. Stats Cards ─── */
-        async function loadStats() {
-            try {
-                const d = await api('/stats');
-                $('#s-total').textContent = fmt(d.total_calls);
-                $('#s-24h').textContent   = fmt(d.calls_24h);
-                $('#s-1h').textContent    = fmt(d.calls_1h);
-                $('#s-tg').textContent    = fmt(d.talkgroups);
-                $('#s-units').textContent = fmt(d.units);
-                $('#s-hours').textContent = d.total_duration_hours != null
-                    ? d.total_duration_hours.toFixed(1)
-                    : '—';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      var step = Math.max(1, Math.floor(data.length / 8));
+      for (var i = 0; i < data.length; i += step) {
+        ctx.fillText(fmtTime(data[i].time, bucket), xPos(i), h - pad.bottom + 8);
+      }
 
-                // subtext
-                const sys = (d.system_activity || []).filter(s => s.calls_1h > 0);
-                if (sys.length) {
-                    const names = sys.map(s => s.system_name).join(', ');
-                    $('#s-total-sub').textContent = sys.length + ' active system' + (sys.length>1?'s':'');
-                    const totalActive = sys.reduce((a,s)=>a+s.active_talkgroups, 0);
-                    const totalUnits = sys.reduce((a,s)=>a+s.active_units, 0);
-                    $('#s-tg-sub').textContent = totalActive + ' active now';
-                    $('#s-units-sub').textContent = totalUnits + ' active now';
-                }
-                $('#timeframe-label').textContent = 'live';
-            } catch (e) {
-                console.error('stats', e);
-            }
-        }
+      var legend = document.createElement('div');
+      legend.className = 'legend';
+      legend.appendChild(makeLegendItem('Recording', COLORS.recording.stroke));
+      legend.appendChild(makeLegendItem('Available', COLORS.available.stroke));
+      legend.appendChild(makeLegendItem('Idle', COLORS.idle.stroke));
+      legend.appendChild(makeLegendItem('Ignore', COLORS.ignore.stroke));
+      wrap.appendChild(legend);
 
-        /* ─── 2. Hourly Volume (7d) ─── */
-        async function loadVolume() {
-            const el = $('#chart-volume'), loader = $('#volume-loading'), wrap = $('#volume-chart-wrap');
-            try {
-                const data = await api('/stats/call-volume?interval=hour&days=7');
-                const rows = data.buckets;
-                loader.style.display = 'none';
-                wrap.style.display = '';
-                const p = palette();
+      canvas.addEventListener('mousemove', function(e) {
+        var rect = canvas.getBoundingClientRect();
+        var mx = e.clientX - rect.left;
+        var idx = Math.round(((mx - pad.left) / cw) * (data.length - 1));
+        idx = Math.max(0, Math.min(data.length - 1, idx));
+        var d = data[idx];
+        canvas.title = fmtTimeFull(d.time) +
+          '\nRecording: ' + d.pct_recording + '%' +
+          '\nAvailable: ' + d.pct_available + '%' +
+          '\nIdle: ' + d.pct_idle + '%' +
+          '\nIgnore: ' + d.pct_ignore + '%' +
+          '\nSamples: ' + d.sample_count;
+      });
+    });
+  }
 
-                new Chart(el.getContext('2d'), {
-                    type: 'line',
-                    data: {
-                        labels: rows.map(r => r.time),
-                        datasets: [{
-                            label: 'Calls / hour',
-                            data: rows.map(r => r.calls),
-                            borderColor: p.accent,
-                            backgroundColor: p.accentG,
-                            fill: true,
-                            tension: 0.35,
-                            pointRadius: 0,
-                            pointHitRadius: 8,
-                            borderWidth: 2,
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        interaction: { mode: 'index', intersect: false },
-                        plugins: {
-                            legend: { display: false },
-                            tooltip: {
-                                callbacks: {
-                                    title: (items) => {
-                                        const d = new Date(items[0].label);
-                                        return d.toLocaleDateString('en-US', { weekday:'short', month:'short', day:'numeric' }) +
-                                            ' ' + d.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit' });
-                                    }
-                                }
-                            }
-                        },
-                        scales: {
-                            x: {
-                                type: 'category',
-                                ticks: {
-                                    maxTicksLimit: 14,
-                                    callback: function(val, i) {
-                                        const d = new Date(this.getLabelForValue(val));
-                                        return d.getHours() === 0
-                                            ? d.toLocaleDateString('en-US', { month:'short', day:'numeric' })
-                                            : '';
-                                    }
-                                },
-                                grid: { display: false }
-                            },
-                            y: {
-                                beginAtZero: true,
-                                ticks: { maxTicksLimit: 6 },
-                                grid: { color: p.border + '44' }
-                            }
-                        }
-                    }
-                });
-            } catch (e) {
-                loader.innerHTML = '<span class="chart-error">Failed to load</span>';
-                console.error('volume', e);
-            }
-        }
+  // ── Decode rate chart (line + min/max band) ──
+  function drawDecodeRates(container, buckets, bucket) {
+    clearEl(container);
+    if (!buckets.length) {
+      container.appendChild(makeError('No data for this time range.'));
+      return;
+    }
 
-        /* ─── 3. Daily Overview ─── */
-        async function loadDaily() {
-            const el = $('#chart-daily'), loader = $('#daily-loading'), wrap = $('#daily-chart-wrap');
-            try {
-                const data = await api('/stats/daily-overview?days=14');
-                const rows = data.days;
-                loader.style.display = 'none';
-                wrap.style.display = '';
-                const p = palette();
+    var systems = {};
+    buckets.forEach(function(b) {
+      if (!systems[b.system_id]) systems[b.system_id] = { name: b.system_name, data: [] };
+      systems[b.system_id].data.push(b);
+    });
+    var sysKeys = Object.keys(systems).map(Number).sort(function(a,b){return a-b;});
 
-                new Chart(el.getContext('2d'), {
-                    type: 'bar',
-                    data: {
-                        labels: rows.map(r => {
-                            const d = new Date(r.date + 'T00:00:00');
-                            return d.toLocaleDateString('en-US', { month:'short', day:'numeric' });
-                        }),
-                        datasets: [
-                            {
-                                label: 'Calls',
-                                data: rows.map(r => r.calls),
-                                backgroundColor: p.accent + 'aa',
-                                borderColor: p.accent,
-                                borderWidth: 1,
-                                borderRadius: 4,
-                                yAxisID: 'y',
-                                order: 2,
-                            },
-                            {
-                                label: 'Active TGs',
-                                data: rows.map(r => r.active_talkgroups),
-                                type: 'line',
-                                borderColor: p.success,
-                                backgroundColor: 'transparent',
-                                borderWidth: 2,
-                                tension: 0.3,
-                                pointRadius: 3,
-                                pointBackgroundColor: p.success,
-                                yAxisID: 'y1',
-                                order: 1,
-                            }
-                        ]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        interaction: { mode: 'index', intersect: false },
-                        plugins: { legend: { position: 'bottom' } },
-                        scales: {
-                            x: { grid: { display: false } },
-                            y: {
-                                beginAtZero: true,
-                                position: 'left',
-                                ticks: { maxTicksLimit: 5 },
-                                grid: { color: p.border + '44' },
-                                title: { display: true, text: 'Calls', color: p.textMute, font: { size: 10 } }
-                            },
-                            y1: {
-                                beginAtZero: true,
-                                position: 'right',
-                                ticks: { maxTicksLimit: 5 },
-                                grid: { drawOnChartArea: false },
-                                title: { display: true, text: 'Talkgroups', color: p.textMute, font: { size: 10 } }
-                            }
-                        }
-                    }
-                });
-            } catch (e) {
-                loader.innerHTML = '<span class="chart-error">Failed to load</span>';
-                console.error('daily', e);
-            }
-        }
+    var allTimes = [], timeSet = {};
+    buckets.forEach(function(b) {
+      if (!timeSet[b.time]) { allTimes.push(b.time); timeSet[b.time] = true; }
+    });
+    allTimes.sort();
 
-        /* ─── 4. Category Doughnut ─── */
-        async function loadCategory() {
-            const el = $('#chart-category'), loader = $('#cat-loading'), wrap = $('#cat-chart-wrap');
-            try {
-                const data = await api('/stats/category-breakdown?hours=24&limit=10');
-                const rows = data.categories;
-                loader.style.display = 'none';
-                wrap.style.display = '';
-                const p = palette();
+    var wrap = document.createElement('div');
+    wrap.className = 'chart-container';
+    container.appendChild(wrap);
 
-                new Chart(el.getContext('2d'), {
-                    type: 'doughnut',
-                    data: {
-                        labels: rows.map(r => r.tag),
-                        datasets: [{
-                            data: rows.map(r => r.calls),
-                            backgroundColor: CAT_COLORS.slice(0, rows.length),
-                            borderColor: p.bgSurf,
-                            borderWidth: 2,
-                            hoverBorderColor: p.text,
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        cutout: '58%',
-                        plugins: {
-                            legend: {
-                                position: 'right',
-                                labels: {
-                                    padding: 10,
-                                    font: { size: 10.5 },
-                                }
-                            },
-                            tooltip: {
-                                callbacks: {
-                                    label: (ctx) => {
-                                        const total = ctx.dataset.data.reduce((a,b)=>a+b,0);
-                                        const pct = (ctx.raw / total * 100).toFixed(1);
-                                        return ` ${ctx.label}: ${fmt(ctx.raw)} (${pct}%)`;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
-            } catch (e) {
-                loader.innerHTML = '<span class="chart-error">Failed to load</span>';
-                console.error('category', e);
-            }
-        }
+    var canvas = document.createElement('canvas');
+    wrap.appendChild(canvas);
 
-        /* ─── 5. Heatmap ─── */
-        async function loadHeatmap() {
-            const wrap = $('#heatmap-wrap'), loader = $('#heatmap-loading');
-            try {
-                const data = await api('/stats/call-heatmap?days=7&tz=America/New_York');
-                const rows = data.cells;
-                loader.style.display = 'none';
-                wrap.style.display = '';
-                const p = palette();
+    var r = getCtx(canvas);
+    var ctx = r.ctx, w = r.w, h = r.h;
+    var pad = { top: 16, right: 12, bottom: 36, left: 44 };
+    var cw = w - pad.left - pad.right;
+    var ch = h - pad.top - pad.bottom;
 
-                // Build lookup
-                const map = {};
-                let maxVal = 1;
-                rows.forEach(r => {
-                    const k = r.dow + '-' + r.hour;
-                    map[k] = r.calls;
-                    if (r.calls > maxVal) maxVal = r.calls;
-                });
+    var minVal = Infinity, maxVal = -Infinity;
+    buckets.forEach(function(b) {
+      if (b.min_rate < minVal) minVal = b.min_rate;
+      if (b.max_rate > maxVal) maxVal = b.max_rate;
+    });
+    if (minVal === Infinity) { minVal = 0; maxVal = 100; }
+    var yPad = (maxVal - minVal) * 0.1 || 5;
+    minVal = Math.max(0, minVal - yPad);
+    maxVal = maxVal + yPad;
 
-                const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-                const grid = document.createElement('div');
-                grid.className = 'heatmap-grid';
+    function xPos(i) { return pad.left + (i / Math.max(allTimes.length - 1, 1)) * cw; }
+    function yPos(v) { return pad.top + (1 - (v - minVal) / (maxVal - minVal)) * ch; }
 
-                // Header row: empty corner + 24 hour labels
-                grid.appendChild(Object.assign(document.createElement('div'), { className: 'hm-label' }));
-                for (let h = 0; h < 24; h++) {
-                    const lbl = document.createElement('div');
-                    lbl.className = 'hm-label top';
-                    lbl.textContent = h === 0 ? '12a' : h < 12 ? h + 'a' : h === 12 ? '12p' : (h-12) + 'p';
-                    // Only show every other label on small screens
-                    if (h % 3 !== 0) lbl.style.opacity = '0.5';
-                    grid.appendChild(lbl);
-                }
+    ctx.strokeStyle = cv('tile-border') || 'rgba(128,128,128,0.15)';
+    ctx.lineWidth = 0.5;
+    var gridSteps = 5;
+    for (var g = 0; g <= gridSteps; g++) {
+      var gv = minVal + (maxVal - minVal) * (g / gridSteps);
+      ctx.beginPath(); ctx.moveTo(pad.left, yPos(gv)); ctx.lineTo(w - pad.right, yPos(gv)); ctx.stroke();
+    }
 
-                // Data rows
-                for (let d = 0; d < 7; d++) {
-                    const dayLbl = document.createElement('div');
-                    dayLbl.className = 'hm-label';
-                    dayLbl.textContent = dayNames[d];
-                    grid.appendChild(dayLbl);
+    sysKeys.forEach(function(sysId, sysIdx) {
+      var sys = systems[sysId];
+      var color = RATE_COLORS[sysIdx % RATE_COLORS.length];
+      var timeMap = {};
+      sys.data.forEach(function(d) { timeMap[d.time] = d; });
 
-                    for (let h = 0; h < 24; h++) {
-                        const val = map[d + '-' + h] || 0;
-                        const intensity = val / maxVal;
-                        const cell = document.createElement('div');
-                        cell.className = 'hm-cell';
-                        cell.dataset.tip = `${dayNames[d]} ${h}:00 — ${fmt(val)} calls`;
+      ctx.beginPath();
+      var started = false;
+      for (var i = 0; i < allTimes.length; i++) {
+        var d = timeMap[allTimes[i]]; if (!d) continue;
+        if (!started) { ctx.moveTo(xPos(i), yPos(d.max_rate)); started = true; }
+        else ctx.lineTo(xPos(i), yPos(d.max_rate));
+      }
+      for (var i = allTimes.length - 1; i >= 0; i--) {
+        var d = timeMap[allTimes[i]]; if (!d) continue;
+        ctx.lineTo(xPos(i), yPos(d.min_rate));
+      }
+      ctx.closePath();
+      ctx.fillStyle = color.band;
+      ctx.fill();
 
-                        // Color gradient from dim to accent
-                        if (val === 0) {
-                            cell.style.background = p.bgElev;
-                        } else {
-                            const alpha = 0.15 + intensity * 0.85;
-                            cell.style.background = p.accent;
-                            cell.style.opacity = alpha;
-                        }
-                        grid.appendChild(cell);
-                    }
-                }
-                wrap.appendChild(grid);
+      ctx.beginPath();
+      started = false;
+      for (var i = 0; i < allTimes.length; i++) {
+        var d = timeMap[allTimes[i]]; if (!d) continue;
+        if (!started) { ctx.moveTo(xPos(i), yPos(d.avg_rate)); started = true; }
+        else ctx.lineTo(xPos(i), yPos(d.avg_rate));
+      }
+      ctx.strokeStyle = color.stroke;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    });
 
-                // Legend
-                const legend = document.createElement('div');
-                legend.className = 'hm-legend';
-                legend.innerHTML = '<span>Less</span><div class="hm-legend-bar"></div><span>More</span>';
-                const bar = legend.querySelector('.hm-legend-bar');
-                for (let i = 0; i < 6; i++) {
-                    const s = document.createElement('span');
-                    const alpha = i === 0 ? 0 : (0.15 + (i / 5) * 0.85);
-                    s.style.background = i === 0 ? p.bgElev : p.accent;
-                    if (i > 0) s.style.opacity = alpha;
-                    bar.appendChild(s);
-                }
-                wrap.appendChild(legend);
-            } catch (e) {
-                loader.innerHTML = '<span class="chart-error">Failed to load</span>';
-                console.error('heatmap', e);
-            }
-        }
+    ctx.fillStyle = cv('text-muted') || '#888';
+    ctx.font = '10px ' + (cv('font-mono') || 'monospace');
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    for (var g = 0; g <= gridSteps; g++) {
+      var gv = minVal + (maxVal - minVal) * (g / gridSteps);
+      ctx.fillText(gv.toFixed(0), pad.left - 6, yPos(gv));
+    }
 
-        /* ─── 6. Top Talkgroups ─── */
-        async function loadTopTG() {
-            const list = $('#tg-list'), loader = $('#tg-loading');
-            try {
-                const data = await api('/stats/talkgroup-activity?limit=12&sort=calls');
-                const items = data.activity || [];
-                loader.style.display = 'none';
-                list.style.display = '';
-                const p = palette();
-                const maxCalls = items.length ? items[0].call_count : 1;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    var step = Math.max(1, Math.floor(allTimes.length / 8));
+    for (var i = 0; i < allTimes.length; i += step) {
+      ctx.fillText(fmtTime(allTimes[i], bucket), xPos(i), h - pad.bottom + 8);
+    }
 
-                const tagColors = {
-                    'Law Dispatch': p.accent,
-                    'Law Tac':      p.accentL,
-                    'Fire Dispatch': p.danger,
-                    'Fire-Tac':     '#f97316',
-                    'EMS Dispatch': p.success,
-                    'Public Works': p.warning,
-                    'Corrections':  '#8b5cf6',
-                    'Transportation':'#14b8a6',
-                    'Interop':      p.info,
-                };
+    var legend = document.createElement('div');
+    legend.className = 'legend';
+    sysKeys.forEach(function(sysId, sysIdx) {
+      var color = RATE_COLORS[sysIdx % RATE_COLORS.length];
+      legend.appendChild(makeLegendItem(systems[sysId].name + ' (avg \u00b1 min/max)', color.stroke));
+    });
+    wrap.appendChild(legend);
 
-                items.forEach(tg => {
-                    const pctW = (tg.call_count / maxCalls * 100).toFixed(1);
-                    const color = tagColors[tg.tg_tag] || p.textMid;
-                    const hours = (tg.total_duration / 3600).toFixed(1);
-                    const li = document.createElement('li');
-                    li.innerHTML =
-                        `<div class="tg-info">
-                            <div class="tg-name">${esc(tg.tg_alpha_tag || 'TG ' + tg.tgid)}</div>
-                            <div class="tg-desc">${esc(tg.tg_description || tg.tg_tag || '')} · ${hours}h audio</div>
-                        </div>
-                        <div class="tg-bar-wrap">
-                            <div class="tg-bar-track">
-                                <div class="tg-bar-fill" style="width:${pctW}%;background:${color}"></div>
-                            </div>
-                            <span class="tg-count">${fmt(tg.call_count)}</span>
-                        </div>`;
-                    list.appendChild(li);
-                });
-            } catch (e) {
-                loader.innerHTML = '<span class="chart-error">Failed to load</span>';
-                console.error('topTG', e);
-            }
-        }
+    canvas.addEventListener('mousemove', function(e) {
+      var rect = canvas.getBoundingClientRect();
+      var mx = e.clientX - rect.left;
+      var idx = Math.round(((mx - pad.left) / cw) * (allTimes.length - 1));
+      idx = Math.max(0, Math.min(allTimes.length - 1, idx));
+      var t = allTimes[idx];
+      var lines = [fmtTimeFull(t)];
+      sysKeys.forEach(function(sysId) {
+        var d = null;
+        systems[sysId].data.forEach(function(b) { if (b.time === t) d = b; });
+        if (d) lines.push(systems[sysId].name + ': avg=' + d.avg_rate + ' min=' + d.min_rate + ' max=' + d.max_rate);
+      });
+      canvas.title = lines.join('\n');
+    });
+  }
 
-        function esc(s) {
-            const d = document.createElement('div');
-            d.textContent = s;
-            return d.innerHTML;
-        }
+  // ── Summary cards ──
+  function renderRecorderSummary(buckets) {
+    var el = document.getElementById('recorder-summary');
+    clearEl(el);
+    if (!buckets.length) return;
 
-        /* ─── Init ─── */
-        applyChartDefaults();
-        loadStats();
-        loadVolume();
-        loadDaily();
-        loadCategory();
-        loadHeatmap();
-        loadTopTG();
+    var total = 0, sumRec = 0, sumAvail = 0, sumIdle = 0;
+    buckets.forEach(function(b) {
+      total += b.sample_count;
+      sumRec += b.pct_recording * b.sample_count;
+      sumAvail += b.pct_available * b.sample_count;
+      sumIdle += b.pct_idle * b.sample_count;
+    });
 
-        // Re-apply chart defaults on theme change (if theme engine fires an event)
-        window.addEventListener('theme-changed', () => {
-            applyChartDefaults();
-            // Reload to re-render with new colors
-            location.reload();
-        });
-    })();
-    </script>
+    var devices = {};
+    buckets.forEach(function(b) { devices[b.src_num] = true; });
+
+    el.appendChild(makeSummaryCard('Avg Recording', (sumRec / total).toFixed(1), '%'));
+    el.appendChild(makeSummaryCard('Avg Available', (sumAvail / total).toFixed(1), '%'));
+    el.appendChild(makeSummaryCard('Avg Idle', (sumIdle / total).toFixed(1), '%'));
+    el.appendChild(makeSummaryCard('SDR Devices', String(Object.keys(devices).length), ''));
+    el.appendChild(makeSummaryCard('Snapshots', total.toLocaleString(), ''));
+  }
+
+  function renderDecodeSummary(buckets) {
+    var el = document.getElementById('decode-summary');
+    clearEl(el);
+    if (!buckets.length) return;
+
+    var total = 0, sumRate = 0, gMin = Infinity, gMax = -Infinity;
+    buckets.forEach(function(b) {
+      total += b.sample_count;
+      sumRate += b.avg_rate * b.sample_count;
+      if (b.min_rate < gMin) gMin = b.min_rate;
+      if (b.max_rate > gMax) gMax = b.max_rate;
+    });
+
+    var systems = {};
+    buckets.forEach(function(b) { systems[b.system_id] = b.system_name; });
+
+    el.appendChild(makeSummaryCard('Avg Rate', (sumRate / total).toFixed(1), ''));
+    el.appendChild(makeSummaryCard('Min', gMin.toFixed(1), ''));
+    el.appendChild(makeSummaryCard('Max', gMax.toFixed(1), ''));
+    el.appendChild(makeSummaryCard('Systems', String(Object.keys(systems).length), ''));
+    el.appendChild(makeSummaryCard('Samples', total.toLocaleString(), ''));
+  }
+
+  // ── Load ──
+  function loadAll() {
+    var q = queryStr();
+    var b = ctlBucket.value;
+
+    var recWrap = document.getElementById('recorder-chart-wrap');
+    var decWrap = document.getElementById('decode-chart-wrap');
+    clearEl(recWrap); recWrap.appendChild(makeLoading());
+    clearEl(decWrap); decWrap.appendChild(makeLoading());
+
+    apiFetch('/analytics/recorder-utilization' + q).then(function(data) {
+      renderRecorderSummary(data.buckets);
+      drawStackedArea(recWrap, data.buckets, b);
+    }).catch(function(err) {
+      clearEl(recWrap); recWrap.appendChild(makeError(err.message));
+    });
+
+    apiFetch('/analytics/decode-rates' + q).then(function(data) {
+      renderDecodeSummary(data.buckets);
+      drawDecodeRates(decWrap, data.buckets, b);
+    }).catch(function(err) {
+      clearEl(decWrap); decWrap.appendChild(makeError(err.message));
+    });
+  }
+
+  var resizeTimer;
+  window.addEventListener('resize', function() {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(loadAll, 250);
+  });
+
+  ctlBucket.addEventListener('change', loadAll);
+  ctlDays.addEventListener('change', loadAll);
+
+  loadAll();
+})();
+</script>
 </body>
 </html>

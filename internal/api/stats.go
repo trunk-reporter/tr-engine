@@ -289,6 +289,71 @@ func isInvalidTimezone(err error) bool {
 	return strings.Contains(err.Error(), "time zone")
 }
 
+// GetRecorderUtilization returns recorder state percentages bucketed by hour or day.
+func (h *StatsHandler) GetRecorderUtilization(w http.ResponseWriter, r *http.Request) {
+	filter := database.RecorderUtilizationFilter{}
+	if v, ok := QueryString(r, "bucket"); ok {
+		if v != "hour" && v != "day" {
+			WriteError(w, http.StatusBadRequest, "bucket must be 'hour' or 'day'")
+			return
+		}
+		filter.Bucket = v
+	}
+	if v, ok := QueryInt(r, "days"); ok {
+		if v < 1 || v > 90 {
+			WriteError(w, http.StatusBadRequest, "days must be between 1 and 90")
+			return
+		}
+		filter.Days = v
+	}
+	if v, ok := QueryInt(r, "src_num"); ok {
+		filter.SrcNum = &v
+	}
+	if v, ok := QueryString(r, "instance_id"); ok {
+		filter.InstanceID = &v
+	}
+
+	buckets, err := h.db.GetRecorderUtilization(r.Context(), filter)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "failed to get recorder utilization")
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"buckets": buckets,
+		"total":   len(buckets),
+	})
+}
+
+// GetDecodeRateBuckets returns decode rates aggregated into time buckets.
+func (h *StatsHandler) GetDecodeRateBuckets(w http.ResponseWriter, r *http.Request) {
+	filter := database.DecodeRateBucketFilter{}
+	if v, ok := QueryString(r, "bucket"); ok {
+		if v != "hour" && v != "day" {
+			WriteError(w, http.StatusBadRequest, "bucket must be 'hour' or 'day'")
+			return
+		}
+		filter.Bucket = v
+	}
+	if v, ok := QueryInt(r, "days"); ok {
+		if v < 1 || v > 90 {
+			WriteError(w, http.StatusBadRequest, "days must be between 1 and 90")
+			return
+		}
+		filter.Days = v
+	}
+	filter.SystemIDs = QueryIntList(r, "system_id")
+
+	buckets, err := h.db.GetDecodeRateBuckets(r.Context(), filter)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "failed to get decode rate buckets")
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"buckets": buckets,
+		"total":   len(buckets),
+	})
+}
+
 // Routes registers stats routes on the given router.
 func (h *StatsHandler) Routes(r chi.Router) {
 	r.Get("/stats", h.GetStats)
@@ -298,6 +363,8 @@ func (h *StatsHandler) Routes(r chi.Router) {
 	r.Get("/stats/daily-overview", h.GetDailyOverview)
 	r.Get("/stats/category-breakdown", h.GetCategoryBreakdown)
 	r.Get("/stats/call-heatmap", h.GetCallHeatmap)
+	r.Get("/analytics/recorder-utilization", h.GetRecorderUtilization)
+	r.Get("/analytics/decode-rates", h.GetDecodeRateBuckets)
 	r.Get("/trunking-messages", h.ListTrunkingMessages)
 	r.Get("/console-messages", h.ListConsoleMessages)
 }

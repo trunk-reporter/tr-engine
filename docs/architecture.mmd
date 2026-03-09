@@ -1,0 +1,112 @@
+%%{init: {'flowchart': {'nodeSpacing': 16, 'rankSpacing': 40, 'padding': 12}} }%%
+graph LR
+    subgraph sources["Data Sources"]
+        direction TB
+        TR["Trunk-Recorder<br/>Instances (1+)"]
+        TRFILES["TR Audio<br/>Directory"]
+        UPLOADCLI["Upload Clients<br/>(rdio-scanner / OpenMHz)"]
+    end
+
+    subgraph transport["Ingest Modes (optional — use any combination)"]
+        direction TB
+        MQTT["MQTT Broker<br/>(full-featured)"]
+        FSWATCH["File Watcher<br/>(no plugins needed)"]
+        UPLOAD["HTTP Upload<br/>(easiest setup)"]
+    end
+
+    TR -->|"calls · units · recorders<br/>rates · trunking · audio<br/>config · status · console"| MQTT
+    TRFILES -.->|"JSON + audio"| FSWATCH
+    UPLOADCLI -.->|"call data + audio"| UPLOAD
+
+    subgraph engine["tr-engine (Go)"]
+        direction TB
+
+        subgraph ingest["Ingest Pipeline"]
+            direction LR
+            ROUTER["Topic Router"] --> IDENTITY["Identity Resolver<br/>(system/site matching)"] --> HANDLERS["Handlers +<br/>Batch Writer"]
+        end
+
+        EVENTBUS["Event Bus<br/>(ring buffer · pub/sub)"]
+
+        subgraph api["REST API (Chi)"]
+            direction TB
+            REST["49 Endpoints"]
+            SSE["SSE Stream<br/>(server-side filtering)"]
+            HEALTH["/health · /metrics"]
+        end
+
+        subgraph sttpipe["Transcription"]
+            WORKERS["Worker Pool"]
+        end
+
+        subgraph storage["Audio Storage"]
+            direction TB
+            CACHE["Tiered Cache<br/>(local + S3 sync)"]
+            LOCAL["Local Filesystem<br/>(default)"]
+            S3["S3 / MinIO / Spaces<br/>(optional)"]
+            PRUNER["Cache Pruner<br/>(age / size eviction)"]
+        end
+    end
+
+    MQTT --> ROUTER
+    FSWATCH -.-> IDENTITY
+    UPLOAD -.-> IDENTITY
+
+    HANDLERS --> EVENTBUS
+    EVENTBUS --> SSE
+    HANDLERS --> WORKERS
+
+    HANDLERS --> CACHE
+    CACHE --> LOCAL
+    CACHE --> S3
+    LOCAL <-->|"async upload /<br/>reconcile"| S3
+    LOCAL --> PRUNER
+    PRUNER --> S3
+    REST <-->|"serve audio"| LOCAL
+    REST -->|"presigned URL"| S3
+
+    DB[("PostgreSQL 17+<br/>calls · units · talkgroups<br/>transcriptions · trunking_msgs<br/>recorder state · raw archive<br/>(monthly partitions)")]
+
+    HANDLERS --> DB
+    WORKERS --> DB
+    REST <--> DB
+
+    subgraph stt["STT Providers (pluggable)"]
+        direction TB
+        WHISPER["Whisper<br/>(self-hosted)"]
+        ELEVENLABS["ElevenLabs"]
+        DEEPINFRA["DeepInfra"]
+    end
+
+    WORKERS -->|"audio POST"| stt
+    stt -->|"text + timestamps"| WORKERS
+
+    subgraph clients["Clients"]
+        direction TB
+        WEBUI["Event Horizon<br/>(included demo pages)<br/>live monitors · scanner<br/>analytics · signal flow · API docs"]
+        TRDASH["TR-Dashboard<br/>(official client)"]
+        APICLI["Custom Consumers"]
+        PROMETHEUS["Prometheus"]
+    end
+
+    REST -.->|"API calls"| WEBUI
+    REST -.->|"API calls"| TRDASH
+    REST -.->|"API calls"| APICLI
+    SSE -.->|"real-time events"| WEBUI
+    SSE -.->|"real-time events"| TRDASH
+    SSE -.->|"real-time events"| APICLI
+    HEALTH -.->|"scrape"| PROMETHEUS
+
+    classDef source fill:#4a9eff,stroke:#2176d6,color:#fff
+    classDef transport fill:#ff9f43,stroke:#e67e22,color:#fff
+    classDef core fill:#2ecc71,stroke:#27ae60,color:#fff
+    classDef db fill:#9b59b6,stroke:#8e44ad,color:#fff
+    classDef external fill:#e74c3c,stroke:#c0392b,color:#fff
+    classDef client fill:#1abc9c,stroke:#16a085,color:#fff
+
+    class TR,TRFILES,UPLOADCLI source
+    class MQTT,FSWATCH,UPLOAD transport
+    class ROUTER,IDENTITY,HANDLERS,EVENTBUS,REST,SSE,HEALTH,WORKERS,LOCAL,S3,CACHE,PRUNER core
+    class DB db
+    class WHISPER,ELEVENLABS,DEEPINFRA external
+    class WEBUI,APICLI,TRDASH,PROMETHEUS client

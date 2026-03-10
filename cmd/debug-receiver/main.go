@@ -156,7 +156,7 @@ func main() {
 
 		ip := extractIP(r)
 		ts := time.Now().UTC().Format("2006-01-02T15-04-05")
-		baseName := fmt.Sprintf("%s_%s", ts, strings.ReplaceAll(ip, ":", "-"))
+		baseName := fmt.Sprintf("%s_%s", ts, hashIP(ip))
 
 		ct := r.Header.Get("Content-Type")
 		isMultipart := strings.HasPrefix(ct, "multipart/")
@@ -292,7 +292,7 @@ func main() {
 
 				// Sanitize filename: keep only the base name
 				origName := filepath.Base(fh.Filename)
-				filename := fmt.Sprintf("%s_%s_%s", ts, strings.ReplaceAll(ip, ":", "-"), origName)
+				filename := fmt.Sprintf("%s_%s_%s", ts, hashIP(ip), origName)
 				path := filepath.Join(uploadDir, filename)
 
 				dst, err := os.Create(path)

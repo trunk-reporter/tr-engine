@@ -1,9 +1,15 @@
 package api
 
 import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/snarg/tr-engine/internal/config"
 )
 
@@ -166,4 +172,157 @@ func searchString(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestDebugReportSubmitForwards(t *testing.T) {
+	// Mock debug-receiver that captures the forwarded request body
+	var capturedBody []byte
+	mockReceiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		capturedBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("mock receiver failed to read body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mockReceiver.Close()
+
+	cfg := &config.Config{
+		DatabaseURL:    "postgres://user:pass@localhost:5432/test",
+		AuthToken:      "secret-token",
+		DebugReportURL: mockReceiver.URL,
+	}
+
+	handler := NewDebugReportHandler(DebugReportOptions{
+		DB:            nil,
+		Config:        cfg,
+		Live:          nil,
+		AudioStreamer: nil,
+		MQTT:          nil,
+		Log:           zerolog.Nop(),
+		Version:       "test-v0.0.1",
+		StartTime:     time.Now(),
+	})
+
+	reqBody := `{"problem":"audio not working","userAgent":"TestBrowser/1.0"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/debug-report", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.Submit(rec, req)
+
+	// Assert response is 200 with {"ok":true}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var respBody map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &respBody); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if respBody["ok"] != true {
+		t.Errorf("expected ok=true, got %v", respBody["ok"])
+	}
+
+	// Unmarshal the captured forwarded body
+	var report map[string]any
+	if err := json.Unmarshal(capturedBody, &report); err != nil {
+		t.Fatalf("failed to unmarshal captured report: %v", err)
+	}
+
+	// Assert report_type
+	if rt, ok := report["report_type"].(string); !ok || rt != "debug_report" {
+		t.Errorf("expected report_type=%q, got %v", "debug_report", report["report_type"])
+	}
+
+	// Assert client.problem
+	client, ok := report["client"].(map[string]any)
+	if !ok {
+		t.Fatal("report missing 'client' map")
+	}
+	if prob, ok := client["problem"].(string); !ok || prob != "audio not working" {
+		t.Errorf("expected client.problem=%q, got %v", "audio not working", client["problem"])
+	}
+
+	// Assert server-side data
+	server, ok := report["server"].(map[string]any)
+	if !ok {
+		t.Fatal("report missing 'server' map")
+	}
+
+	// Assert server.config.AuthToken is redacted
+	cfgMap, ok := server["config"].(map[string]any)
+	if !ok {
+		t.Fatal("report missing 'server.config' map")
+	}
+	if at, ok := cfgMap["AuthToken"].(string); !ok || at != "***" {
+		t.Errorf("expected server.config.AuthToken=%q, got %v", "***", cfgMap["AuthToken"])
+	}
+
+	// Assert server.config.DatabaseURL does NOT contain "pass"
+	dbURL, ok := cfgMap["DatabaseURL"].(string)
+	if !ok {
+		t.Fatal("server.config.DatabaseURL is not a string")
+	}
+	if strings.Contains(dbURL, "pass") {
+		t.Errorf("server.config.DatabaseURL still contains password: %q", dbURL)
+	}
+
+	// Assert server.environment exists
+	if _, ok := server["environment"]; !ok {
+		t.Error("report missing 'server.environment'")
+	}
+}
+
+func TestDebugReportDisabledReturns503(t *testing.T) {
+	cfg := &config.Config{
+		DebugReportURL: "", // disabled
+	}
+
+	handler := NewDebugReportHandler(DebugReportOptions{
+		Config:    cfg,
+		Log:       zerolog.Nop(),
+		Version:   "test-v0.0.1",
+		StartTime: time.Now(),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/debug-report", strings.NewReader(`{"problem":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.Submit(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDebugReportBadJSON(t *testing.T) {
+	mockReceiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("mock receiver should not have been called for bad JSON")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mockReceiver.Close()
+
+	cfg := &config.Config{
+		DebugReportURL: mockReceiver.URL,
+	}
+
+	handler := NewDebugReportHandler(DebugReportOptions{
+		Config:    cfg,
+		Log:       zerolog.Nop(),
+		Version:   "test-v0.0.1",
+		StartTime: time.Now(),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/debug-report", strings.NewReader("not json at all{{"))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.Submit(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d: %s", rec.Code, rec.Body.String())
+	}
 }

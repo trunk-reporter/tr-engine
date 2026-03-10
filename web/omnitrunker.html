@@ -683,6 +683,101 @@
     background: var(--accent); border-radius: 50%; cursor: pointer; border: none;
   }
 
+  /* ── Multi-Select Dropdown ── */
+  .multiselect {
+    position: relative;
+    display: inline-block;
+  }
+  .multiselect-btn {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xs);
+    padding: 3px 22px 3px 8px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    appearance: none;
+    position: relative;
+  }
+  .multiselect-btn::after {
+    content: '▾';
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 10px;
+    color: var(--text-muted);
+    pointer-events: none;
+  }
+  .multiselect-btn:hover, .multiselect-btn:focus-visible {
+    border-color: var(--accent);
+    outline: none;
+  }
+  .multiselect-btn.open {
+    border-color: var(--accent);
+  }
+  .controls-bar .multiselect-btn {
+    padding: 2px 20px 2px 6px;
+    font-size: 11px;
+  }
+  .multiselect-list {
+    display: none;
+    position: absolute;
+    top: calc(100% + 2px);
+    left: 0;
+    min-width: 160px;
+    max-height: 280px;
+    overflow-y: auto;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xs);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    z-index: 100;
+    padding: 4px 0;
+  }
+  .multiselect-list.open { display: block; }
+  .multiselect-actions {
+    display: flex;
+    gap: 4px;
+    padding: 2px 8px 4px;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+    margin-bottom: 2px;
+  }
+  .multiselect-actions button {
+    background: none;
+    border: none;
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    cursor: pointer;
+    padding: 1px 4px;
+    border-radius: var(--radius-xs);
+  }
+  .multiselect-actions button:hover {
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+  }
+  .multiselect-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    cursor: pointer;
+    font-size: 12px;
+    white-space: nowrap;
+    user-select: none;
+  }
+  .multiselect-item:hover {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .multiselect-item input[type="checkbox"] {
+    accent-color: var(--accent);
+    margin: 0;
+    cursor: pointer;
+  }
+  .controls-bar .multiselect-item { font-size: 11px; }
+
   /* ── Mobile ── */
   @media (max-width: 600px) {
     .toolbar {
@@ -717,9 +812,7 @@
     <div id="status-dot" class="status-dot connecting"></div>
     <span id="status-text">connecting...</span>
   </div>
-  <select id="system-filter">
-    <option value="">All Systems</option>
-  </select>
+  <div id="system-filter-container"></div>
   <div class="view-toggle" id="view-toggle">
     <button class="view-btn active" data-view="talkgroup">TG</button>
     <button class="view-btn" data-view="frequency">FREQ</button>
@@ -737,7 +830,7 @@
   </div>
   <button class="gear-btn" id="settings-btn" title="Settings">&#9881;</button>
   <div class="stats"><span id="event-count">0</span> events</div>
-  <div class="stats" style="opacity:0.6;font-size:10px;color:var(--text-muted)" title="Page version">v15</div>
+  <div class="stats" style="opacity:0.6;font-size:10px;color:var(--text-muted)" title="Page version">v16</div>
 </div>
 
 <div class="panels">
@@ -780,18 +873,7 @@
         <option value="200" selected>200</option>
         <option value="500">500</option>
       </select></label>
-      <label>Type: <select id="type-filter">
-        <option value="">All Types</option>
-        <option value="grant">Grant</option>
-        <option value="affiliation">Affiliation</option>
-        <option value="registration">Registration</option>
-        <option value="deregistration">Deregistration</option>
-        <option value="acknowledge">Acknowledge</option>
-        <option value="data">Data Grant</option>
-        <option value="location">Location</option>
-        <option value="call-end">Call End</option>
-        <option value="signal">Signal</option>
-      </select></label>
+      <label>Type: <span id="type-filter-container"></span></label>
       <label><input type="checkbox" id="auto-scroll" checked> Auto-scroll</label>
       <button id="clear-btn">Clear</button>
     </div>
@@ -924,14 +1006,189 @@
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 const eventCountEl = document.getElementById('event-count');
-const systemFilter = document.getElementById('system-filter');
 const channelsBody = document.getElementById('channels-body');
 const channelsEmpty = document.getElementById('channels-empty');
 const activityBody = document.getElementById('activity-body');
 const activityScroll = document.getElementById('activity-scroll');
 const bufferSizeSelect = document.getElementById('buffer-size');
-const typeFilterSelect = document.getElementById('type-filter');
 const autoScrollCheckbox = document.getElementById('auto-scroll');
+
+// ── Multi-Select Dropdown Widget ──
+class MultiSelectDropdown {
+  constructor(container, options) {
+    this.allLabel = options.allLabel || 'All';
+    this.noun = options.noun || 'items';
+    this.items = new Map(); // value -> label
+    this.selected = new Set();
+    this.onChange = options.onChange || function() {};
+    this._build(container);
+    if (options.items) {
+      for (const [value, label] of options.items) this.addItem(value, label);
+    }
+  }
+
+  _build(container) {
+    this.el = document.createElement('div');
+    this.el.className = 'multiselect';
+
+    this.btn = document.createElement('button');
+    this.btn.className = 'multiselect-btn';
+    this.btn.type = 'button';
+    this.btn.textContent = this.allLabel;
+    this.el.appendChild(this.btn);
+
+    this.list = document.createElement('div');
+    this.list.className = 'multiselect-list';
+
+    const actions = document.createElement('div');
+    actions.className = 'multiselect-actions';
+    const allBtn = document.createElement('button');
+    allBtn.type = 'button';
+    allBtn.textContent = 'All';
+    allBtn.addEventListener('click', (e) => { e.stopPropagation(); this.selectAll(); });
+    const noneBtn = document.createElement('button');
+    noneBtn.type = 'button';
+    noneBtn.textContent = 'None';
+    noneBtn.addEventListener('click', (e) => { e.stopPropagation(); this.selectNone(); });
+    actions.appendChild(allBtn);
+    actions.appendChild(noneBtn);
+    this.list.appendChild(actions);
+
+    this.itemsContainer = document.createElement('div');
+    this.list.appendChild(this.itemsContainer);
+    this.el.appendChild(this.list);
+
+    this.btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.toggle();
+    });
+
+    document.addEventListener('click', () => this.close());
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') this.close(); });
+
+    container.appendChild(this.el);
+  }
+
+  addItem(value, label) {
+    if (this.items.has(value)) return;
+    this.items.set(value, label);
+    this.selected.add(value); // default: all selected
+
+    const item = document.createElement('label');
+    item.className = 'multiselect-item';
+    item.addEventListener('click', (e) => e.stopPropagation());
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = true;
+    cb.dataset.value = value;
+    cb.addEventListener('change', () => {
+      if (cb.checked) this.selected.add(value);
+      else this.selected.delete(value);
+      this._updateLabel();
+      this.onChange(this.getSelected());
+    });
+
+    const span = document.createElement('span');
+    span.textContent = label;
+
+    item.appendChild(cb);
+    item.appendChild(span);
+    this.itemsContainer.appendChild(item);
+    this._updateLabel();
+  }
+
+  toggle() {
+    const isOpen = this.list.classList.toggle('open');
+    this.btn.classList.toggle('open', isOpen);
+  }
+
+  close() {
+    this.list.classList.remove('open');
+    this.btn.classList.remove('open');
+  }
+
+  selectAll() {
+    for (const value of this.items.keys()) this.selected.add(value);
+    this._syncCheckboxes();
+    this._updateLabel();
+    this.onChange(this.getSelected());
+  }
+
+  selectNone() {
+    this.selected.clear();
+    this._syncCheckboxes();
+    this._updateLabel();
+    this.onChange(this.getSelected());
+  }
+
+  setSelected(values) {
+    this.selected.clear();
+    for (const v of values) {
+      if (this.items.has(v)) this.selected.add(v);
+    }
+    this._syncCheckboxes();
+    this._updateLabel();
+  }
+
+  getSelected() {
+    return new Set(this.selected);
+  }
+
+  isAllSelected() {
+    return this.items.size === 0 || this.selected.size === this.items.size;
+  }
+
+  matchesValue(value) {
+    return this.isAllSelected() || this.selected.has(value);
+  }
+
+  _syncCheckboxes() {
+    for (const cb of this.itemsContainer.querySelectorAll('input[type="checkbox"]')) {
+      cb.checked = this.selected.has(cb.dataset.value);
+    }
+  }
+
+  _updateLabel() {
+    if (this.items.size === 0 || this.selected.size === this.items.size) {
+      this.btn.textContent = this.allLabel;
+    } else if (this.selected.size === 0) {
+      this.btn.textContent = 'None';
+    } else if (this.selected.size === 1) {
+      const val = this.selected.values().next().value;
+      this.btn.textContent = this.items.get(val) || val;
+    } else {
+      this.btn.textContent = this.selected.size + ' ' + this.noun;
+    }
+  }
+}
+
+// Create system filter multi-select
+const systemFilterDropdown = new MultiSelectDropdown(
+  document.getElementById('system-filter-container'),
+  { allLabel: 'All Systems', noun: 'systems', onChange: onSystemFilterChange }
+);
+
+// Create type filter multi-select
+const typeFilterDropdown = new MultiSelectDropdown(
+  document.getElementById('type-filter-container'),
+  {
+    allLabel: 'All Types',
+    noun: 'types',
+    items: [
+      ['grant', 'Grant'],
+      ['affiliation', 'Affiliation'],
+      ['registration', 'Registration'],
+      ['deregistration', 'Deregistration'],
+      ['acknowledge', 'Acknowledge'],
+      ['data', 'Data Grant'],
+      ['location', 'Location'],
+      ['call-end', 'Call End'],
+      ['signal', 'Signal'],
+    ],
+    onChange: onTypeFilterChange,
+  }
+);
 const clearBtn = document.getElementById('clear-btn');
 const authPrompt = document.getElementById('auth-prompt');
 const authTokenInput = document.getElementById('auth-token');
@@ -952,6 +1209,7 @@ let viewMode = 'talkgroup'; // 'talkgroup' or 'frequency'
 const freqChannels = new Map();
 // Seen systems for filter dropdown
 const seenSystems = new Map(); // system_id -> system_name
+var _pendingSystemRestore = null; // deferred system filter restore (array of system IDs)
 // Talkgroup metadata cache: "system_id:tgid" -> { alpha_tag, description, group, tag }
 const tgCache = new Map();
 
@@ -1004,14 +1262,8 @@ function getSiteName(data) {
   return data.short_name || data.site_short_name || data.sys_name || '';
 }
 
-function getSelectedSystem() {
-  return systemFilter.value;
-}
-
 function matchesSystemFilter(data) {
-  const sel = getSelectedSystem();
-  if (!sel) return true;
-  return String(data.system_id) === sel;
+  return systemFilterDropdown.matchesValue(String(data.system_id));
 }
 
 // ── Event type to badge mapping ──
@@ -1066,10 +1318,19 @@ function trackSystem(data) {
   if (!seenSystems.has(sid)) {
     const name = data.system_name || 'sys-' + sid;
     seenSystems.set(sid, name);
-    const opt = document.createElement('option');
-    opt.value = sid;
-    opt.textContent = name;
-    systemFilter.appendChild(opt);
+    systemFilterDropdown.addItem(sid, name);
+    // Apply pending restore once all saved systems are available
+    if (typeof _pendingSystemRestore !== 'undefined' && _pendingSystemRestore) {
+      const allFound = _pendingSystemRestore.every(s => systemFilterDropdown.items.has(s));
+      if (allFound) {
+        systemFilterDropdown.setSelected(_pendingSystemRestore);
+        _pendingSystemRestore = null;
+        refilterActivityRows();
+        for (const entry of activeChannels.values()) applyChannelSystemFilter(entry);
+        for (const entry of freqChannels.values()) applyChannelSystemFilter(entry);
+        updateChannelsEmptyState();
+      }
+    }
   }
 }
 
@@ -1475,12 +1736,7 @@ function removeActiveChannel(data) {
 }
 
 function applyChannelSystemFilter(entry) {
-  const sel = getSelectedSystem();
-  if (!sel) {
-    entry.row.style.display = '';
-  } else {
-    entry.row.style.display = (String(entry.data.system_id) === sel) ? '' : 'none';
-  }
+  entry.row.style.display = systemFilterDropdown.matchesValue(String(entry.data.system_id)) ? '' : 'none';
 }
 
 // ── Unit Activity Feed ──
@@ -1496,6 +1752,7 @@ function buildActivityRow(eventType, data) {
 
   const row = document.createElement('tr');
   if (data.system_id) row.dataset.systemId = String(data.system_id);
+  row.dataset.filterKey = getFilterKey(eventType);
 
   // Time
   const c0 = document.createElement('td');
@@ -1582,8 +1839,7 @@ function addActivityRow(eventType, data) {
   trackSystem(data);
 
   const filterKey = getFilterKey(eventType);
-  const selectedType = typeFilterSelect.value;
-  if (selectedType && filterKey !== selectedType) return;
+  if (!typeFilterDropdown.matchesValue(filterKey)) return;
   if (!matchesSystemFilter(data)) return;
   if (isDuplicateActivity(eventType, data)) return;
 
@@ -1608,8 +1864,8 @@ function addActivityRow(eventType, data) {
 // Elapsed timer merged into unified update loop below (audio status poll)
 
 // ── System Filter ──
-systemFilter.addEventListener('change', function() {
-  localStorage.setItem('omni-system-filter', systemFilter.value);
+function onSystemFilterChange() {
+  localStorage.setItem('omni-system-filter', JSON.stringify([...systemFilterDropdown.getSelected()]));
   // Filter active channels (both maps)
   for (const entry of activeChannels.values()) {
     applyChannelSystemFilter(entry);
@@ -1619,16 +1875,28 @@ systemFilter.addEventListener('change', function() {
   }
   updateChannelsEmptyState();
 
-  // Filter activity rows (hide/show based on system)
-  const sel = getSelectedSystem();
-  for (const row of activityBody.children) {
-    if (!sel) {
-      row.style.display = '';
-    } else {
-      row.style.display = (row.dataset.systemId === sel) ? '' : 'none';
-    }
+  // Filter activity rows (hide/show based on both filters)
+  refilterActivityRows();
+
+  // Update audio subscription if listening
+  if (typeof engine !== 'undefined' && engine && typeof listening !== 'undefined' && listening) {
+    engine.subscribe(getSubscribeFilter());
   }
-});
+}
+
+// ── Type Filter ──
+function onTypeFilterChange() {
+  localStorage.setItem('omni-type-filter', JSON.stringify([...typeFilterDropdown.getSelected()]));
+  refilterActivityRows();
+}
+
+function refilterActivityRows() {
+  for (const row of activityBody.children) {
+    const sysMatch = systemFilterDropdown.matchesValue(row.dataset.systemId || '');
+    const typeMatch = typeFilterDropdown.matchesValue(row.dataset.filterKey || '');
+    row.style.display = (sysMatch && typeMatch) ? '' : 'none';
+  }
+}
 
 // ── Controls ──
 bufferSizeSelect.addEventListener('change', function() {
@@ -1930,7 +2198,9 @@ setInterval(function() {
       }
       if (saved.autoPan === false) autoPanToggle.checked = false;
       if (saved.bufferSize) { bufferSizeSelect.value = saved.bufferSize; setBufferSizeEl.value = saved.bufferSize; }
-      if (saved.systemFilter) pendingSystemFilter = saved.systemFilter;
+      if (Array.isArray(saved.systemFilter)) _pendingSystemRestore = saved.systemFilter;
+      else if (typeof saved.systemFilter === 'string' && saved.systemFilter) _pendingSystemRestore = [saved.systemFilter]; // migrate legacy
+      if (Array.isArray(saved.typeFilter)) typeFilterDropdown.setSelected(saved.typeFilter);
       if (saved.listening) pendingListen = true;
       if (saved.viewMode === 'frequency') {
         // Defer switching until after DOM is ready — use setTimeout to avoid race
@@ -1961,7 +2231,8 @@ setInterval(function() {
         bufferSize: bufferSizeSelect.value,
         hiddenColumns: getHiddenColumns(),
         listening: listening,
-        systemFilter: systemFilter.value,
+        systemFilter: [...systemFilterDropdown.getSelected()],
+        typeFilter: [...typeFilterDropdown.getSelected()],
         viewMode: viewMode,
         panelSplit: pct
       };
@@ -2038,22 +2309,22 @@ setInterval(function() {
     } catch (e) {}
   }
 
-  // Restore system filter — applied via MutationObserver when the option appears in dropdown
-  var savedSystemFilter = localStorage.getItem('omni-system-filter');
-  if (savedSystemFilter) {
-    // Try immediately (option may already exist)
-    systemFilter.value = savedSystemFilter;
-    if (systemFilter.value !== savedSystemFilter) {
-      // Option not yet in dropdown — watch for it
-      var obs = new MutationObserver(function() {
-        systemFilter.value = savedSystemFilter;
-        if (systemFilter.value === savedSystemFilter) {
-          obs.disconnect();
-          systemFilter.dispatchEvent(new Event('change'));
-        }
-      });
-      obs.observe(systemFilter, { childList: true });
-    }
+  // Restore system filter — deferred until systems are discovered via trackSystem()
+  // _pendingSystemRestore is set from omni-settings during restore above;
+  // also check standalone localStorage key as fallback
+  if (!_pendingSystemRestore) {
+    try {
+      var _sf = JSON.parse(localStorage.getItem('omni-system-filter'));
+      if (Array.isArray(_sf)) _pendingSystemRestore = _sf;
+    } catch(e) {}
+  }
+
+  // Restore type filter from standalone key as fallback
+  if (typeFilterDropdown.isAllSelected()) {
+    try {
+      var _tf = JSON.parse(localStorage.getItem('omni-type-filter'));
+      if (Array.isArray(_tf) && _tf.length > 0) typeFilterDropdown.setSelected(_tf);
+    } catch(e) {}
   }
 
   // ── Audio status helpers ──
@@ -2072,8 +2343,9 @@ setInterval(function() {
   updateTGCount();
 
   function getSubscribeFilter() {
-    var sel = getSelectedSystem();
-    return sel ? { systems: [parseInt(sel)] } : {};
+    if (systemFilterDropdown.isAllSelected()) return {};
+    var selected = [...systemFilterDropdown.getSelected()].map(s => parseInt(s)).filter(n => !isNaN(n));
+    return selected.length > 0 ? { systems: selected } : {};
   }
 
   // ── Audio engine lifecycle ──
@@ -2104,8 +2376,7 @@ setInterval(function() {
     engine.setMasterVolume(parseInt(masterVol.value) / 100);
     engine.setAutoPan(autoPanToggle.checked);
     setAutoPanEl.checked = autoPanToggle.checked;
-    var sel = getSelectedSystem();
-    engine.subscribe(sel ? { systems: [parseInt(sel)] } : {});
+    engine.subscribe(getSubscribeFilter());
 
     listening = true;
     listenToggle.classList.add('active');
@@ -2170,12 +2441,7 @@ setInterval(function() {
     }
   }
 
-  // Update subscription when system filter changes
-  systemFilter.addEventListener('change', function() {
-    if (engine && listening) {
-      engine.subscribe(getSubscribeFilter());
-    }
-  });
+  // Audio subscription is updated via onSystemFilterChange() which is the dropdown's onChange callback
 
   // ── Expose for buildChannelCells (selection model) ──
   window._omniAudio = {

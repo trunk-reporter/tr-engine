@@ -295,7 +295,17 @@ Live audio streaming lets browser clients hear radio traffic in real time via th
 >
 > It will **not** work over plain `http://` to a remote host — the browser silently blocks `AudioContext` creation. If you're accessing tr-engine from another machine, put a reverse proxy with TLS in front (Caddy, nginx + Let's Encrypt, Cloudflare Tunnel, etc.). See the [full stack guide](./docker-full-stack.md) for a production HTTPS setup.
 
-**trunk-recorder side:** Add the simplestream plugin to your trunk-recorder `config.json`:
+**trunk-recorder side:** You must enable audio streaming globally **and** add the simplestream plugin. In your trunk-recorder `config.json`, set `"audioStreaming": true` at the top level:
+
+```json
+{
+  "audioStreaming": true
+}
+```
+
+Without this, the simplestream plugin silently does nothing.
+
+Then add the simplestream plugin:
 
 ```json
 {

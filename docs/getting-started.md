@@ -295,7 +295,19 @@ Live audio streaming lets browser clients hear radio traffic in real time via th
 
 ### trunk-recorder side
 
-Add the simplestream plugin to your trunk-recorder `config.json`:
+**Important:** You must enable audio streaming globally in trunk-recorder's `config.json` **and** add the simplestream plugin. Both are required.
+
+**1. Enable audioStreaming** in the top-level config:
+
+```json
+{
+  "audioStreaming": true
+}
+```
+
+Without this, the simplestream plugin silently does nothing.
+
+**2. Add the simplestream plugin:**
 
 ```json
 {

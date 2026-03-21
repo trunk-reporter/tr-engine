@@ -519,6 +519,13 @@ func (db *DB) RefreshTalkgroupStatsHot(ctx context.Context) (int64, error) {
 
 // RefreshTalkgroupStatsCold updates the slow-changing stats (call_count_30d, unit_count_30d)
 // by scanning the last 30 days. Runs every hour.
+//
+// Unit counts are derived from two sources (whichever is higher wins):
+//   - unit_events: explicit unit event messages from trunk-recorder's unit_topic
+//   - calls.unit_ids: units extracted from call src_list data
+//
+// This ensures unit counts are populated even when trunk-recorder is not
+// configured to send unit event messages (only call_start/call_end).
 func (db *DB) RefreshTalkgroupStatsCold(ctx context.Context) (int64, error) {
 	tag, err := db.Pool.Exec(ctx, `
 		UPDATE talkgroups t SET
@@ -532,10 +539,22 @@ func (db *DB) RefreshTalkgroupStatsCold(ctx context.Context) (int64, error) {
 			GROUP BY system_id, tgid
 		) cs
 		FULL JOIN (
-			SELECT system_id, tgid, count(DISTINCT unit_rid)::int AS unit_count
-			FROM unit_events
-			WHERE tgid IS NOT NULL AND time > now() - interval '30 days'
-			GROUP BY system_id, tgid
+			SELECT system_id, tgid, GREATEST(
+				COALESCE(ue_count, 0), COALESCE(cu_count, 0)
+			)::int AS unit_count
+			FROM (
+				SELECT system_id, tgid, count(DISTINCT unit_rid)::int AS ue_count
+				FROM unit_events
+				WHERE tgid IS NOT NULL AND time > now() - interval '30 days'
+				GROUP BY system_id, tgid
+			) ue
+			FULL JOIN (
+				SELECT system_id, tgid, count(DISTINCT u)::int AS cu_count
+				FROM calls, unnest(unit_ids) AS u
+				WHERE start_time > now() - interval '30 days'
+				  AND unit_ids IS NOT NULL
+				GROUP BY system_id, tgid
+			) cu USING (system_id, tgid)
 		) us USING (system_id, tgid)
 		WHERE t.system_id = COALESCE(cs.system_id, us.system_id)
 		  AND t.tgid = COALESCE(cs.tgid, us.tgid)

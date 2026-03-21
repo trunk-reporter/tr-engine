@@ -83,7 +83,10 @@ SELECT t.system_id, COALESCE(s.name, '') AS system_name, s.sysid,
     (SELECT count(*)::int FROM calls c WHERE c.system_id = t.system_id AND c.tgid = t.tgid AND c.start_time > now() - interval '30 days') AS call_count,
     (SELECT count(*)::int FROM calls c WHERE c.system_id = t.system_id AND c.tgid = t.tgid AND c.start_time > now() - interval '1 hour') AS calls_1h,
     (SELECT count(*)::int FROM calls c WHERE c.system_id = t.system_id AND c.tgid = t.tgid AND c.start_time > now() - interval '24 hours') AS calls_24h,
-    (SELECT count(DISTINCT unit_rid)::int FROM unit_events ue WHERE ue.system_id = t.system_id AND ue.tgid = t.tgid AND ue.time > now() - interval '30 days') AS unit_count
+    GREATEST(
+        (SELECT count(DISTINCT unit_rid)::int FROM unit_events ue WHERE ue.system_id = t.system_id AND ue.tgid = t.tgid AND ue.time > now() - interval '30 days'),
+        (SELECT count(DISTINCT u)::int FROM calls c, unnest(c.unit_ids) AS u WHERE c.system_id = t.system_id AND c.tgid = t.tgid AND c.start_time > now() - interval '30 days' AND c.unit_ids IS NOT NULL)
+    ) AS unit_count
 FROM talkgroups t
 JOIN systems s ON s.system_id = t.system_id
 WHERE t.system_id = $1 AND t.tgid = $2

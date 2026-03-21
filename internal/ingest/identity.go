@@ -172,6 +172,28 @@ func (ir *IdentityResolver) LookupByShortName(instanceID, shortName string) (sys
 	return 0, 0, false
 }
 
+// LookupByShortNameAny scans all identity cache entries for a matching short name,
+// skipping entries whose instanceID is in the exclude set. Returns the first
+// non-excluded match along with its instanceID. Used for auto-learning source IP
+// to instance mappings in multi-instance simplestream setups.
+func (ir *IdentityResolver) LookupByShortNameAny(shortName string, exclude map[string]bool) (systemID, siteID int, instanceID string, ok bool) {
+	ir.mu.RLock()
+	defer ir.mu.RUnlock()
+
+	for key, ri := range ir.cache {
+		if ri.SystemName != shortName {
+			continue
+		}
+		// Extract instanceID from cache key ("instanceID:sysName")
+		instID := key[:len(key)-len(shortName)-1]
+		if exclude[instID] {
+			continue
+		}
+		return ri.SystemID, ri.SiteID, instID, true
+	}
+	return 0, 0, "", false
+}
+
 // RewriteSystemID updates all cache entries pointing at oldSystemID to use newSystemID.
 // Called after a system merge so subsequent lookups resolve to the merged target.
 func (r *IdentityResolver) RewriteSystemID(oldSystemID, newSystemID int) {

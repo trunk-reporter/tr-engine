@@ -89,7 +89,7 @@ func (s *SimplestreamSource) Start(ctx context.Context, out chan<- AudioChunk) e
 
 	buf := make([]byte, 65536) // max UDP packet size
 	for {
-		n, _, err := conn.ReadFromUDP(buf)
+		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			// Check if we were cancelled
 			select {
@@ -102,6 +102,9 @@ func (s *SimplestreamSource) Start(ctx context.Context, out chan<- AudioChunk) e
 		}
 
 		chunk, ok := s.parsePacket(buf[:n])
+		if ok && remoteAddr != nil {
+			chunk.SourceAddr = remoteAddr.IP.String()
+		}
 		if !ok {
 			continue
 		}

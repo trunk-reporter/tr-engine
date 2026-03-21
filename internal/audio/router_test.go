@@ -24,6 +24,14 @@ func (m *mockIdentityLookup) LookupByShortName(instanceID, shortName string) (sy
 	return r.systemID, r.siteID, true
 }
 
+func (m *mockIdentityLookup) LookupByShortNameAny(shortName string, exclude map[string]bool) (systemID, siteID int, instanceID string, ok bool) {
+	r, found := m.systems[shortName]
+	if !found {
+		return 0, 0, "", false
+	}
+	return r.systemID, r.siteID, "default", true
+}
+
 func makeChunk(shortName string, tgid, unitID int) AudioChunk {
 	return AudioChunk{
 		ShortName:  shortName,
@@ -312,6 +320,21 @@ func (m *instanceScopedLookup) LookupByShortName(instanceID, shortName string) (
 		return r.systemID, r.siteID, true
 	}
 	return 0, 0, false
+}
+
+func (m *instanceScopedLookup) LookupByShortNameAny(shortName string, exclude map[string]bool) (systemID, siteID int, instanceID string, ok bool) {
+	for key, r := range m.entries {
+		// Extract instanceID from key "instanceID:shortName"
+		instID := key[:len(key)-len(shortName)-1]
+		if key[len(instID)+1:] != shortName {
+			continue
+		}
+		if exclude[instID] {
+			continue
+		}
+		return r.systemID, r.siteID, instID, true
+	}
+	return 0, 0, "", false
 }
 
 func TestRouterInstanceIDResolvesCorrectSystem(t *testing.T) {

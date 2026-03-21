@@ -27,6 +27,7 @@ func (f AudioFormat) String() string {
 // AudioChunk is a single audio frame from any ingest source.
 type AudioChunk struct {
 	ShortName  string      // TR sys_name (e.g. "butco")
+	SourceAddr string      // sender IP address (from UDP source)
 	SystemID   int         // resolved system ID (0 if unresolved)
 	SiteID     int         // resolved site ID (0 if unresolved)
 	TGID       int         // talkgroup ID

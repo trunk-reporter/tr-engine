@@ -15,6 +15,11 @@ import (
 // systems with duplicate short names across instances).
 type IdentityLookup interface {
 	LookupByShortName(instanceID, shortName string) (systemID, siteID int, ok bool)
+	// LookupByShortNameAny scans all identity cache entries for a matching short name,
+	// skipping entries whose instanceID is in the exclude set. Returns the first
+	// non-excluded match along with its instanceID. Used for auto-learning source IP
+	// to instance mappings in multi-instance simplestream setups.
+	LookupByShortNameAny(shortName string, exclude map[string]bool) (systemID, siteID int, instanceID string, ok bool)
 }
 
 // activeStream tracks a live audio stream for a specific talkgroup.
@@ -46,7 +51,7 @@ type StreamJitterSnapshot struct {
 type AudioRouter struct {
 	bus          *AudioBus
 	identity     IdentityLookup
-	instanceID   string        // TR instance ID for scoped identity lookups
+	instanceID   string        // TR instance ID fallback for scoped identity lookups
 	idleTimeout  time.Duration
 	opusBitrate  int // 0 = PCM passthrough, >0 = Opus requested (falls back to PCM if unavailable)
 	log          zerolog.Logger
@@ -56,6 +61,9 @@ type AudioRouter struct {
 	mu            sync.RWMutex
 	activeStreams map[string]*activeStream // key: "systemID:tgid"
 	encoders      map[string]AudioEncoder  // key: "systemID:tgid"
+
+	sourceMu  sync.RWMutex
+	sourceMap map[string]string // sender IP → instanceID (auto-learned)
 }
 
 // NewAudioRouter creates an AudioRouter that resolves identity, deduplicates
@@ -78,6 +86,7 @@ func NewAudioRouter(bus *AudioBus, identity IdentityLookup, instanceID string, i
 		input:         make(chan AudioChunk, 256),
 		activeStreams: make(map[string]*activeStream),
 		encoders:      make(map[string]AudioEncoder),
+		sourceMap:     make(map[string]string),
 	}
 }
 
@@ -112,6 +121,50 @@ func (r *AudioRouter) Run(ctx context.Context) {
 	}
 }
 
+// resolveInstanceID returns the instance ID to use for this chunk's identity lookup.
+// For chunks with a source address and short name, it checks the auto-learned
+// sourceMap first, then tries LookupByShortNameAny to learn new mappings.
+// Falls back to the configured STREAM_INSTANCE_ID.
+func (r *AudioRouter) resolveInstanceID(chunk AudioChunk) string {
+	// No source address or no short name — can't auto-learn, use fallback
+	if chunk.SourceAddr == "" || chunk.ShortName == "" {
+		return r.instanceID
+	}
+
+	// Fast path: check if we've already learned this IP's instance
+	r.sourceMu.RLock()
+	if instID, ok := r.sourceMap[chunk.SourceAddr]; ok {
+		r.sourceMu.RUnlock()
+		return instID
+	}
+	r.sourceMu.RUnlock()
+
+	// Slow path: try to learn by scanning all identity entries.
+	// Build the exclude set from already-claimed instanceIDs.
+	r.sourceMu.RLock()
+	exclude := make(map[string]bool, len(r.sourceMap))
+	for _, instID := range r.sourceMap {
+		exclude[instID] = true
+	}
+	r.sourceMu.RUnlock()
+
+	_, _, instID, ok := r.identity.LookupByShortNameAny(chunk.ShortName, exclude)
+	if ok {
+		r.sourceMu.Lock()
+		r.sourceMap[chunk.SourceAddr] = instID
+		r.sourceMu.Unlock()
+		r.log.Info().
+			Str("source_ip", chunk.SourceAddr).
+			Str("instance_id", instID).
+			Str("short_name", chunk.ShortName).
+			Msg("auto-learned source IP → instance mapping")
+		return instID
+	}
+
+	// Learning failed — fall back to configured default
+	return r.instanceID
+}
+
 // processChunk resolves identity, applies dedup logic, and publishes a frame.
 func (r *AudioRouter) processChunk(chunk AudioChunk) {
 	systemID := chunk.SystemID
@@ -119,11 +172,13 @@ func (r *AudioRouter) processChunk(chunk AudioChunk) {
 
 	// Resolve identity from short name if system ID is not already set.
 	if systemID == 0 && chunk.ShortName != "" {
+		instanceID := r.resolveInstanceID(chunk)
 		var ok bool
-		systemID, siteID, ok = r.identity.LookupByShortName(r.instanceID, chunk.ShortName)
+		systemID, siteID, ok = r.identity.LookupByShortName(instanceID, chunk.ShortName)
 		if !ok {
 			r.log.Debug().
 				Str("short_name", chunk.ShortName).
+				Str("instance_id", instanceID).
 				Msg("dropping chunk: unknown short name")
 			return
 		}

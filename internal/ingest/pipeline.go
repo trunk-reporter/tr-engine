@@ -1,10 +1,11 @@
 package ingest
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -212,6 +213,10 @@ func NewPipeline(opts PipelineOptions) *Pipeline {
 		audioBus = audio.NewAudioBus()
 		audioRouter = audio.NewAudioRouter(audioBus, identity, opts.StreamInstanceID, opts.StreamIdleTimeout, opts.StreamOpusBitrate)
 		audioRouter.SetLogger(log)
+		if os.Getenv("STREAM_INSTANCE_ID") != "" {
+			log.Warn().Str("instance_id", opts.StreamInstanceID).
+				Msg("STREAM_INSTANCE_ID is deprecated — source IP auto-detection handles multi-instance setups automatically")
+		}
 		log.Info().Msg("live audio streaming infrastructure initialized")
 	}
 

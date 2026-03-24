@@ -163,8 +163,12 @@
 
     return pendingPrompt.then(function (result) {
       if (!result) {
-        // User cancelled — return a synthetic 401/403 so page handlers see it
-        return _fetch.call(window, saved.input, saved.init);
+        // User cancelled — return a synthetic error response so the page's
+        // .catch() or error handling fires. Do NOT re-fire the fetch, as
+        // the patched fetch would intercept the 401/403 again.
+        return new Response(JSON.stringify({ error: 'authentication cancelled' }), {
+          status: 401, headers: { 'Content-Type': 'application/json' }
+        });
       }
       // Retry with new credentials
       var retryInit = saved.init || {};

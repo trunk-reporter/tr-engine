@@ -1112,6 +1112,13 @@ function saveUnitTag(u, newTag) {
     body: JSON.stringify({ alpha_tag: newTag, alpha_tag_source: 'manual' }),
   })
     .then(r => {
+      if (r.status === 401 || r.status === 403) {
+        saveStatus.textContent = 'Write token required';
+        saveStatus.className = 'unit-modal-save-status unit-modal-error';
+        saveBtn.disabled = false;
+        showAuth();
+        throw new Error('auth');
+      }
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
     })
@@ -1130,7 +1137,8 @@ function saveUnitTag(u, newTag) {
         u.el.setAttribute('data-tip', tip);
       }
     })
-    .catch(() => {
+    .catch((err) => {
+      if (err.message === 'auth') return;
       saveBtn.disabled = false;
       saveStatus.textContent = 'Error';
       saveStatus.className = 'unit-modal-save-status unit-modal-error';

@@ -78,31 +78,6 @@
 
   .stats { margin-left: auto; font-size: 12px; color: var(--text-muted); white-space: nowrap; }
 
-  .auth-prompt { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 10000; align-items: center; justify-content: center; }
-  .auth-prompt.visible { display: flex; }
-  .auth-box {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 24px; max-width: 360px; width: 90%;
-  }
-  .auth-box h2 { font-size: 15px; color: var(--text); margin-bottom: 4px; font-family: var(--font-display); }
-  .auth-box p { font-size: 13px; color: var(--text-muted); margin-bottom: 16px; }
-  .auth-box input {
-    width: 100%; padding: 8px 10px;
-    background: var(--bg); border: 1px solid var(--border);
-    border-radius: var(--radius-xs); color: var(--text);
-    font-family: var(--font-mono); font-size: 13px; margin-bottom: 12px;
-  }
-  .auth-box input:focus { outline: none; border-color: var(--accent); }
-  .auth-box button {
-    padding: 6px 16px; background: var(--accent);
-    border: none; border-radius: var(--radius-xs);
-    color: #fff; font-size: 13px; cursor: pointer;
-    transition: opacity 0.15s;
-  }
-  .auth-box button:hover { opacity: 0.85; }
-
   #events {
     position: relative; z-index: 1;
     padding: 4px 0; overflow-y: auto; flex: 1;
@@ -182,15 +157,6 @@
 
 <div id="events"></div>
 
-<div id="auth-prompt" class="auth-prompt">
-  <div class="auth-box">
-    <h2>Authentication Required</h2>
-    <p>Enter your API token to connect to the event stream.</p>
-    <input id="auth-token" type="password" placeholder="Bearer token" autofocus>
-    <button id="auth-submit">Connect</button>
-  </div>
-</div>
-
 <div class="theme-label" id="themeLabel"></div>
 
 <script>
@@ -198,14 +164,10 @@ const eventsEl = document.getElementById('events');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 const eventCountEl = document.getElementById('event-count');
-const authPrompt = document.getElementById('auth-prompt');
-const authTokenInput = document.getElementById('auth-token');
-const authSubmit = document.getElementById('auth-submit');
 const MAX_EVENTS = 200;
 let eventSource = null;
 let lastEventId = '';
 let totalCount = 0;
-let authToken = localStorage.getItem('tr-engine-token') || '';
 let everConnected = false;
 
 const EVENT_TYPES = ['call_start', 'call_end', 'call_update', 'unit_event', 'recorder_update', 'rate_update', 'trunking_message', 'console'];
@@ -295,16 +257,6 @@ function addEvent(type, data) {
   }
 }
 
-function showAuth() {
-  authPrompt.classList.add('visible');
-  authTokenInput.value = authToken;
-  authTokenInput.focus();
-}
-
-function hideAuth() {
-  authPrompt.classList.remove('visible');
-}
-
 function connect() {
   if (eventSource) {
     eventSource.close();
@@ -315,9 +267,6 @@ function connect() {
   if (types.length > 0 && types.length < EVENT_TYPES.length) {
     params.set('types', types.join(','));
   }
-  if (authToken) {
-    params.set('token', authToken);
-  }
   const qs = params.toString();
   const url = '/api/v1/events/stream' + (qs ? '?' + qs : '');
 
@@ -327,17 +276,12 @@ function connect() {
 
   eventSource.onopen = () => {
     setStatus('connected', 'connected');
-    hideAuth();
     everConnected = true;
   };
 
   eventSource.onerror = () => {
     if (eventSource.readyState === EventSource.CLOSED) {
       setStatus('disconnected', 'disconnected');
-      if (!everConnected) {
-        eventSource.close();
-        showAuth();
-      }
     } else {
       setStatus('connecting', 'reconnecting...');
     }
@@ -356,20 +300,6 @@ function connect() {
     });
   });
 }
-
-// Auth form handlers
-authSubmit.addEventListener('click', () => {
-  authToken = authTokenInput.value.trim();
-  localStorage.setItem('tr-engine-token', authToken);
-  hideAuth();
-  connect();
-});
-
-authTokenInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') {
-    authSubmit.click();
-  }
-});
 
 // Reconnect on filter change
 document.querySelectorAll('.filters input').forEach(cb => {

@@ -133,31 +133,6 @@
   .legend-dot.state-idle { background: color-mix(in srgb, var(--info) 45%, var(--text-faint)); }
   .legend-dot.state-off { background: var(--text-faint); opacity: 0.45; }
 
-  /* --- Auth --- */
-  .auth-prompt {
-    display: none; position: fixed; inset: 0;
-    background: rgba(0,0,0,0.7); z-index: 100;
-    align-items: center; justify-content: center;
-  }
-  .auth-prompt.visible { display: flex; }
-  .auth-box {
-    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 28px; max-width: 380px; width: 92%;
-  }
-  .auth-box h2 { font-size: 16px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
-  .auth-box p { font-size: 13px; color: var(--text-muted); margin-bottom: 16px; }
-  .auth-box input {
-    width: 100%; padding: 8px 12px;
-    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm);
-    color: var(--text); font-family: var(--font-mono); font-size: 13px; margin-bottom: 12px;
-  }
-  .auth-box input:focus { outline: none; border-color: var(--accent); }
-  .auth-box button {
-    padding: 7px 20px; background: var(--accent); border: none; border-radius: var(--radius-sm);
-    color: #000; font-size: 13px; font-weight: 600; cursor: pointer; transition: filter 0.15s;
-  }
-  .auth-box button:hover { filter: brightness(1.2); }
-
   /* --- Card Grid --- */
   #card-grid {
     padding: 12px 16px;
@@ -509,14 +484,6 @@
 <div id="empty-state">No active talkgroups found. Waiting for events...</div>
 <div id="card-grid"></div>
 
-<div id="auth-prompt" class="auth-prompt">
-  <div class="auth-box">
-    <h2>Authentication Required</h2>
-    <p>Enter your API token to connect.</p>
-    <input id="auth-token" type="password" placeholder="Bearer token" autofocus>
-    <button id="auth-submit">Connect</button>
-  </div>
-</div>
 
 <div id="unit-modal" class="unit-modal">
   <div class="unit-modal-box">
@@ -566,7 +533,6 @@ const DECAY = { active: 5000, recent: 60000, location: 30000, data: 30000 };
 const DORMANT_TIMEOUT = 5 * 60 * 1000;
 
 // --- State ---
-let authToken = localStorage.getItem('tr-engine-token') || '';
 let eventSource = null;
 let everConnected = false;
 let totalEvents = 0;
@@ -589,20 +555,11 @@ const statEvents = document.getElementById('stat-events');
 const filterSystem = document.getElementById('filter-system');
 const filterGroup = document.getElementById('filter-group');
 const filterSearch = document.getElementById('filter-search');
-const authPrompt = document.getElementById('auth-prompt');
-const authTokenInput = document.getElementById('auth-token');
-const authSubmitBtn = document.getElementById('auth-submit');
 const hideDormantCheckbox = document.getElementById('hide-dormant');
 const legendToggle = document.getElementById('legend-toggle');
 const colorLegend = document.getElementById('color-legend');
 
 // --- Helpers ---
-function authHeaders() {
-  const h = {};
-  if (authToken) h['Authorization'] = 'Bearer ' + authToken;
-  return h;
-}
-
 function setStatus(state, text) {
   statusDot.className = 'status-dot ' + state;
   statusText.textContent = text;
@@ -1012,7 +969,7 @@ function openUnitModal(u) {
 
   const unitId = encodeURIComponent(u.systemId + ':' + u.unitId);
 
-  fetch(API_BASE + '/units/' + unitId, { headers: authHeaders() })
+  fetch(API_BASE + '/units/' + unitId)
     .then(r => r.ok ? r.json() : null)
     .then(data => {
       if (!data || currentModalUnit !== u) return;
@@ -1042,7 +999,7 @@ function openUnitModal(u) {
     })
     .catch(() => {});
 
-  fetch(API_BASE + '/units/' + unitId + '/events?limit=30', { headers: authHeaders() })
+  fetch(API_BASE + '/units/' + unitId + '/events?limit=30')
     .then(r => r.ok ? r.json() : null)
     .then(data => {
       if (!data || currentModalUnit !== u) return;
@@ -1108,7 +1065,7 @@ function saveUnitTag(u, newTag) {
   const unitId = encodeURIComponent(u.systemId + ':' + u.unitId);
   fetch(API_BASE + '/units/' + unitId, {
     method: 'PATCH',
-    headers: Object.assign({}, authHeaders(), { 'Content-Type': 'application/json' }),
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ alpha_tag: newTag, alpha_tag_source: 'manual' }),
   })
     .then(r => {
@@ -1177,7 +1134,7 @@ function openTgModal(tg) {
   const tgId = encodeURIComponent(tg.systemId + ':' + tg.tgid);
 
   // Fetch talkgroup details
-  fetch(API_BASE + '/talkgroups/' + tgId, { headers: authHeaders() })
+  fetch(API_BASE + '/talkgroups/' + tgId)
     .then(r => r.ok ? r.json() : null)
     .then(data => {
       if (!data || currentModalTg !== tg) return;
@@ -1206,7 +1163,7 @@ function openTgModal(tg) {
     .catch(() => {});
 
   // Fetch recent calls
-  fetch(API_BASE + '/talkgroups/' + tgId + '/calls?limit=15&sort=-stop_time&deduplicate=true', { headers: authHeaders() })
+  fetch(API_BASE + '/talkgroups/' + tgId + '/calls?limit=15&sort=-stop_time&deduplicate=true')
     .then(r => r.ok ? r.json() : null)
     .then(data => {
       if (!data || currentModalTg !== tg) return;
@@ -1504,13 +1461,9 @@ let bootstrapOk = false;
 async function apiFetch(path) {
   let resp;
   try {
-    resp = await fetch(API_BASE + path, { headers: authHeaders() });
+    resp = await fetch(API_BASE + path);
   } catch (e) {
     throw new Error('network');
-  }
-  if (resp.status === 401 || resp.status === 403) {
-    showAuth();
-    throw new Error('auth');
   }
   if (!resp.ok) throw new Error('HTTP ' + resp.status);
   bootstrapOk = true;
@@ -1559,8 +1512,7 @@ async function bootstrap() {
         const t = queue[idx++];
         try {
           const id = t.system_id + ':' + t.tgid;
-          const resp = await fetch(API_BASE + '/talkgroups/' + encodeURIComponent(id) + '/units?window=60&limit=100', { headers: authHeaders() });
-          if (resp.status === 401 || resp.status === 403) { showAuth(); return; }
+          const resp = await fetch(API_BASE + '/talkgroups/' + encodeURIComponent(id) + '/units?window=60&limit=100');
           if (!resp.ok) continue;
           const unitData = await resp.json();
           const unitList = unitData.units || [];
@@ -1599,7 +1551,6 @@ async function bootstrap() {
     connectSSE();
   } catch (e) {
     loadingEl.classList.add('hidden');
-    if (e.message === 'auth') return;
     console.error('Bootstrap failed:', e);
     emptyEl.style.display = 'block';
     emptyEl.textContent = 'Failed to load talkgroups. Connecting to live stream...';
@@ -1613,7 +1564,6 @@ function connectSSE() {
 
   const params = new URLSearchParams();
   params.set('types', 'unit_event,call_start,call_end');
-  if (authToken) params.set('token', authToken);
   const url = API_BASE + '/events/stream?' + params.toString();
 
   setStatus('connecting', 'connecting...');
@@ -1622,7 +1572,6 @@ function connectSSE() {
 
   eventSource.onopen = () => {
     setStatus('connected', 'connected');
-    hideAuth();
     everConnected = true;
   };
 
@@ -1631,7 +1580,6 @@ function connectSSE() {
       setStatus('disconnected', 'disconnected');
       if (!everConnected && !bootstrapOk) {
         eventSource.close();
-        showAuth();
       }
     } else {
       setStatus('connecting', 'reconnecting...');
@@ -1662,28 +1610,6 @@ function connectSSE() {
     } catch (err) { console.error('call_end parse error', err); }
   });
 }
-
-// --- Auth ---
-function showAuth() {
-  authPrompt.classList.add('visible');
-  authTokenInput.value = authToken;
-  authTokenInput.focus();
-}
-
-function hideAuth() {
-  authPrompt.classList.remove('visible');
-}
-
-authSubmitBtn.addEventListener('click', () => {
-  authToken = authTokenInput.value.trim();
-  localStorage.setItem('tr-engine-token', authToken);
-  hideAuth();
-  bootstrap();
-});
-
-authTokenInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') authSubmitBtn.click();
-});
 
 // --- Start ---
 bootstrap();

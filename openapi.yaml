@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: tr-engine API
-  version: 0.9.0
+  version: 0.9.1
   contact:
     name: tr-engine
     url: https://github.com/LumenPrima/tr-engine

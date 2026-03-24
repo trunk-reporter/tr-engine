@@ -18,6 +18,21 @@ func NewSetupHandler(db *database.DB, log zerolog.Logger) *SetupHandler {
 	return &SetupHandler{db: db, log: log}
 }
 
+// Status returns whether first-run setup is needed (zero users exist).
+// GET /auth/setup
+func (h *SetupHandler) Status(w http.ResponseWriter, r *http.Request) {
+	count, err := h.db.CountUsers(r.Context())
+	if err != nil {
+		h.log.Error().Err(err).Msg("setup: count users failed")
+		WriteError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"needs_setup": count == 0,
+		"user_count":  count,
+	})
+}
+
 // Setup creates the first admin user. Only works when zero users exist.
 // Uses an atomic INSERT ... WHERE NOT EXISTS to prevent race conditions
 // where two concurrent requests could both create admin users.

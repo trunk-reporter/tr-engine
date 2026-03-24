@@ -150,6 +150,7 @@ func NewServer(opts ServerOptions) *Server {
 	// Only registered when user auth is configured (JWT secret present).
 	if opts.Config.JWTSecret != "" {
 		setupHandler := NewSetupHandler(opts.DB, opts.Log)
+		r.Get("/api/v1/auth/setup", setupHandler.Status)
 		r.With(authRateLimit).Post("/api/v1/auth/setup", setupHandler.Setup)
 	}
 

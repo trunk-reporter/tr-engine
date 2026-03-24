@@ -1,0 +1,948 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="auth.js?v=2"></script>
+<meta name="card-title" content="Admin">
+<meta name="card-description" content="User management, API keys, and system settings">
+<meta name="card-order" content="20">
+<title>Admin — tr-engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="theme-config.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font-body);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    min-height: 100vh;
+  }
+  body::before {
+    content: ''; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+    background-image: var(--grid-bg, linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px));
+    background-size: var(--grid-size, 60px) var(--grid-size, 60px);
+    opacity: 0.07;
+  }
+  body::after {
+    content: ''; position: fixed; inset: 0; z-index: 9999; pointer-events: none;
+    background: var(--scanlines, repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px));
+    opacity: 0;
+  }
+  .vignette-overlay {
+    position: fixed; inset: 0; z-index: 9998; pointer-events: none;
+    background: var(--vignette, radial-gradient(ellipse at center, transparent 60%, rgba(0,0,0,0.4) 100%));
+  }
+
+  .toolbar {
+    position: sticky; top: 60px; z-index: 20;
+    background: color-mix(in srgb, var(--bg) 92%, transparent);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+    padding: 10px 20px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .logo { font-family: var(--font-mono); font-size: 14px; font-weight: 600; color: var(--text); white-space: nowrap; }
+  .logo span { color: var(--accent); }
+  .mode-badge {
+    font-size: 11px; font-family: var(--font-mono); font-weight: 600;
+    padding: 2px 8px; border-radius: 3px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .mode-badge.legacy { background: color-mix(in srgb, var(--warning) 20%, transparent); color: var(--warning); border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent); }
+  .mode-badge.jwt { background: color-mix(in srgb, var(--success) 20%, transparent); color: var(--success); border: 1px solid color-mix(in srgb, var(--success) 40%, transparent); }
+  .mode-badge.none { background: color-mix(in srgb, var(--text-muted) 20%, transparent); color: var(--text-muted); border: 1px solid var(--border); }
+  .toolbar-right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  .toolbar-user { font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); }
+  .btn-logout {
+    font-size: 11px; padding: 3px 10px; border-radius: 3px; cursor: pointer;
+    background: transparent; color: var(--text-muted); border: 1px solid var(--border);
+    font-family: var(--font-mono); transition: all 0.2s;
+  }
+  .btn-logout:hover { color: var(--danger); border-color: var(--danger); }
+
+  .content { position: relative; z-index: 1; max-width: 800px; margin: 0 auto; padding: 24px 20px 80px; }
+
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  .section {
+    background: color-mix(in srgb, var(--bg-surface, var(--bg)) 80%, transparent);
+    border: 1px solid var(--border); border-radius: var(--radius-sm, 6px);
+    padding: 20px; margin-bottom: 16px;
+  }
+  .section-title {
+    font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.8px;
+    color: var(--text-muted); margin-bottom: 14px;
+    font-family: var(--font-mono);
+  }
+  .section-desc { font-size: 13px; color: var(--text-muted); line-height: 1.5; margin-bottom: 14px; }
+
+  .status-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 13px; }
+  .status-label { color: var(--text-muted); min-width: 120px; }
+  .status-val { font-family: var(--font-mono); font-weight: 600; }
+  .status-val.active { color: var(--success); }
+  .status-val.inactive { color: var(--text-faint, var(--text-muted)); }
+
+  .form-row { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; margin-top: 12px; }
+  .form-group { display: flex; flex-direction: column; gap: 4px; }
+  .form-group label { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.5px; }
+  .form-group input, .form-group select {
+    padding: 7px 10px; font-size: 13px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); font-family: var(--font-body);
+    outline: none; transition: border-color 0.2s;
+  }
+  .form-group input:focus, .form-group select:focus { border-color: var(--accent); }
+  .form-group input::placeholder { color: var(--text-faint, var(--text-muted)); }
+
+  .btn {
+    padding: 7px 14px; font-size: 12px; font-weight: 600; border-radius: 4px;
+    cursor: pointer; border: none; font-family: var(--font-mono);
+    transition: all 0.2s; white-space: nowrap;
+  }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.15); }
+  .btn-secondary { background: transparent; color: var(--text-muted); border: 1px solid var(--border); }
+  .btn-secondary:hover:not(:disabled) { color: var(--text); border-color: var(--text-muted); }
+  .btn-danger { background: transparent; color: var(--danger); border: 1px solid color-mix(in srgb, var(--danger) 50%, transparent); }
+  .btn-danger:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 15%, transparent); border-color: var(--danger); }
+  .btn-sm { padding: 4px 10px; font-size: 11px; }
+
+  .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .data-table th {
+    text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--text-muted); padding: 6px 8px;
+    border-bottom: 1px solid var(--border); font-family: var(--font-mono);
+  }
+  .data-table td { padding: 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent); vertical-align: middle; }
+  .data-table tr:hover td { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+
+  .role-badge {
+    display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 6px;
+    border-radius: 3px; text-transform: uppercase; letter-spacing: 0.5px;
+    font-family: var(--font-mono);
+  }
+  .role-badge.admin { background: color-mix(in srgb, var(--danger) 20%, transparent); color: var(--danger); }
+  .role-badge.editor { background: color-mix(in srgb, var(--warning) 20%, transparent); color: var(--warning); }
+  .role-badge.viewer { background: color-mix(in srgb, var(--text-muted) 20%, transparent); color: var(--text-muted); }
+
+  .enabled-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+  .enabled-dot.yes { background: var(--success); }
+  .enabled-dot.no { background: var(--danger); }
+
+  .action-link {
+    font-size: 11px; font-family: var(--font-mono); cursor: pointer;
+    color: var(--text-muted); text-decoration: none; transition: color 0.2s;
+    background: none; border: none; padding: 0;
+  }
+  .action-link:hover { color: var(--accent); }
+  .action-link.danger:hover { color: var(--danger); }
+
+  .key-reveal {
+    background: var(--bg); border: 1px solid var(--accent);
+    border-radius: 4px; padding: 12px; margin-top: 12px;
+    font-family: var(--font-mono); font-size: 13px;
+  }
+  .key-reveal .key-val { word-break: break-all; color: var(--accent); margin: 8px 0; user-select: all; }
+  .key-reveal .key-warn { font-size: 11px; color: var(--warning); }
+
+  .danger-zone {
+    border-color: color-mix(in srgb, var(--danger) 30%, transparent);
+    background: color-mix(in srgb, var(--danger) 5%, transparent);
+  }
+  .danger-zone .section-title { color: var(--danger); }
+
+  .danger-toggle {
+    font-size: 12px; color: var(--text-muted); cursor: pointer;
+    background: none; border: none; font-family: var(--font-mono);
+    display: flex; align-items: center; gap: 6px; padding: 0; margin-bottom: 8px;
+  }
+  .danger-toggle:hover { color: var(--text); }
+  .danger-toggle .arrow { transition: transform 0.2s; display: inline-block; }
+  .danger-toggle .arrow.open { transform: rotate(90deg); }
+  .danger-body { display: none; }
+  .danger-body.open { display: block; }
+
+  .confirm-row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+  .confirm-row input {
+    flex: 1; padding: 7px 10px; font-size: 13px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); font-family: var(--font-mono); outline: none;
+  }
+
+  .toast {
+    position: fixed; bottom: 24px; right: 24px; z-index: 99999;
+    padding: 10px 16px; border-radius: 6px; font-size: 13px;
+    font-family: var(--font-mono); font-weight: 600;
+    transform: translateY(20px); opacity: 0; transition: all 0.3s;
+    pointer-events: none;
+  }
+  .toast.show { transform: translateY(0); opacity: 1; }
+  .toast.success { background: color-mix(in srgb, var(--success) 20%, var(--bg)); color: var(--success); border: 1px solid var(--success); }
+  .toast.error { background: color-mix(in srgb, var(--danger) 20%, var(--bg)); color: var(--danger); border: 1px solid var(--danger); }
+
+  .empty-state { text-align: center; padding: 24px; color: var(--text-muted); font-size: 13px; }
+
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 50000;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .modal-box {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 24px; max-width: 400px; width: 90%;
+  }
+  .modal-box h3 { font-size: 15px; font-weight: 600; margin-bottom: 16px; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+  .welcome-hero { text-align: center; padding: 40px 20px 20px; }
+  .welcome-hero h1 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+  .welcome-hero p { font-size: 14px; color: var(--text-muted); line-height: 1.5; max-width: 500px; margin: 0 auto; }
+  .setup-form { max-width: 340px; margin: 0 auto; }
+  .setup-form .form-group { margin-bottom: 10px; }
+  .setup-form .form-group input { width: 100%; }
+  .setup-form .btn { width: 100%; margin-top: 6px; }
+  .setup-or { text-align: center; color: var(--text-faint, var(--text-muted)); font-size: 12px; margin: 16px 0; }
+
+  .error-msg { color: var(--danger); font-size: 12px; margin-top: 6px; display: none; }
+
+  .info-box { font-size: 12px; color: var(--text-muted); line-height: 1.5; margin-top: 12px; padding: 10px; background: color-mix(in srgb, var(--accent) 5%, transparent); border-radius: 4px; border: 1px solid color-mix(in srgb, var(--accent) 15%, transparent); }
+  .info-box code { font-family: var(--font-mono); color: var(--accent); font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="vignette-overlay"></div>
+
+<div class="toolbar">
+  <div class="logo">tr/<span>admin</span></div>
+  <span class="mode-badge none" id="mode-badge">---</span>
+  <div class="toolbar-right">
+    <span class="toolbar-user" id="toolbar-user"></span>
+    <button class="btn-logout" id="btn-logout" style="display:none">logout</button>
+  </div>
+</div>
+
+<div class="content">
+
+  <!-- FIRST-RUN SETUP -->
+  <div class="panel" id="panel-setup">
+    <div class="welcome-hero">
+      <h1>Welcome to tr-engine</h1>
+      <p>No user accounts exist yet. Create an admin account to enable user-based authentication with roles and API keys.</p>
+    </div>
+    <div class="section">
+      <div class="section-title">Create Admin Account</div>
+      <div class="setup-form">
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" id="setup-user" placeholder="admin" autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="password" id="setup-pass" placeholder="Min 8 characters" autocomplete="new-password">
+        </div>
+        <div class="form-group">
+          <label>Confirm Password</label>
+          <input type="password" id="setup-pass2" placeholder="Confirm password" autocomplete="new-password">
+        </div>
+        <div class="error-msg" id="setup-err"></div>
+        <button class="btn btn-primary" id="setup-btn">Create Admin</button>
+      </div>
+      <div class="setup-or">or continue with token-based auth</div>
+      <p class="section-desc" style="text-align:center;margin-bottom:0">
+        Token auth is already active. You can manage read/write tokens via your environment config without creating user accounts.
+      </p>
+    </div>
+  </div>
+
+  <!-- BASIC MODE -->
+  <div class="panel" id="panel-basic">
+    <div class="section">
+      <div class="section-title">Auth Status</div>
+      <div class="status-row">
+        <span class="status-label">Auth Mode</span>
+        <span class="status-val" id="basic-mode-val">Token-Based</span>
+      </div>
+      <div class="status-row">
+        <span class="status-label">Read Token</span>
+        <span class="status-val active" id="basic-read-status">Active</span>
+      </div>
+      <div class="status-row">
+        <span class="status-label">Write Token</span>
+        <span class="status-val" id="basic-write-status">---</span>
+      </div>
+      <div class="info-box">
+        Tokens are configured in your <code>.env</code> file or <code>docker-compose.yml</code>. Set <code>AUTH_TOKEN</code> for read access and <code>WRITE_TOKEN</code> for write access. Restart tr-engine after changes.
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Upgrade to User Authentication</div>
+      <p class="section-desc">
+        Create an admin account to enable user-based auth with roles (viewer, editor, admin), login/logout, and API keys. Token auth will continue to work alongside user auth.
+      </p>
+      <div class="setup-form">
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" id="basic-setup-user" placeholder="admin" autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="password" id="basic-setup-pass" placeholder="Min 8 characters" autocomplete="new-password">
+        </div>
+        <div class="form-group">
+          <label>Confirm Password</label>
+          <input type="password" id="basic-setup-pass2" placeholder="Confirm password" autocomplete="new-password">
+        </div>
+        <div class="error-msg" id="basic-setup-err"></div>
+        <button class="btn btn-primary" id="basic-setup-btn">Create Admin &amp; Enable User Auth</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- USER MODE (admin) -->
+  <div class="panel" id="panel-users">
+
+    <div class="section">
+      <div class="section-title">Users</div>
+      <table class="data-table" id="users-table">
+        <thead>
+          <tr>
+            <th>Username</th>
+            <th>Role</th>
+            <th>Status</th>
+            <th>Last Login</th>
+            <th>Created</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="users-body"></tbody>
+      </table>
+      <div class="empty-state" id="users-empty" style="display:none">No users found</div>
+
+      <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:14px">
+        <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:8px;font-family:var(--font-mono)">ADD USER</div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Username</label>
+            <input type="text" id="new-user-name" placeholder="username" autocomplete="off" style="width:160px">
+          </div>
+          <div class="form-group">
+            <label>Password</label>
+            <input type="password" id="new-user-pass" placeholder="min 8 chars" autocomplete="new-password" style="width:160px">
+          </div>
+          <div class="form-group">
+            <label>Role</label>
+            <select id="new-user-role" style="width:100px">
+              <option value="viewer">viewer</option>
+              <option value="editor">editor</option>
+              <option value="admin">admin</option>
+            </select>
+          </div>
+          <button class="btn btn-primary btn-sm" id="add-user-btn">Add</button>
+        </div>
+        <div class="error-msg" id="create-user-err"></div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">API Keys</div>
+      <table class="data-table" id="keys-table">
+        <thead>
+          <tr>
+            <th>Label</th>
+            <th>Prefix</th>
+            <th>Role</th>
+            <th>Owner</th>
+            <th>Last Used</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="keys-body"></tbody>
+      </table>
+      <div class="empty-state" id="keys-empty" style="display:none">No API keys</div>
+      <div id="key-reveal-container"></div>
+
+      <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:14px">
+        <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:8px;font-family:var(--font-mono)">CREATE KEY</div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Label</label>
+            <input type="text" id="new-key-label" placeholder="my-integration" autocomplete="off" style="width:200px">
+          </div>
+          <div class="form-group">
+            <label>Role</label>
+            <select id="new-key-role" style="width:100px">
+              <option value="viewer">viewer</option>
+              <option value="editor">editor</option>
+              <option value="admin">admin</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Type</label>
+            <select id="new-key-type" style="width:130px">
+              <option value="user">User Key</option>
+              <option value="service">Service Account</option>
+            </select>
+          </div>
+          <button class="btn btn-primary btn-sm" id="create-key-btn">Create</button>
+        </div>
+        <div class="error-msg" id="create-key-err"></div>
+      </div>
+    </div>
+
+    <div class="section danger-zone">
+      <div class="section-title">Danger Zone</div>
+      <button class="danger-toggle" id="danger-toggle-btn">
+        <span class="arrow" id="danger-arrow">&#9654;</span> Downgrade to Token-Based Auth
+      </button>
+      <div class="danger-body" id="danger-body">
+        <p class="section-desc">
+          This will permanently delete all user accounts and API keys. tr-engine will revert to token-based authentication. This cannot be undone.
+        </p>
+        <p class="section-desc" style="margin-bottom:8px">
+          Type <code>delete all users</code> to confirm:
+        </p>
+        <div class="confirm-row">
+          <input type="text" id="downgrade-confirm" placeholder="delete all users">
+          <button class="btn btn-danger btn-sm" id="downgrade-btn" disabled>Delete All Users</button>
+        </div>
+        <div class="error-msg" id="downgrade-err"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- INSUFFICIENT PERMISSIONS -->
+  <div class="panel" id="panel-noaccess">
+    <div class="section" style="text-align:center;padding:40px 20px">
+      <div style="font-size:28px;margin-bottom:12px;opacity:0.5">&#x1f512;</div>
+      <div style="font-size:16px;font-weight:600;margin-bottom:8px">Admin Access Required</div>
+      <p class="section-desc" style="margin-bottom:0">
+        You are logged in as <strong id="noaccess-user">---</strong> (<span id="noaccess-role">---</span>).
+        Contact an administrator to access this page.
+      </p>
+    </div>
+  </div>
+
+  <!-- NO JWT CONFIG -->
+  <div class="panel" id="panel-nojwt">
+    <div class="section" style="text-align:center;padding:40px 20px">
+      <div style="font-size:28px;margin-bottom:12px;opacity:0.5">&#x2699;</div>
+      <div style="font-size:16px;font-weight:600;margin-bottom:8px">User Auth Not Configured</div>
+      <p class="section-desc" style="margin-bottom:0">
+        The server does not have a JWT secret configured. User management requires <code>JWT_SECRET</code> in your environment config. Restart tr-engine after adding it.
+      </p>
+    </div>
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function() {
+  'use strict';
+
+  var currentUser = null;
+  var allUsers = [];
+  var allKeys = [];
+
+  // ── Helpers ──
+
+  function toast(msg, type) {
+    var el = document.getElementById('toast');
+    el.textContent = msg;
+    el.className = 'toast ' + (type || 'success');
+    requestAnimationFrame(function() { el.classList.add('show'); });
+    setTimeout(function() { el.classList.remove('show'); }, 3000);
+  }
+
+  function showErr(id, msg) {
+    var el = document.getElementById(id);
+    el.textContent = msg;
+    el.style.display = 'block';
+  }
+
+  function clearErr(id) {
+    var el = document.getElementById(id);
+    el.textContent = '';
+    el.style.display = 'none';
+  }
+
+  function showPanel(id) {
+    document.querySelectorAll('.panel').forEach(function(p) { p.classList.remove('active'); });
+    var panel = document.getElementById(id);
+    if (panel) panel.classList.add('active');
+  }
+
+  function setBadge(cls, label) {
+    var el = document.getElementById('mode-badge');
+    el.className = 'mode-badge ' + cls;
+    el.textContent = label;
+  }
+
+  function fmtDate(s) {
+    if (!s) return '\u2014';
+    var d = new Date(s);
+    if (isNaN(d)) return '\u2014';
+    var now = new Date();
+    var diff = now - d;
+    if (diff < 60000) return 'just now';
+    if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+    if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
+    var opts = { month: 'short', day: 'numeric' };
+    if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
+    return d.toLocaleDateString('en-US', opts);
+  }
+
+  function el(tag, attrs, children) {
+    var e = document.createElement(tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function(k) {
+        if (k === 'text') e.textContent = attrs[k];
+        else if (k === 'cls') e.className = attrs[k];
+        else if (k === 'css') e.style.cssText = attrs[k];
+        else if (k === 'onclick') e.addEventListener('click', attrs[k]);
+        else e.setAttribute(k, attrs[k]);
+      });
+    }
+    if (children) {
+      children.forEach(function(c) { if (c) e.appendChild(c); });
+    }
+    return e;
+  }
+
+  function clearChildren(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  // ── API ──
+
+  function api(method, path, body) {
+    var opts = { method: method, headers: {} };
+    if (body) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    return fetch('/api/v1' + path, opts).then(function(resp) {
+      if (resp.status === 204) return { _status: 204, _ok: true };
+      return resp.json().then(function(data) {
+        data._status = resp.status;
+        data._ok = resp.ok;
+        return data;
+      });
+    });
+  }
+
+  // ── Mode detection ──
+
+  async function detectMode() {
+    var authMode = window.trAuth ? trAuth.getMode() : 'none';
+
+    try {
+      var setupResp = await api('GET', '/auth/setup');
+      var needsSetup = setupResp.needs_setup;
+
+      if (authMode === 'jwt') {
+        try {
+          var me = await api('GET', '/auth/me');
+          if (me._ok) {
+            currentUser = me;
+            document.getElementById('toolbar-user').textContent = me.username + ' (' + me.role + ')';
+            document.getElementById('btn-logout').style.display = '';
+            setBadge('jwt', 'User Auth');
+
+            if (me.role === 'admin') {
+              showPanel('panel-users');
+              loadUsers();
+              loadKeys();
+            } else {
+              document.getElementById('noaccess-user').textContent = me.username;
+              document.getElementById('noaccess-role').textContent = me.role;
+              showPanel('panel-noaccess');
+            }
+            return;
+          }
+        } catch (e) { /* fall through */ }
+      }
+
+      if (needsSetup) {
+        setBadge(authMode === 'legacy' ? 'legacy' : 'none', authMode === 'legacy' ? 'Token Auth' : 'No Auth');
+        showPanel('panel-setup');
+      } else {
+        setBadge(authMode === 'legacy' ? 'legacy' : 'none', authMode === 'legacy' ? 'Token Auth' : 'No Auth');
+        setupBasicPanel();
+        showPanel('panel-basic');
+      }
+    } catch (e) {
+      // /auth/setup not available — JWT not configured
+      if (authMode === 'legacy' || authMode === 'none') {
+        setBadge(authMode === 'legacy' ? 'legacy' : 'none', authMode === 'legacy' ? 'Token Auth' : 'No Auth');
+        showPanel('panel-nojwt');
+      }
+    }
+  }
+
+  function setupBasicPanel() {
+    var readActive = !!(window.trAuth && trAuth.getToken());
+    var writeActive = !!(window.trAuth && trAuth.hasWriteAccess());
+    var readEl = document.getElementById('basic-read-status');
+    var writeEl = document.getElementById('basic-write-status');
+    readEl.textContent = readActive ? 'Active' : 'Not Set';
+    readEl.className = 'status-val ' + (readActive ? 'active' : 'inactive');
+    writeEl.textContent = writeActive ? 'Active' : 'Not Set';
+    writeEl.className = 'status-val ' + (writeActive ? 'active' : 'inactive');
+  }
+
+  // ── Setup handlers ──
+
+  async function handleSetup(userEl, passEl, pass2El, errId, btn, origText) {
+    clearErr(errId);
+    var user = document.getElementById(userEl).value.trim();
+    var pass = document.getElementById(passEl).value;
+    var pass2 = document.getElementById(pass2El).value;
+    if (!user) return showErr(errId, 'Username is required');
+    if (pass.length < 8) return showErr(errId, 'Password must be at least 8 characters');
+    if (pass !== pass2) return showErr(errId, 'Passwords do not match');
+
+    var btnEl = document.getElementById(btn);
+    btnEl.disabled = true; btnEl.textContent = 'Creating...';
+
+    try {
+      var resp = await api('POST', '/auth/setup', { username: user, password: pass });
+      if (resp._ok) {
+        var loginResp = await api('POST', '/auth/login', { username: user, password: pass });
+        if (loginResp.access_token) {
+          localStorage.setItem('tr-engine-jwt', loginResp.access_token);
+        }
+        toast('Admin account created');
+        setTimeout(function() { location.reload(); }, 500);
+      } else {
+        showErr(errId, resp.error || 'Setup failed');
+        btnEl.disabled = false; btnEl.textContent = origText;
+      }
+    } catch (e) {
+      showErr(errId, 'Network error');
+      btnEl.disabled = false; btnEl.textContent = origText;
+    }
+  }
+
+  // ── Users CRUD ──
+
+  async function loadUsers() {
+    var resp = await api('GET', '/users');
+    if (!resp._ok) return;
+    allUsers = resp.users || [];
+    renderUsers();
+  }
+
+  function renderUsers() {
+    var tbody = document.getElementById('users-body');
+    var empty = document.getElementById('users-empty');
+    clearChildren(tbody);
+
+    if (!allUsers.length) {
+      empty.style.display = '';
+      return;
+    }
+    empty.style.display = 'none';
+
+    allUsers.forEach(function(u) {
+      var isSelf = currentUser && u.id === currentUser.id;
+      var tr = el('tr', null, [
+        el('td', null, [
+          el('span', { text: u.username }),
+          isSelf ? el('span', { text: ' (you)', css: 'color:var(--text-faint);font-size:11px' }) : null
+        ]),
+        el('td', null, [el('span', { cls: 'role-badge ' + u.role, text: u.role })]),
+        el('td', null, [
+          el('span', { cls: 'enabled-dot ' + (u.enabled !== false ? 'yes' : 'no') }),
+          el('span', { text: ' ' + (u.enabled !== false ? 'Active' : 'Disabled') })
+        ]),
+        el('td', { text: fmtDate(u.last_login) }),
+        el('td', { text: fmtDate(u.created_at) }),
+        el('td', { css: 'text-align:right;white-space:nowrap' }, [
+          el('button', { cls: 'action-link', text: 'edit', onclick: function() { editUser(u); } }),
+          isSelf ? null : el('button', { cls: 'action-link danger', text: 'delete', css: 'margin-left:8px', onclick: function() { deleteUser(u); } })
+        ])
+      ]);
+      tbody.appendChild(tr);
+    });
+  }
+
+  async function createUser() {
+    clearErr('create-user-err');
+    var name = document.getElementById('new-user-name').value.trim();
+    var pass = document.getElementById('new-user-pass').value;
+    var role = document.getElementById('new-user-role').value;
+    if (!name) return showErr('create-user-err', 'Username required');
+    if (pass.length < 8) return showErr('create-user-err', 'Password must be at least 8 characters');
+
+    var resp = await api('POST', '/users', { username: name, password: pass, role: role });
+    if (resp._ok) {
+      document.getElementById('new-user-name').value = '';
+      document.getElementById('new-user-pass').value = '';
+      toast('User ' + name + ' created');
+      loadUsers();
+    } else {
+      showErr('create-user-err', resp.error || 'Failed to create user');
+    }
+  }
+
+  function editUser(user) {
+    var isSelf = currentUser && user.id === currentUser.id;
+
+    var overlay = el('div', { cls: 'modal-overlay' });
+    var box = el('div', { cls: 'modal-box' });
+
+    var title = el('h3', { text: 'Edit User: ' + user.username });
+
+    var roleGroup = el('div', { cls: 'form-group' }, [el('label', { text: 'Role' })]);
+    var roleSelect = el('select');
+    ['viewer', 'editor', 'admin'].forEach(function(r) {
+      var opt = el('option', { value: r, text: r });
+      if (r === user.role) opt.selected = true;
+      roleSelect.appendChild(opt);
+    });
+    roleSelect.style.cssText = 'width:100%;padding:7px 10px;font-size:13px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-body)';
+    if (isSelf) roleSelect.disabled = true;
+    roleGroup.appendChild(roleSelect);
+
+    var passGroup = el('div', { cls: 'form-group', css: 'margin-top:10px' }, [el('label', { text: 'New Password (leave blank to keep)' })]);
+    var passInput = el('input', { type: 'password', placeholder: 'unchanged', autocomplete: 'new-password' });
+    passInput.style.cssText = 'width:100%;padding:7px 10px;font-size:13px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-body)';
+    passGroup.appendChild(passInput);
+
+    var enabledGroup = el('div', { cls: 'form-group', css: 'margin-top:10px' }, [el('label', { text: 'Status' })]);
+    var enabledSelect = el('select');
+    var optActive = el('option', { value: 'true', text: 'Active' });
+    var optDisabled = el('option', { value: 'false', text: 'Disabled' });
+    if (user.enabled !== false) optActive.selected = true; else optDisabled.selected = true;
+    enabledSelect.appendChild(optActive);
+    enabledSelect.appendChild(optDisabled);
+    enabledSelect.style.cssText = 'width:100%;padding:7px 10px;font-size:13px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-body)';
+    if (isSelf) enabledSelect.disabled = true;
+    enabledGroup.appendChild(enabledSelect);
+
+    var errEl = el('div', { cls: 'error-msg' });
+
+    var cancelBtn = el('button', { cls: 'btn btn-secondary', text: 'Cancel', onclick: function() { overlay.remove(); } });
+    var saveBtn = el('button', { cls: 'btn btn-primary', text: 'Save', onclick: async function() {
+      errEl.style.display = 'none';
+      var patch = {};
+      var newRole = roleSelect.value;
+      var newPass = passInput.value;
+      var newEnabled = enabledSelect.value === 'true';
+      if (newRole !== user.role) patch.role = newRole;
+      if (newPass) patch.password = newPass;
+      if (newEnabled !== (user.enabled !== false)) patch.enabled = newEnabled;
+      if (!Object.keys(patch).length) { overlay.remove(); return; }
+
+      var resp = await api('PATCH', '/users/' + user.id, patch);
+      if (resp._ok) {
+        toast('User updated');
+        overlay.remove();
+        loadUsers();
+      } else {
+        errEl.textContent = resp.error || 'Update failed';
+        errEl.style.display = 'block';
+      }
+    }});
+
+    var actions = el('div', { cls: 'modal-actions' }, [cancelBtn, saveBtn]);
+    box.appendChild(title);
+    box.appendChild(roleGroup);
+    box.appendChild(passGroup);
+    box.appendChild(enabledGroup);
+    box.appendChild(errEl);
+    box.appendChild(actions);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
+  }
+
+  async function deleteUser(user) {
+    if (!confirm('Delete user "' + user.username + '"? This cannot be undone.')) return;
+    var resp = await api('DELETE', '/users/' + user.id);
+    if (resp._ok) {
+      toast('User deleted');
+      loadUsers();
+    } else {
+      toast(resp.error || 'Delete failed', 'error');
+    }
+  }
+
+  // ── API Keys CRUD ──
+
+  async function loadKeys() {
+    var resp = await api('GET', '/auth/keys/all');
+    if (!resp._ok) return;
+    allKeys = Array.isArray(resp) ? resp : (resp.keys || []);
+    renderKeys();
+  }
+
+  function renderKeys() {
+    var tbody = document.getElementById('keys-body');
+    var empty = document.getElementById('keys-empty');
+    clearChildren(tbody);
+
+    if (!allKeys.length) {
+      empty.style.display = '';
+      return;
+    }
+    empty.style.display = 'none';
+
+    allKeys.forEach(function(k) {
+      var owner = k.is_service_account ? 'service' : (k.username || 'user #' + (k.user_id || '?'));
+      var tr = el('tr', null, [
+        el('td', { text: k.label || '\u2014' }),
+        el('td', null, [el('code', { text: (k.key_prefix || '\u2014') + '...' })]),
+        el('td', null, [el('span', { cls: 'role-badge ' + k.role, text: k.role })]),
+        el('td', { text: owner }),
+        el('td', { text: fmtDate(k.last_used) }),
+        el('td', { css: 'text-align:right' }, [
+          el('button', { cls: 'action-link danger', text: 'revoke', onclick: function() { revokeKey(k); } })
+        ])
+      ]);
+      tbody.appendChild(tr);
+    });
+  }
+
+  async function createKey() {
+    clearErr('create-key-err');
+    var label = document.getElementById('new-key-label').value.trim();
+    var role = document.getElementById('new-key-role').value;
+    var type = document.getElementById('new-key-type').value;
+    if (!label) return showErr('create-key-err', 'Label required');
+
+    var endpoint = type === 'service' ? '/auth/keys/service' : '/auth/keys';
+    var resp = await api('POST', endpoint, { label: label, role: role });
+    if (resp._ok) {
+      document.getElementById('new-key-label').value = '';
+      var rawKey = resp.raw_key || resp.key || '';
+
+      var container = document.getElementById('key-reveal-container');
+      clearChildren(container);
+      var reveal = el('div', { cls: 'key-reveal' }, [
+        el('div', { text: 'New API Key Created', css: 'font-weight:600;font-size:12px;margin-bottom:4px' }),
+        el('div', { cls: 'key-val', text: rawKey }),
+        el('div', { cls: 'key-warn', text: 'Copy this key now \u2014 it will not be shown again.' }),
+        el('button', { cls: 'btn btn-secondary btn-sm', text: 'Dismiss', css: 'margin-top:8px', onclick: function() { reveal.remove(); } })
+      ]);
+      container.appendChild(reveal);
+
+      toast('API key created');
+      loadKeys();
+    } else {
+      showErr('create-key-err', resp.error || 'Failed to create key');
+    }
+  }
+
+  async function revokeKey(key) {
+    if (!confirm('Revoke API key "' + (key.label || '') + '"? This cannot be undone.')) return;
+    var resp = await api('DELETE', '/auth/keys/' + key.id + '/any');
+    if (resp._ok) {
+      toast('Key revoked');
+      clearChildren(document.getElementById('key-reveal-container'));
+      loadKeys();
+    } else {
+      toast(resp.error || 'Revoke failed', 'error');
+    }
+  }
+
+  // ── Downgrade ──
+
+  async function doDowngrade() {
+    clearErr('downgrade-err');
+    var btn = document.getElementById('downgrade-btn');
+    btn.disabled = true; btn.textContent = 'Deleting...';
+
+    try {
+      var selfId = currentUser ? currentUser.id : null;
+      var others = allUsers.filter(function(u) { return u.id !== selfId; });
+      var self = allUsers.find(function(u) { return u.id === selfId; });
+
+      // Delete other users first
+      for (var i = 0; i < others.length; i++) {
+        var resp = await api('DELETE', '/users/' + others[i].id);
+        if (!resp._ok) {
+          showErr('downgrade-err', 'Failed to delete ' + others[i].username + ': ' + (resp.error || 'unknown error'));
+          btn.disabled = false; btn.textContent = 'Delete All Users';
+          return;
+        }
+      }
+
+      // Delete all API keys
+      for (var j = 0; j < allKeys.length; j++) {
+        await api('DELETE', '/auth/keys/' + allKeys[j].id + '/any');
+      }
+
+      // Delete self last
+      if (self) {
+        await api('DELETE', '/users/' + self.id);
+      }
+
+      localStorage.removeItem('tr-engine-jwt');
+      toast('All users deleted \u2014 reverting to token auth');
+      setTimeout(function() { location.reload(); }, 1000);
+    } catch (e) {
+      showErr('downgrade-err', 'Network error during downgrade');
+      btn.disabled = false; btn.textContent = 'Delete All Users';
+    }
+  }
+
+  // ── Event bindings ──
+
+  document.getElementById('btn-logout').addEventListener('click', function() {
+    if (window.trAuth) trAuth.logout();
+  });
+
+  document.getElementById('setup-btn').addEventListener('click', function() {
+    handleSetup('setup-user', 'setup-pass', 'setup-pass2', 'setup-err', 'setup-btn', 'Create Admin');
+  });
+
+  document.getElementById('basic-setup-btn').addEventListener('click', function() {
+    handleSetup('basic-setup-user', 'basic-setup-pass', 'basic-setup-pass2', 'basic-setup-err', 'basic-setup-btn', 'Create Admin & Enable User Auth');
+  });
+
+  document.getElementById('add-user-btn').addEventListener('click', createUser);
+  document.getElementById('create-key-btn').addEventListener('click', createKey);
+
+  document.getElementById('danger-toggle-btn').addEventListener('click', function() {
+    document.getElementById('danger-body').classList.toggle('open');
+    document.getElementById('danger-arrow').classList.toggle('open');
+  });
+
+  document.getElementById('downgrade-confirm').addEventListener('input', function() {
+    document.getElementById('downgrade-btn').disabled = this.value.trim().toLowerCase() !== 'delete all users';
+  });
+
+  document.getElementById('downgrade-btn').addEventListener('click', doDowngrade);
+
+  // Enter key on forms
+  document.getElementById('setup-pass2').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') document.getElementById('setup-btn').click();
+  });
+  document.getElementById('basic-setup-pass2').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') document.getElementById('basic-setup-btn').click();
+  });
+  document.getElementById('new-user-pass').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') document.getElementById('add-user-btn').click();
+  });
+  document.getElementById('new-key-label').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') document.getElementById('create-key-btn').click();
+  });
+
+  // ── Init ──
+  detectMode();
+})();
+</script>
+<script src="theme-engine.js?v=2"></script>
+</body>
+</html>

@@ -284,6 +284,25 @@ type TrunkingMessageMsg struct {
 	Message TrunkingMessageData `json:"message"`
 }
 
+// DvcfMetadata is the metadata sub-object inside a DVCF MQTT message.
+type DvcfMetadata struct {
+	Talkgroup    int        `json:"talkgroup"`
+	TalkgroupTag string     `json:"talkgroup_tag"`
+	Freq         float64    `json:"freq"`
+	StartTime    int64      `json:"start_time"`
+	StopTime     int64      `json:"stop_time"`
+	CallLength   int        `json:"call_length"`
+	ShortName    string     `json:"short_name"`
+	Filename     string     `json:"filename"`
+	SrcList      []SrcItem  `json:"srcList"`
+}
+
+// DvcfMsg wraps a DVCF message from the mqtt_dvcf plugin.
+type DvcfMsg struct {
+	AudioDvcfBase64 string       `json:"audio_dvcf_base64"`
+	Metadata        DvcfMetadata `json:"metadata"`
+}
+
 // ConsoleLogData is the inner data for a trunk-recorder console log message.
 type ConsoleLogData struct {
 	Time     string `json:"time"`     // ISO 8601 timestamp from TR

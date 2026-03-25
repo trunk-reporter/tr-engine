@@ -25,6 +25,7 @@ func (h *UsersHandler) Routes(r chi.Router) {
 	r.Get("/", h.List)
 	r.Post("/", h.Create)
 	r.Patch("/{id}", h.Update)
+	r.Delete("/all", h.DeleteAll) // bulk delete (downgrade path) — must precede /{id}
 	r.Delete("/{id}", h.Delete)
 }
 
@@ -250,4 +251,17 @@ func (h *UsersHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		Msg("user deleted")
 
 	WriteJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// DeleteAll removes all users and their API keys (cascade). Used for the
+// downgrade-to-token-auth path. Bypasses self-delete and last-admin protections.
+func (h *UsersHandler) DeleteAll(w http.ResponseWriter, r *http.Request) {
+	initiatedBy := ContextUserID(r)
+	if err := h.db.DeleteAllUsers(r.Context()); err != nil {
+		h.log.Error().Err(err).Msg("users: delete all failed")
+		WriteError(w, http.StatusInternalServerError, "failed to delete all users")
+		return
+	}
+	h.log.Warn().Int("initiated_by", initiatedBy).Msg("all users deleted — downgrading to token auth")
+	WriteJSON(w, http.StatusOK, map[string]string{"status": "all users deleted"})
 }

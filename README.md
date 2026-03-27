@@ -7,7 +7,7 @@ Zero configuration for radio systems — tr-engine discovers systems, sites, tal
 > **Note:** This is a ground-up rewrite of the original tr-engine, now archived at [LumenPrima/tr-engine-v0](https://github.com/LumenPrima/tr-engine-v0). The database schema is not compatible — there is no migration path from v0. If you're coming from v0, see the **[migration guide](docs/migrating-from-v0.md)**. If you're starting fresh, you're in the right place.
 
 > **Warning:** This project is almost entirely AI-written (Claude Code pair programming). It works, but it may also eat your computer or your pets. Specifically:
-> - **Set `AUTH_TOKEN` before exposing to the internet.** tr-engine includes bearer token auth, per-IP rate limiting, CORS origin restrictions, and request body size limits — but all are opt-in or have permissive defaults. For production use, set `AUTH_TOKEN`, configure `CORS_ORIGINS`, and put it behind a reverse proxy (Caddy, nginx, etc.) with TLS.
+> - **Set `AUTH_TOKEN` before exposing to the internet.** tr-engine includes bearer token auth, per-IP rate limiting, CORS origin restrictions, and request body size limits — but all are opt-in or have permissive defaults. For production use, set `AUTH_TOKEN` (read-only access) and `WRITE_TOKEN` (mutations), configure `CORS_ORIGINS`, and put it behind a reverse proxy (Caddy, nginx, etc.) with TLS. Alternatively, set `ADMIN_PASSWORD` to enable user login mode (JWT) — this disables static bearer tokens and requires per-user authentication.
 > - **The ad-hoc SQL query endpoint (`/query`)** is disabled unless `AUTH_TOKEN` is set, and runs in a read-only transaction with a 30-second timeout.
 > - **Installation instructions have not been thoroughly vetted** and may cause random fires. Test in a disposable environment first.
 
@@ -50,7 +50,7 @@ All pages support 11 switchable themes. Here's the detail view with activity cha
 Run this from your trunk-recorder directory (requires [Docker](https://docs.docker.com/get-docker/)):
 
 ```bash
-curl -sL https://raw.githubusercontent.com/LumenPrima/tr-engine/master/install.sh | sh
+curl -sL https://raw.githubusercontent.com/trunk-reporter/tr-engine/master/install.sh | sh
 ```
 
 That's it. Open http://localhost:8080 — call recordings will appear as trunk-recorder captures them.
@@ -103,7 +103,10 @@ The `.env` file is auto-loaded from the current directory on startup. See `sampl
 | `TR_DIR` | * | | Path to trunk-recorder directory for auto-discovery |
 | `MQTT_TOPICS` | No | `#` | MQTT topic filter (match your TR plugin prefix with `/#`) |
 | `HTTP_ADDR` | No | `:8080` | HTTP listen address |
-| `AUTH_TOKEN` | No | | Bearer token for API auth (disabled if empty) |
+| `AUTH_TOKEN` | No | | Bearer token for read-only API access. Auto-generated if unset (logged at startup). |
+| `WRITE_TOKEN` | No | | Bearer token required for write operations (POST/PUT/PATCH/DELETE). If unset with auth enabled, API is read-only. |
+| `JWT_SECRET` | No | | HMAC secret for JWT signing (user login mode). Auto-generated if unset (sessions lost on restart). |
+| `ADMIN_PASSWORD` | No | | Enables user login mode — seeds admin user, disables static bearer tokens. |
 | `CORS_ORIGINS` | No | `*` | Comma-separated allowed CORS origins (empty = allow all) |
 | `RATE_LIMIT_RPS` | No | `20` | Per-IP rate limit (requests/second) |
 | `RATE_LIMIT_BURST` | No | `40` | Per-IP rate limit burst size |
@@ -204,6 +207,8 @@ All under `/api/v1`. See `openapi.yaml` for the full specification.
 | `PUT /calls/{id}/transcription` | Submit human correction |
 | `POST /calls/{id}/transcribe` | Enqueue call for transcription |
 | `POST /admin/systems/merge` | Merge duplicate systems |
+| `GET /admin/maintenance` | View maintenance schedule and last run results |
+| `POST /admin/maintenance` | Trigger immediate maintenance run |
 | `POST /call-upload` | Upload call recording (rdio-scanner/OpenMHz compatible) |
 | `POST /query` | Ad-hoc read-only SQL queries |
 

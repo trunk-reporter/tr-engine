@@ -1,0 +1,42 @@
+{
+    "ver": 2,
+    "sources": [{
+        "center": 852120000,
+        "rate": 2048000,
+        "error": 0,
+        "gain": 39,
+        "debugRecorders": 0,
+        "digitalRecorders": 9,
+        "driver": "osmosdr",
+        "device": "rtl=00000102"
+    }, {
+        "center": 853587500,
+        "rate": 2048000,
+        "error": 0,
+        "gain": 39,
+        "digitalRecorders": 3,
+        "driver": "osmosdr",
+        "device": "rtl=00000101"
+    }],
+
+    "systems": [{
+        "control_channels": [851587500, 851650000, 851975000, 851162500],
+        "type": "p25",
+        "talkgroupsFile": "chan.csv",
+        "unitTagsFile": "units.csv",
+        "shortName": "scp25",
+        "compressWav": "true",
+        "digitalLevels": 5,
+        "audioArchive": false,
+        "recordUnknown": false,
+        "modulation": "qpsk",
+        "apiKey": "key",
+        "uploadScript": "/home/pi/trunk-recorder/encode-upload.sh",
+        "broadcastifyApiKey": "key",
+        "broadcastifySystemId": "id"
+}],
+        "captureDir": "/home/pi/trunk-player/audio_files",
+        "uploadServer": "https://api.openmhz.com",
+        "broadcastifyCallsServer": "https://api.broadcastify.com/call-upload",
+        "logFile": false
+}

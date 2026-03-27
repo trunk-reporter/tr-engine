@@ -805,7 +805,7 @@
         el('td', null, [el('code', { text: (k.key_prefix || '\u2014') + '...' })]),
         el('td', null, [el('span', { cls: 'role-badge ' + k.role, text: k.role })]),
         el('td', { text: owner }),
-        el('td', { text: fmtDate(k.last_used) }),
+        el('td', { text: fmtDate(k.last_used_at) }),
         el('td', { css: 'text-align:right' }, [
           el('button', { cls: 'action-link danger', text: 'revoke', onclick: function() { revokeKey(k); } })
         ])
@@ -864,33 +864,15 @@
     btn.disabled = true; btn.textContent = 'Deleting...';
 
     try {
-      var selfId = currentUser ? currentUser.id : null;
-      var others = allUsers.filter(function(u) { return u.id !== selfId; });
-      var self = allUsers.find(function(u) { return u.id === selfId; });
-
-      // Delete other users first
-      for (var i = 0; i < others.length; i++) {
-        var resp = await api('DELETE', '/users/' + others[i].id);
-        if (!resp._ok) {
-          showErr('downgrade-err', 'Failed to delete ' + others[i].username + ': ' + (resp.error || 'unknown error'));
-          btn.disabled = false; btn.textContent = 'Delete All Users';
-          return;
-        }
+      var resp = await api('DELETE', '/users/all');
+      if (resp._ok) {
+        localStorage.removeItem('tr-engine-jwt');
+        toast('All users deleted \u2014 reverting to token auth');
+        setTimeout(function() { location.reload(); }, 1000);
+      } else {
+        showErr('downgrade-err', resp.error || 'Delete failed');
+        btn.disabled = false; btn.textContent = 'Delete All Users';
       }
-
-      // Delete all API keys
-      for (var j = 0; j < allKeys.length; j++) {
-        await api('DELETE', '/auth/keys/' + allKeys[j].id + '/any');
-      }
-
-      // Delete self last
-      if (self) {
-        await api('DELETE', '/users/' + self.id);
-      }
-
-      localStorage.removeItem('tr-engine-jwt');
-      toast('All users deleted \u2014 reverting to token auth');
-      setTimeout(function() { location.reload(); }, 1000);
     } catch (e) {
       showErr('downgrade-err', 'Network error during downgrade');
       btn.disabled = false; btn.textContent = 'Delete All Users';

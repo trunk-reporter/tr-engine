@@ -16,6 +16,7 @@ type APIKey struct {
 	ID               int        `json:"id"`
 	KeyPrefix        string     `json:"key_prefix"`
 	UserID           *int       `json:"user_id,omitempty"`
+	Username         *string    `json:"username,omitempty"` // populated in admin list view
 	Role             string     `json:"role"`
 	Label            string     `json:"label"`
 	IsServiceAccount bool       `json:"is_service_account"`
@@ -109,16 +110,27 @@ func (db *DB) ListAPIKeysByUser(ctx context.Context, userID int) ([]APIKey, erro
 	return scanAPIKeys(rows)
 }
 
-// ListAllAPIKeys returns all keys (admin view).
+// ListAllAPIKeys returns all keys with owner username (admin view).
 func (db *DB) ListAllAPIKeys(ctx context.Context) ([]APIKey, error) {
 	rows, err := db.Pool.Query(ctx,
-		`SELECT id, key_prefix, user_id, role, label, is_service_account, created_at, last_used_at
-		 FROM api_keys ORDER BY created_at DESC`)
+		`SELECT ak.id, ak.key_prefix, ak.user_id, ak.role, ak.label, ak.is_service_account, ak.created_at, ak.last_used_at, u.username
+		 FROM api_keys ak
+		 LEFT JOIN users u ON u.id = ak.user_id
+		 ORDER BY ak.created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanAPIKeys(rows)
+
+	var keys []APIKey
+	for rows.Next() {
+		var k APIKey
+		if err := rows.Scan(&k.ID, &k.KeyPrefix, &k.UserID, &k.Role, &k.Label, &k.IsServiceAccount, &k.CreatedAt, &k.LastUsedAt, &k.Username); err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
 }
 
 // DeleteAPIKey deletes a key by ID. Returns pgx.ErrNoRows if not found.

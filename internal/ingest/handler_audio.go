@@ -81,6 +81,22 @@ func (p *Pipeline) handleAudio(payload []byte) error {
 			}
 		}
 
+		// Decode and save .dvcf file alongside audio (for IMBE ASR)
+		if msg.Call.AudioDvcfBase64 != "" && audioPath != "" {
+			dvcfDecoded, dvcfErr := base64.StdEncoding.DecodeString(msg.Call.AudioDvcfBase64)
+			if dvcfErr != nil {
+				p.log.Warn().Err(dvcfErr).Msg("failed to decode dvcf base64")
+			} else {
+				dvcfExt := filepath.Ext(audioPath)
+				tapKey := strings.TrimSuffix(audioPath, dvcfExt) + ".dvcf"
+				if err := p.saveAudio(ctx, tapKey, dvcfDecoded, "application/octet-stream"); err != nil {
+					p.log.Error().Err(err).Str("tap_key", tapKey).Msg("failed to save tap file")
+				} else {
+					p.log.Debug().Str("tap_key", tapKey).Int("tap_size", len(dvcfDecoded)).Msg("tap file saved")
+				}
+			}
+		}
+
 		if callID > 0 && audioPath != "" {
 			if err := p.db.UpdateCallAudio(ctx, callID, callStartTime, audioPath, audioSize); err != nil {
 				p.log.Warn().Err(err).Int64("call_id", callID).Msg("failed to update call audio")

@@ -175,7 +175,7 @@ If you have multiple TR instances monitoring the same P25 network from different
 ### Build
 
 ```bash
-git clone https://github.com/LumenPrima/tr-engine.git
+git clone https://github.com/trunk-reporter/tr-engine.git
 cd tr-engine
 bash build.sh
 ```

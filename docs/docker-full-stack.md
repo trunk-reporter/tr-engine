@@ -53,9 +53,9 @@ Production deployment with Caddy (automatic HTTPS), Mosquitto (MQTT broker), tr-
 
 ```bash
 mkdir tr-engine && cd tr-engine
-curl -sO https://raw.githubusercontent.com/LumenPrima/tr-engine/master/docker-compose.full.yml
+curl -sO https://raw.githubusercontent.com/trunk-reporter/tr-engine/master/docker-compose.full.yml
 mv docker-compose.full.yml docker-compose.yml
-curl -sO https://raw.githubusercontent.com/LumenPrima/tr-engine/master/sample.env
+curl -sO https://raw.githubusercontent.com/trunk-reporter/tr-engine/master/sample.env
 cp sample.env .env
 ```
 
@@ -108,7 +108,7 @@ Key variables:
 | `AUTH_TOKEN` | Strongly recommended | Read-only API token (Caddy injects this for browser requests) |
 | `WRITE_TOKEN` | Strongly recommended | Write token for mutating operations (POST/PATCH/PUT/DELETE) |
 
-See [`sample.env`](https://github.com/LumenPrima/tr-engine/blob/master/sample.env) for all available options. Settings like `TR_DIR`, transcription, file watch, and S3 storage are documented in the [Docker Compose guide](./docker.md).
+See [`sample.env`](https://github.com/trunk-reporter/tr-engine/blob/master/sample.env) for all available options. Settings like `TR_DIR`, transcription, file watch, and S3 storage are documented in the [Docker Compose guide](./docker.md).
 
 ## 3. Set up Mosquitto
 

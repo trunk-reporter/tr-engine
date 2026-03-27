@@ -20,7 +20,7 @@ If you don't have these yet, see the [build from source guide](./getting-started
 
 ## 1. Download
 
-Grab the latest release for your platform from the [releases page](https://github.com/LumenPrima/tr-engine/releases):
+Grab the latest release for your platform from the [releases page](https://github.com/trunk-reporter/tr-engine/releases):
 
 | Platform | File |
 |----------|------|
@@ -32,7 +32,7 @@ Grab the latest release for your platform from the [releases page](https://githu
 
 ```bash
 # Example: Linux amd64
-curl -LO https://github.com/LumenPrima/tr-engine/releases/latest/download/tr-engine-linux-amd64.tar.gz
+curl -LO https://github.com/trunk-reporter/tr-engine/releases/latest/download/tr-engine-linux-amd64.tar.gz
 tar xzf tr-engine-linux-amd64.tar.gz
 chmod +x tr-engine
 ```

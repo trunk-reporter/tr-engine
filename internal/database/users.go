@@ -189,3 +189,10 @@ func (db *DB) CountUsers(ctx context.Context) (int, error) {
 	err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM users`).Scan(&count)
 	return count, err
 }
+
+// DeleteAllUsers removes all users (and their API keys via CASCADE).
+// Used for the downgrade-to-token-auth admin action.
+func (db *DB) DeleteAllUsers(ctx context.Context) error {
+	_, err := db.Pool.Exec(ctx, `DELETE FROM users`)
+	return err
+}

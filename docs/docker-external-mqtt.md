@@ -18,7 +18,7 @@ Run tr-engine via Docker Compose, connecting to an MQTT broker you already have 
 
 ```bash
 mkdir tr-engine && cd tr-engine
-curl -sO https://raw.githubusercontent.com/LumenPrima/tr-engine/master/docker-compose.yml
+curl -sO https://raw.githubusercontent.com/trunk-reporter/tr-engine/master/docker-compose.yml
 ```
 
 ## 2. Configure your MQTT broker
@@ -39,7 +39,7 @@ MQTT_TOPICS=trengine/#
 | `MQTT_PASSWORD` | Broker credentials (leave empty for anonymous) |
 | `MQTT_TOPICS` | Must match your TR plugin's topic prefix with `/#`. If your TR plugin uses `topic: "myradio/feeds"`, set this to `myradio/#` |
 
-See [`sample.env`](https://github.com/LumenPrima/tr-engine/blob/master/sample.env) for all available options.
+See [`sample.env`](https://github.com/trunk-reporter/tr-engine/blob/master/sample.env) for all available options.
 
 ## 3. Edit `docker-compose.yml`
 
@@ -138,7 +138,7 @@ docker compose exec postgres pg_dump -U trengine trengine > backup.sql
 
 ## Other settings
 
-Everything else is optional and has sensible defaults. Add any variable from [sample.env](https://github.com/LumenPrima/tr-engine/blob/master/sample.env) to your `.env` file:
+Everything else is optional and has sensible defaults. Add any variable from [sample.env](https://github.com/trunk-reporter/tr-engine/blob/master/sample.env) to your `.env` file:
 
 ```bash
 AUTH_TOKEN=my-secret                # API authentication token
@@ -170,7 +170,7 @@ In `docker-compose.yml`:
       - /path/to/trunk-recorder:/tr-config:ro
 ```
 
-`TR_DIR` reads TR's `config.json`, auto-sets `WATCH_DIR` and `TR_AUDIO_DIR`, and imports talkgroup and unit tag CSVs. See [sample.env](https://github.com/LumenPrima/tr-engine/blob/master/sample.env) for all available options.
+`TR_DIR` reads TR's `config.json`, auto-sets `WATCH_DIR` and `TR_AUDIO_DIR`, and imports talkgroup and unit tag CSVs. See [sample.env](https://github.com/trunk-reporter/tr-engine/blob/master/sample.env) for all available options.
 
 ### Filesystem audio (TR_AUDIO_DIR)
 

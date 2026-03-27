@@ -101,6 +101,10 @@ type Config struct {
 	DeepInfraAPIKey string `env:"DEEPINFRA_STT_API_KEY"`
 	DeepInfraModel  string `env:"DEEPINFRA_STT_MODEL" envDefault:"openai/whisper-large-v3-turbo"`
 
+	// IMBE ASR (alternative to Whisper; used when STT_PROVIDER=imbe)
+	IMBEAsrURL   string `env:"IMBE_ASR_URL"`
+	IMBEAsrModel string `env:"IMBE_ASR_MODEL" envDefault:"imbe"`
+
 	// LLM post-processing (optional — disabled when LLM_URL is empty; not yet implemented)
 	LLMUrl     string        `env:"LLM_URL"`
 	LLMModel   string        `env:"LLM_MODEL"`

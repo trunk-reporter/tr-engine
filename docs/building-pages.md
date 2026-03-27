@@ -28,7 +28,7 @@ If you prefer to copy-paste directly, here are the prompt skeletons. Replace `{D
 Build a single-file HTML page that will be served from tr-engine's web/ directory.
 
 ## API Specification
-Read the full API spec here: https://raw.githubusercontent.com/LumenPrima/tr-engine/master/openapi.yaml
+Read the full API spec here: https://raw.githubusercontent.com/trunk-reporter/tr-engine/master/openapi.yaml
 
 Use any endpoints you need. All endpoints are under /api/v1. Responses use {items, total, limit, offset} pagination.
 
@@ -77,7 +77,7 @@ Event types: call_start, call_end, unit_event, recorder_update, rate_update
 Build a self-contained single-file HTML page that connects to a tr-engine REST API instance.
 
 ## API Specification
-Read the full API spec here: https://raw.githubusercontent.com/LumenPrima/tr-engine/master/openapi.yaml
+Read the full API spec here: https://raw.githubusercontent.com/trunk-reporter/tr-engine/master/openapi.yaml
 
 Use any endpoints you need. All endpoints are under /api/v1. Responses use {items, total, limit, offset} pagination.
 
@@ -125,7 +125,7 @@ These work well as-is or as starting points:
 
 ## API Reference
 
-Full API specification: [openapi.yaml](https://raw.githubusercontent.com/LumenPrima/tr-engine/master/openapi.yaml)
+Full API specification: [openapi.yaml](https://raw.githubusercontent.com/trunk-reporter/tr-engine/master/openapi.yaml)
 
 Interactive docs: [API Docs](/docs.html) on your tr-engine instance
 

@@ -1110,6 +1110,8 @@ func (p *Pipeline) dispatch(route *Route, topic string, payload []byte, env *Env
 		err = p.handleCallsActive(payload)
 	case "audio":
 		err = p.handleAudio(payload)
+	case "dvcf":
+		err = p.handleDvcf(payload)
 	case "recorders":
 		err = p.handleRecorders(payload)
 	case "recorder":
@@ -1215,6 +1217,8 @@ func (p *Pipeline) archiveRaw(handler, topic string, payload []byte, instanceID 
 	rawPayload := payload
 	if handler == "audio" {
 		rawPayload = stripAudioBase64(payload)
+	} else if handler == "dvcf" {
+		rawPayload = stripDvcfBase64(payload)
 	}
 	p.rawBatcher.Add(database.RawMessageRow{
 		Topic:      topic,
@@ -1337,6 +1341,21 @@ func stripAudioBase64(payload []byte) []byte {
 		return payload
 	}
 	obj["call"] = callBytes
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return payload
+	}
+	return out
+}
+
+// stripDvcfBase64 removes the base64 DVCF data from dvcf message payloads
+// before storing in mqtt_raw_messages.
+func stripDvcfBase64(payload []byte) []byte {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &obj); err != nil {
+		return payload
+	}
+	delete(obj, "audio_dvcf_base64")
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return payload

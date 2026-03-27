@@ -67,6 +67,11 @@ func ParseTopic(topic string) *Route {
 		return &Route{Handler: "trunking_message", SysName: parts[n-2]}
 	}
 
+	// DVCF file messages: .../dvcf
+	if last == "dvcf" {
+		return &Route{Handler: "dvcf"}
+	}
+
 	// Unit events: .../{sys_name}/{event_type}
 	switch last {
 	case "on", "off", "call", "end", "join", "location", "ackresp", "data", "signal":

@@ -50,10 +50,10 @@ psql -U trengine -d trengine -f schema.sql
 
 ### 3. Install v1
 
-Download the binary for your platform from the [releases page](https://github.com/LumenPrima/tr-engine/releases), or build from source:
+Download the binary for your platform from the [releases page](https://github.com/trunk-reporter/tr-engine/releases), or build from source:
 
 ```bash
-git clone https://github.com/LumenPrima/tr-engine.git
+git clone https://github.com/trunk-reporter/tr-engine.git
 cd tr-engine
 bash build.sh
 ```

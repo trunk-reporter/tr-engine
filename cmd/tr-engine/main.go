@@ -215,10 +215,15 @@ func main() {
 			log.Fatal().Msg("STT_PROVIDER=deepinfra requires DEEPINFRA_STT_API_KEY")
 		}
 		sttProvider = transcribe.NewDeepInfraClient(cfg.DeepInfraAPIKey, cfg.DeepInfraModel, cfg.WhisperTimeout)
+	case "imbe":
+		if cfg.IMBEAsrURL == "" {
+			log.Fatal().Msg("STT_PROVIDER=imbe requires IMBE_ASR_URL")
+		}
+		sttProvider = transcribe.NewIMBEClient(cfg.IMBEAsrURL, cfg.IMBEAsrModel, cfg.WhisperTimeout)
 	case "none", "":
 		// Transcription explicitly disabled
 	default:
-		log.Fatal().Str("provider", cfg.STTProvider).Msg("unknown STT_PROVIDER (valid: whisper, elevenlabs, deepinfra, none)")
+		log.Fatal().Str("provider", cfg.STTProvider).Msg("unknown STT_PROVIDER (valid: whisper, elevenlabs, deepinfra, imbe, none)")
 	}
 
 	if sttProvider != nil {

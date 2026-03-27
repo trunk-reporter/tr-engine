@@ -4,7 +4,7 @@ Run tr-engine with a single command. Docker Compose handles PostgreSQL, the MQTT
 
 > **Don't have the MQTT plugin?** Run this from your trunk-recorder directory — no setup needed:
 > ```bash
-> curl -sL https://raw.githubusercontent.com/LumenPrima/tr-engine/master/install.sh | sh
+> curl -sL https://raw.githubusercontent.com/trunk-reporter/tr-engine/master/install.sh | sh
 > ```
 > This installs everything (including PostgreSQL) and starts watching your call recordings automatically.
 
@@ -23,7 +23,7 @@ Run tr-engine with a single command. Docker Compose handles PostgreSQL, the MQTT
 
 ```bash
 mkdir tr-engine && cd tr-engine
-curl -sO https://raw.githubusercontent.com/LumenPrima/tr-engine/master/docker-compose.yml
+curl -sO https://raw.githubusercontent.com/trunk-reporter/tr-engine/master/docker-compose.yml
 docker compose up -d
 ```
 
@@ -121,7 +121,7 @@ tr-engine works with zero configuration — all defaults are built into `docker-
 
 ```bash
 # Download the reference with all options documented
-curl -sO https://raw.githubusercontent.com/LumenPrima/tr-engine/master/sample.env
+curl -sO https://raw.githubusercontent.com/trunk-reporter/tr-engine/master/sample.env
 cp sample.env .env
 # Edit .env with your settings, then: docker compose up -d
 ```
@@ -148,7 +148,7 @@ Docker-specific settings (ignored when running the binary directly):
 # MQTT_PORT=1883                # host port for the MQTT broker
 ```
 
-See [`sample.env`](https://github.com/LumenPrima/tr-engine/blob/master/sample.env) for all available options with descriptions.
+See [`sample.env`](https://github.com/trunk-reporter/tr-engine/blob/master/sample.env) for all available options with descriptions.
 
 > **Note:** `DATABASE_URL`, `MQTT_BROKER_URL`, and `AUDIO_DIR` are set automatically by `docker-compose.yml` and don't need to appear in `.env`. Database credentials flow from `POSTGRES_*` variables into both the postgres container and `DATABASE_URL` automatically.
 
@@ -371,12 +371,12 @@ To pull the latest web UI files from GitHub without rebuilding:
 
 **Linux/Mac:**
 ```bash
-mkdir -p web && cd web && curl -s https://api.github.com/repos/LumenPrima/tr-engine/contents/web | python3 -c "import json,sys,urllib.request; [urllib.request.urlretrieve(f['download_url'],f['name']) for f in json.load(sys.stdin) if f['type']=='file']"
+mkdir -p web && cd web && curl -s https://api.github.com/repos/trunk-reporter/tr-engine/contents/web | python3 -c "import json,sys,urllib.request; [urllib.request.urlretrieve(f['download_url'],f['name']) for f in json.load(sys.stdin) if f['type']=='file']"
 ```
 
 **Windows (PowerShell):**
 ```powershell
-mkdir -Force web; (irm https://api.github.com/repos/LumenPrima/tr-engine/contents/web) | ? type -eq file | % { iwr $_.download_url -Out "web/$($_.name)" }
+mkdir -Force web; (irm https://api.github.com/repos/trunk-reporter/tr-engine/contents/web) | ? type -eq file | % { iwr $_.download_url -Out "web/$($_.name)" }
 ```
 
 Run from the directory containing your `docker-compose.yml`. Changes take effect on the next browser refresh — no restart needed.

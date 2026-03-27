@@ -1,0 +1,46 @@
+[ 95%] Built target unit_script
+/home/dygear/trunk-recorder/user_plugins/tr-web/tr_web_plugin.cc: In lambda function:
+/home/dygear/trunk-recorder/user_plugins/tr-web/tr_web_plugin.cc:817:35: error: ‘class System’ has no member named ‘get_unit_tags’; did you mean ‘get_unit_tags_file’?
+  817 |             for (auto* tag : sys->get_unit_tags()) {
+      |                                   ^~~~~~~~~~~~~
+      |                                   get_unit_tags_file
+/home/dygear/trunk-recorder/user_plugins/tr-web/tr_web_plugin.cc:827:31: error: ‘class System’ has no member named ‘get_unit_tags_mode’; did you mean ‘get_unit_tags_file’?
+  827 |                 {"mode", sys->get_unit_tags_mode()},
+      |                               ^~~~~~~~~~~~~~~~~~
+      |                               get_unit_tags_file
+/home/dygear/trunk-recorder/user_plugins/tr-web/tr_web_plugin.cc:830:13: error: could not convert ‘{{"file", System::get_unit_tags_file()}, {"mode", <expression error>}, {"count", tags.nlohmann::json_abi_v3_12_0::basic_json<>::size()}, {"tags", tags}}’ from ‘<brace-enclosed initializer list>’ to ‘json’ {aka ‘nlohmann::json_abi_v3_12_0::basic_json<>’}
+  830 |             };
+      |             ^
+      |             |
+      |             <brace-enclosed initializer list>
+/home/dygear/trunk-recorder/user_plugins/tr-web/tr_web_plugin.cc: In lambda function:
+/home/dygear/trunk-recorder/user_plugins/tr-web/tr_web_plugin.cc:857:35: error: ‘class System’ has no member named ‘get_unit_tags_ota’; did you mean ‘get_unit_tags_file’?
+  857 |             for (auto* ota : sys->get_unit_tags_ota()) {
+      |                                   ^~~~~~~~~~~~~~~~~
+      |                                   get_unit_tags_file
+/home/dygear/trunk-recorder/user_plugins/tr-web/tr_web_plugin.cc:865:31: error: ‘class System’ has no member named ‘get_unit_tags_ota_file’; did you mean ‘get_unit_tags_file’?
+  865 |                 {"file", sys->get_unit_tags_ota_file()},
+      |                               ^~~~~~~~~~~~~~~~~~~~~~
+      |                               get_unit_tags_file
+/home/dygear/trunk-recorder/user_plugins/tr-web/tr_web_plugin.cc:868:13: error: could not convert ‘{{"file", <expression error>}, {"count", aliases.nlohmann::json_abi_v3_12_0::basic_json<>::size()}, {"aliases", aliases}}’ from ‘<brace-enclosed initializer list>’ to ‘json’ {aka ‘nlohmann::json_abi_v3_12_0::basic_json<>’}
+  868 |             };
+      |             ^
+      |             |
+      |             <brace-enclosed initializer list>
+/home/dygear/trunk-recorder/user_plugins/tr-web/tr_web_plugin.cc: In member function ‘json Tr_Web::get_system_json(System*)’:
+/home/dygear/trunk-recorder/user_plugins/tr-web/tr_web_plugin.cc:1242:37: error: ‘class System’ has no member named ‘get_unit_tags_mode’; did you mean ‘get_unit_tags_file’?
+ 1242 |             {"unit_tags_mode", sys->get_unit_tags_mode()},
+      |                                     ^~~~~~~~~~~~~~~~~~
+      |                                     get_unit_tags_file
+/home/dygear/trunk-recorder/user_plugins/tr-web/tr_web_plugin.cc:1243:41: error: ‘class System’ has no member named ‘get_unit_tags_ota_file’; did you mean ‘get_unit_tags_file’?
+ 1243 |             {"unit_tags_ota_file", sys->get_unit_tags_ota_file()}
+      |                                         ^~~~~~~~~~~~~~~~~~~~~~
+      |                                         get_unit_tags_file
+/home/dygear/trunk-recorder/user_plugins/tr-web/tr_web_plugin.cc:1244:9: error: could not convert ‘{{"sys_num", stat_node.boost::property_tree::basic_ptree<std::__cxx11::basic_string<char>, std::__cxx11::basic_string<char> >::get<int>(boost::property_tree::string_path<std::__cxx11::basic_string<char>, boost::property_tree::id_translator<std::__cxx11::basic_string<char> > >(((const char*)"id"), ((int)'.'), (boost::property_tree::id_translator<std::__cxx11::basic_string<char> >(), boost::property_tree::id_translator<std::__cxx11::basic_string<char> >())))}, {"sys_name", boost::property_tree::basic_ptree<Key, Data, KeyCompare>::get(const path_type&) const [with Type = std::__cxx11::basic_string<char>; Key = std::__cxx11::basic_string<char>; Data = std::__cxx11::basic_string<char>; KeyCompare = std::less<std::__cxx11::basic_string<char> >; path_type = boost::property_tree::string_path<std::__cxx11::basic_string<char>, boost::property_tree::id_translator<std::__cxx11::basic_string<char> > >](boost::property_tree::string_path<std::__cxx11::basic_string<char>, boost::property_tree::id_translator<std::__cxx11::basic_string<char> > >(((const char*)"name"), ((int)'.'), (boost::property_tree::id_translator<std::__cxx11::basic_string<char> >(), boost::property_tree::id_translator<std::__cxx11::basic_string<char> >())))}, {"type", boost::property_tree::basic_ptree<Key, Data, KeyCompare>::get(const path_type&) const [with Type = std::__cxx11::basic_string<char>; Key = std::__cxx11::basic_string<char>; Data = std::__cxx11::basic_string<char>; KeyCompare = std::less<std::__cxx11::basic_string<char> >; path_type = boost::property_tree::string_path<std::__cxx11::basic_string<char>, boost::property_tree::id_translator<std::__cxx11::basic_string<char> > >](boost::property_tree::string_path<std::__cxx11::basic_string<char>, boost::property_tree::id_translator<std::__cxx11::basic_string<char> > >(((const char*)"type"), ((int)'.'), (boost::property_tree::id_translator<std::__cxx11::basic_string<char> >(), boost::property_tree::id_translator<std::__cxx11::basic_string<char> >())))}, {"sysid", Tr_Web::int_to_hex(int, int)(stat_node.boost::property_tree::basic_ptree<std::__cxx11::basic_string<char>, std::__cxx11::basic_string<char> >::get<int>(boost::property_tree::string_path<std::__cxx11::basic_string<char>, boost::property_tree::id_translator<std::__cxx11::basic_string<char> > >(((const char*)"sysid"), ((int)'.'), (boost::property_tree::id_translator<std::__cxx11::basic_string<char> >(), boost::property_tree::id_translator<std::__cxx11::basic_string<char> >()))), 0)}, {"wacn", Tr_Web::int_to_hex(int, int)(stat_node.boost::property_tree::basic_ptree<std::__cxx11::basic_string<char>, std::__cxx11::basic_string<char> >::get<int>(boost::property_tree::string_path<std::__cxx11::basic_string<char>, boost::property_tree::id_translator<std::__cxx11::basic_string<char> > >(((const char*)"wacn"), ((int)'.'), (boost::property_tree::id_translator<std::__cxx11::basic_string<char> >(), boost::property_tree::id_translator<std::__cxx11::basic_string<char> >()))), 0)}, {"nac", Tr_Web::int_to_hex(int, int)(stat_node.boost::property_tree::basic_ptree<std::__cxx11::basic_string<char>, std::__cxx11::basic_string<char> >::get<int>(boost::property_tree::string_path<std::__cxx11::basic_string<char>, boost::property_tree::id_translator<std::__cxx11::basic_string<char> > >(((const char*)"nac"), ((int)'.'), (boost::property_tree::id_translator<std::__cxx11::basic_string<char> >(), boost::property_tree::id_translator<std::__cxx11::basic_string<char> >()))), 0)}, {"rfss", sys->System::get_sys_rfss()}, {"site_id", sys->System::get_sys_site_id()}, {"control_channel", control_channel}, {"control_channels", control_channels}, {"talkgroups_file", System::get_talkgroups_file()}, {"unit_tags_file", System::get_unit_tags_file()}, {"unit_tags_mode", <expression error>}, {"unit_tags_ota_file", <expression error>}}’ from ‘<brace-enclosed initializer list>’ to ‘json’ {aka ‘nlohmann::json_abi_v3_12_0::basic_json<>’}
+ 1244 |         };
+      |         ^
+      |         |
+      |         <brace-enclosed initializer list>
+make[2]: *** [user_plugins/tr-web/CMakeFiles/tr_web_plugin.dir/build.make:86: user_plugins/tr-web/CMakeFiles/tr_web_plugin.dir/tr_web_plugin.cc.o] Error 1
+make[1]: *** [CMakeFiles/Makefile2:626: user_plugins/tr-web/CMakeFiles/tr_web_plugin.dir/all] Error 2
+make[1]: *** Waiting for unfinished jobs....

@@ -247,14 +247,16 @@ HTML pages in `web/` are auto-discovered and listed on the index page via meta t
 - Health endpoint — shows database, MQTT, and trunk-recorder instance status (connected/disconnected with last_seen timestamps)
 - Dev tools — `cmd/mqtt-dump` (MQTT traffic inspector), `cmd/dbcheck` (DB analysis)
 - Security hardening — proxy-aware per-IP rate limiting, 10 MB request body limit, response timeout for non-streaming handlers, CORS origin restrictions, XSS prevention in web UI
-- Two-tier auth — read token (`AUTH_TOKEN`, auto-generated if not set) gates all API access; write token (`WRITE_TOKEN`) required for POST/PATCH/PUT/DELETE. When auth is enabled but `WRITE_TOKEN` is not set, the API runs in **read-only mode** — all mutating requests (including uploads) are rejected with 403. `GET /api/v1/auth-init` serves only the read token. Web pages load the read token via `auth.js` for seamless read access. Write operations (tag edits, system merges, transcription corrections, call uploads) require the write token, which is never exposed by any endpoint. When both tokens are empty (`AUTH_ENABLED=false`), all requests pass through with no auth.
+- Two-tier auth — read token (`AUTH_TOKEN`, auto-generated if not set) gates all API access; write token (`WRITE_TOKEN`) required for POST/PATCH/PUT/DELETE. When auth is enabled but `WRITE_TOKEN` is not set, the API runs in **read-only mode** — all mutating requests (including uploads) are rejected with 403. `GET /api/v1/auth-init` returns `{"token": "...", "guest_access": true}` — the read token for web UI pages, plus `guest_access` flag so external dashboards (tr-dashboard) can skip the login form and use Caddy-injected tokens for read access. If a valid JWT is in the request, auth-init also returns `user` info. Web pages load the read token via `auth.js` for seamless read access. Write operations (tag edits, system merges, transcription corrections, call uploads) require the write token, which is never exposed by any endpoint. When both tokens are empty (`AUTH_ENABLED=false`), all requests pass through with no auth — but note this also disables `auth-init` (tokens are cleared), which can break external dashboards that depend on it. For public demo deployments, keep `AUTH_ENABLED=true` with `ADMIN_PASSWORD` set and let Caddy inject the read token for guest access.
+- JWT auth — optional, enabled when `ADMIN_PASSWORD` is set. Seeds an admin user on first run, registers `/api/v1/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/setup`, `/auth/me` endpoints. `JWT_SECRET` auto-generated if not set (sessions lost on restart). External dashboards detect JWT availability by probing `/auth/login` OPTIONS — 404 means JWT not configured, 204 means it is.
 - Tag source tracking — `alpha_tag_source` on talkgroups and units (`manual`, `csv`, `mqtt`). Manual edits are preserved across MQTT and CSV re-imports.
 - Unit CSV import — loads unit tags from TR's `unitTagsFile` at startup; opt-in writeback on PATCH via `CSV_WRITEBACK`
 - Affiliation map eviction — stale entries (>24h) cleaned every 5 minutes
 - Warmup gate — buffers non-identity MQTT messages on fresh start until system registration establishes real P25 sysid/wacn, preventing duplicate system creation from early calls. Conventional systems release the gate immediately when their type is detected (no sysid to wait for). 5s timeout fallback if no system info arrives. Skipped on restart when identity cache loads from DB.
 - Recorder enrichment — SSE `recorder_update` events and REST recorder cache are enriched with `tgid`, `tg_alpha_tag`, `unit_id`, `unit_alpha_tag` by matching recorder frequency against active calls.
 - Theme engine — `theme-config.js` + `theme-engine.js` provide 11 switchable themes, sticky header with nav dropdown, keyboard shortcut (Ctrl+Shift+T), and page visibility management (hide/show pages per-browser via localStorage).
-- Transcription pipeline — pluggable STT providers (`STT_PROVIDER`): `whisper` (self-hosted or cloud Whisper-compatible API), `elevenlabs` (ElevenLabs Scribe API), `deepinfra` (DeepInfra hosted Whisper). Configurable workers, queue size, duration filters, anti-hallucination parameters. Performance tracking: `provider_ms` isolates STT call time from total `duration_ms`; queue stats endpoint includes rolling real-time ratio averages.
+- Transcription pipeline — pluggable STT providers (`STT_PROVIDER`): `whisper` (self-hosted or cloud Whisper-compatible API), `elevenlabs` (ElevenLabs Scribe API), `deepinfra` (DeepInfra hosted Whisper), `imbe` (IMBE ASR — transcribes directly from P25 IMBE codec frames). Configurable workers, queue size, duration filters, anti-hallucination parameters. Performance tracking: `provider_ms` isolates STT call time from total `duration_ms`; queue stats endpoint includes rolling real-time ratio averages.
+- IMBE ASR integration — when `STT_PROVIDER=imbe`, transcription is enqueued by `handleDvcf` (not `handleAudio` or other handlers). The DVCF plugin (`tr-plugin-dvcf`) publishes `.dvcf` files on a separate MQTT topic (`{topic}/dvcf`) without the standard TR envelope (no `instance_id`). `handleDvcf` saves the file, finds the matching call via `FindCallBySystemName(system_name, tgid, start_time ±5s)`, and enqueues transcription. All other `enqueueTranscription()` call sites are no-ops when IMBE is active. **Known limitation:** IMBE only handles P25 calls. Analog calls on the same system get no transcription. Future fix: dual-provider routing (IMBE for P25, Whisper fallback for analog).
 - Live audio streaming — trunk-recorder simplestream UDP ingest (`STREAM_LISTEN`), per-talkgroup Opus/PCM encoding, multi-site deduplication, WebSocket delivery (`GET /audio/live`) with subscribe/unsubscribe filtering. Browser playback via `audio-engine.js` + `audio-worklet.js` AudioWorklet.
 - DB maintenance — automated daily maintenance loop: partition creation (3 months ahead monthly, 3+ weeks ahead weekly), state table decimation (`recorder_snapshots`, `decode_rates`: 1/min after 1 week, 1/hr after 1 month), data purging (configurable retention via `RETENTION_*` env vars), stale call cleanup, orphan call_group cleanup. Admin API: `GET /api/v1/admin/maintenance` (view config + last run results), `POST /api/v1/admin/maintenance` (trigger immediate run). Both require WRITE_TOKEN.
 
@@ -297,58 +299,62 @@ The router (`router.go`) is prefix-agnostic — it matches on trailing segments 
 | `{message_topic}/{sys_name}/message` | `handleTrunkingMessage` | `trunking_message` | `trunking_messages` | Very high (batched) |
 | `{topic}/trunk_recorder/console` | `handleConsoleLog` | `console` | `console_messages` | Low-medium |
 | `{topic}/trunk_recorder/status` | `handleStatus` | _(none)_ | `plugin_statuses` | Very low |
+| `{topic}/dvcf` | `handleDvcf` | _(none)_ | filesystem (`.dvcf`) | Low |
 
 Trunking messages use a `Batcher` for CopyFrom batch inserts (same as raw messages and recorder snapshots). Console logs use simple single-row INSERT. The status handler caches TR instance status in-memory for the `/api/v1/health` endpoint rather than publishing SSE events.
 
 ## Deployed Instance
 
-A live v1 instance runs on `tr-dashboard` alongside the existing v0.
+Production runs on `gerty` via Docker Compose.
 
 ### Access
 
 | Service | URL | Port |
 |---------|-----|------|
-| v1 (this repo) | `https://tr-engine.luxprimatech.com` | 8000 on host |
-| v1 Tailnet (direct) | `http://tr-dashboard.pizzly-manta.ts.net:8000` | 8000 on host |
-| v0 (legacy) | `https://tr-dashboard.luxprimatech.com` | 8080 on host |
-| v0 API direct | `https://tr-api.luxprimatech.com` | 8080 on host |
+| tr-dashboard (UI) | `https://tr-dashboard.luxprimatech.com` | 80/443 (Caddy) |
+| tr-engine API (direct) | `https://tr-engine.luxprimatech.com` | 80/443 (Caddy) |
+| tr-engine API (Tailnet) | `http://gerty.pizzly-manta.ts.net:8080` | 8080 on host |
 
 **For API testing from scripts/CLI, prefer the Tailnet URL** — it bypasses Cloudflare (no WAF blocking, no rate limiting, no bot detection).
 
-### Architecture on tr-dashboard
+### Architecture on gerty
 
-- **v0** runs natively at `/data/tr-engine` with embedded PostgreSQL and embedded MQTT broker (port 1883)
-- **v1** runs via Docker Compose at `/data/tr-engine/v1` with its own PostgreSQL container
-- v1 connects to v0's embedded MQTT broker via `host.docker.internal:1883` — both ingest the same feed
-- **Caddy** reverse proxies all three domains, with Cloudflare in front (SSL: Full at domain level)
-- MQTT credentials: see `.env` on tr-dashboard
+- **tr-engine** runs via Docker Compose at `/docker/tr-engine` with its own PostgreSQL and Mosquitto containers
+- **tr-dashboard** runs as a separate container (`ghcr.io/trunk-reporter/tr-dashboard:latest`), served by Caddy
+- **Caddy** reverse proxies both domains, with Cloudflare in front (SSL: Full)
+- **Auth model (public demo):** `AUTH_ENABLED=true`, `ADMIN_PASSWORD` set, Caddy injects `AUTH_TOKEN` for guest read access. Dashboard detects `guest_access: true` from auth-init and skips login. Admins log in via JWT for write operations.
 
 ### SSH
 
 ```bash
-ssh root@tr-dashboard
+ssh root@gerty
 ```
 
-### Docker Compose (v1)
+### Docker Compose
 
 ```bash
 # Location
-cd /data/tr-engine/v1
+cd /docker/tr-engine
 
 # Status
 docker compose ps
 docker compose logs tr-engine --tail 20
 
-# Restart
+# Restart (picks up new images, NOT .env changes)
 docker compose up -d
 
-# Upgrade to new image
-docker compose pull && docker compose up -d
+# To pick up .env changes, must recreate:
+docker compose up -d tr-engine   # recreates with new env
+
+# Upgrade dashboard to new image
+docker compose pull tr-dashboard && docker compose up -d --force-recreate tr-dashboard
 ```
+
+**Important:** `docker compose restart` does NOT re-read `.env` — always use `docker compose up -d <service>` to recreate the container when env vars change.
 
 ### Dev Deploy Script
 
-`deploy-dev.sh` cross-compiles for linux/amd64, stops the container, uploads the binary, restarts, and pushes web files:
+`deploy-dev.sh` cross-compiles a static binary (`CGO_ENABLED=0`) for linux/amd64, stops the container, uploads the binary, restarts, and pushes web files:
 
 ```bash
 ./deploy-dev.sh              # full deploy (binary + web + restart)
@@ -356,77 +362,66 @@ docker compose pull && docker compose up -d
 ./deploy-dev.sh --binary-only # just push binary + restart
 ```
 
+The binary must be statically linked (`CGO_ENABLED=0`) because the container is Alpine (musl, not glibc).
+
 ### Updating Web Files (No Rebuild)
 
 Web files are embedded in the Go binary via `go:embed`, but the Docker deployment bind-mounts `./web:/opt/tr-engine/web` which overrides the embedded files. When a `web/` directory exists on disk, tr-engine serves from it instead — changes take effect on the next browser request with no restart.
 
-**Push local changes to deployed instance:**
 ```bash
-scp web/*.html web/*.js root@tr-dashboard:/data/tr-engine/v1/web/
+scp web/*.html web/*.js root@gerty:/docker/tr-engine/web/
 ```
 
-**Push a single file:**
-```bash
-scp web/stream-graph.html root@tr-dashboard:/data/tr-engine/v1/web/
-```
-
-**Pull latest from GitHub on the server:**
-```bash
-ssh root@tr-dashboard 'cd /data/tr-engine/v1/web && curl -s https://api.github.com/repos/LumenPrima/tr-engine/contents/web | python3 -c "import json,sys,urllib.request; [urllib.request.urlretrieve(f[\"download_url\"],f[\"name\"]) for f in json.load(sys.stdin) if f[\"type\"]==\"file\"]"'
-```
-
-### File Layout on tr-dashboard
+### File Layout on gerty
 
 ```
-/data/tr-engine/              # 3.6TB RAID mount
-├── config.yaml               # v0 config
-├── postgres/                  # v0 embedded PostgreSQL data
-├── audio/                     # v0 audio files
-├── mqtt/                      # v0 embedded Mosquitto data
-└── v1/
-    ├── docker-compose.yml     # PostgreSQL + tr-engine (no Mosquitto)
-    ├── pgdata/                # PostgreSQL data (bind-mounted into container)
-    ├── audio/                 # Call audio files (bind-mounted into container)
-    └── web/                   # Bind-mounted into container, overrides embedded UI
-        ├── auth.js             # Shared auth (fetches token from /api/v1/auth-init)
-        ├── index.html
-        ├── irc-radio-live.html
-        ├── stream-graph.html
-        ├── signal-flow-data.js
-        ├── scanner.html
-        ├── units.html
-        ├── events.html
-        ├── timeline.html
-        ├── talkgroup-directory.html
-        ├── debug-report.html    # Hidden (no card-title), direct URL only
-        └── docs.html
+/docker/tr-engine/
+├── docker-compose.yml     # PostgreSQL + Mosquitto + tr-engine + tr-dashboard + Caddy + debug-receiver
+├── .env                   # All config (AUTH_TOKEN, ADMIN_PASSWORD, CORS_ORIGINS, etc.)
+├── Caddyfile              # Reverse proxy config (bind-mounted into caddy container)
+├── tr-engine              # Binary (bind-mounted into container at /usr/local/bin/tr-engine)
+├── debug-receiver         # Binary (bind-mounted into debug-receiver container)
+├── data/
+│   ├── db/                # PostgreSQL data
+│   └── audio/             # Call audio files
+└── web/                   # Bind-mounted into tr-engine container, overrides embedded UI
 ```
-
-All persistent data (pgdata, audio, web) is bind-mounted from the RAID into the containers — nothing stored on the 32GB root filesystem.
 
 ### Caddy Config
 
-Located at `/etc/caddy/Caddyfile`. To add/modify:
+Located at `/docker/tr-engine/Caddyfile`, bind-mounted into the Caddy container.
 
 ```bash
-ssh root@tr-dashboard "vi /etc/caddy/Caddyfile"
-# After editing:
-ssh root@tr-dashboard "caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy"
+ssh root@gerty "vi /docker/tr-engine/Caddyfile"
+# After editing — must restart container (reload reads cached copy):
+ssh root@gerty "cd /docker/tr-engine && docker compose restart caddy"
 ```
 
-DNS is managed via Cloudflare (proxied). SSL mode is set globally to Full — no per-domain page rules needed.
+DNS is managed via Cloudflare (proxied). SSL mode is set globally to Full.
 
-**Auth header injection:** The `tr-dashboard.luxprimatech.com` block injects the read token (`AUTH_TOKEN`) into proxied `/api/*` requests — but only when the browser doesn't send its own `Authorization` header. This is critical for two-tier auth:
+**Auth header injection:** The `tr-dashboard.luxprimatech.com` block injects the read token (`AUTH_TOKEN`) into proxied `/api/*` requests — but only when the browser doesn't send its own `Authorization` header, and excluding `/api/v1/auth/*` so JWT login flows work:
 
 ```
-@no_auth not header Authorization *
-request_header @no_auth Authorization "Bearer {read_token}"
+# Auth endpoints — pass through untouched
+handle /api/v1/auth/* {
+    reverse_proxy tr-engine:8080
+}
+
+# All other API endpoints — inject read token for guest access
+handle /api/* {
+    @no_auth not header Authorization *
+    request_header @no_auth Authorization "Bearer {$TR_AUTH_TOKEN}"
+    reverse_proxy tr-engine:8080
+}
 ```
 
-- **No token from browser** → Caddy injects read token → reads work seamlessly via `auth.js`
-- **Write token from browser** → Caddy passes it through untouched → writes work
+- **No token from browser** → Caddy injects read token → guest reads work
+- **JWT from browser** → Caddy passes it through untouched → authenticated writes work
+- **Auth endpoints** → never injected, so dashboard can probe auth state cleanly
 
-Without the `@no_auth` matcher, Caddy would unconditionally overwrite the header, replacing the browser's write token with the read token and breaking all write operations. The `tr-engine.luxprimatech.com` direct-access domain has no injection — callers provide their own token.
+The `tr-engine.luxprimatech.com` direct-access domain has no injection — callers provide their own token.
+
+**CORS:** `CORS_ORIGINS` in `.env` must match the actual serving domains. Mismatched origins cause OPTIONS preflight 403s which break dashboard auth detection. Currently: `https://tr-dashboard.luxprimatech.com,https://tr-engine.luxprimatech.com`.
 
 ## Known trunk-recorder Issues (Potential Upstream Bug Reports)
 

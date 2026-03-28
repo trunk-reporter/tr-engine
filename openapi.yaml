@@ -193,11 +193,14 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [token]
+                required: [token, guest_access]
                 properties:
                   token:
                     type: string
                     description: Bearer token for API authentication
+                  guest_access:
+                    type: boolean
+                    description: When true, the read token provides guest access without login. External dashboards should skip the login form and use Caddy-injected or explicit token for read access.
                   user:
                     type: object
                     description: Present only when a valid JWT session exists

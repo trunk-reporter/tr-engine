@@ -525,6 +525,14 @@ func (p *Pipeline) shouldTranscribeTG(systemID, tgid int) bool {
 	return !p.transcribeExcludeTGs[plain] && !p.transcribeExcludeTGs[scoped]
 }
 
+// isIMBEProvider returns true if the transcription provider is the IMBE ASR provider.
+func (p *Pipeline) isIMBEProvider() bool {
+	if p.transcriber == nil {
+		return false
+	}
+	return p.transcriber.ProviderName() == "imbe"
+}
+
 // resolveNamedTGFilters expands name-based entries like "butco:1001" into
 // their numeric equivalents "5:1001" using the identity cache. Called once
 // after LoadCache in Start(). Entries that can't be resolved are logged and

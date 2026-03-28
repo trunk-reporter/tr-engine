@@ -113,6 +113,11 @@ func (p *Pipeline) handleAudio(payload []byte) error {
 	if callID > 0 && meta.Encrypted == 0 {
 		if meta.Transcript != "" {
 			p.insertSourceTranscription(callID, callStartTime, identity.SystemID, meta.Talkgroup, meta)
+		} else if p.isIMBEProvider() && msg.Call.AudioDvcfBase64 == "" {
+			// IMBE provider needs the .dvcf file. If it wasn't embedded in this audio
+			// message, the standalone /dvcf handler will enqueue transcription when
+			// the DVCF message arrives.
+			p.log.Debug().Int64("call_id", callID).Msg("skipping transcription enqueue — waiting for standalone DVCF message")
 		} else {
 			p.enqueueTranscription(callID, callStartTime, identity.SystemID, audioPath, meta)
 		}

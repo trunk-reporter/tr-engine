@@ -42,6 +42,8 @@ func NewEventBus(ringSize int) *EventBus {
 }
 
 // Subscribe registers a new subscriber and returns a channel and cancel function.
+// When ctx is cancelled, the subscriber is automatically removed and the channel
+// is closed, preventing goroutine leaks if cancel is not called explicitly.
 func (eb *EventBus) Subscribe(filter api.EventFilter) (<-chan api.SSEEvent, func()) {
 	eb.mu.Lock()
 	id := eb.nextID
@@ -50,13 +52,16 @@ func (eb *EventBus) Subscribe(filter api.EventFilter) (<-chan api.SSEEvent, func
 	eb.subscribers[id] = subscriber{ch: ch, filter: filter}
 	eb.mu.Unlock()
 
-	cancel := func() {
-		eb.mu.Lock()
-		delete(eb.subscribers, id)
-		close(ch)
-		eb.mu.Unlock()
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			eb.mu.Lock()
+			delete(eb.subscribers, id)
+			close(ch)
+			eb.mu.Unlock()
+		})
 	}
-	return ch, cancel
+	return ch, cleanup
 }
 
 // ReplaySince returns buffered events since the given event ID.

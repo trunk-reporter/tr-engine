@@ -397,18 +397,24 @@ func main() {
 		}
 	}
 
-	// Auth status
-	if !cfg.AuthEnabled {
-		log.Warn().Msg("AUTH_ENABLED=false — API authentication is disabled, all endpoints are open")
-	} else if cfg.AuthTokenGenerated {
-		log.Info().Str("token", cfg.AuthToken).Msg("AUTH_TOKEN auto-generated (set AUTH_TOKEN in .env for a persistent token)")
-	} else {
-		log.Info().Msg("AUTH_TOKEN loaded from configuration")
+	// Auth mode detection and deprecation warnings
+	switch {
+	case cfg.AuthToken == "" && cfg.AdminPassword == "":
+		log.Warn().Msg("WARNING: running in open mode — API is completely unprotected. Set AUTH_TOKEN or ADMIN_PASSWORD to enable authentication.")
+	case cfg.AuthToken != "" && cfg.AdminPassword == "":
+		log.Info().Msg("auth mode: token (shared API token)")
+	case cfg.AdminPassword != "":
+		if cfg.AuthToken != "" {
+			log.Info().Msg("auth mode: full (JWT login + public read via AUTH_TOKEN)")
+		} else {
+			log.Info().Msg("auth mode: full (JWT login required for all access)")
+		}
 	}
-	if cfg.AuthEnabled && cfg.WriteToken != "" {
-		log.Info().Msg("write protection enabled (WRITE_TOKEN set)")
-	} else if cfg.AuthEnabled {
-		log.Warn().Msg("WRITE_TOKEN not set — write endpoints accept the read token")
+	if !cfg.AuthEnabled {
+		log.Warn().Msg("AUTH_ENABLED is deprecated — remove AUTH_TOKEN and ADMIN_PASSWORD to disable auth")
+	}
+	if cfg.WriteToken != "" {
+		log.Warn().Msg("WRITE_TOKEN is deprecated — use ADMIN_PASSWORD for write access control. WRITE_TOKEN will be ignored in a future release.")
 	}
 	if cfg.JWTSecret != "" {
 		log.Info().Msg("JWT user authentication enabled")

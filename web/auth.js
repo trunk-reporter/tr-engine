@@ -30,17 +30,46 @@
     xhr.send();
     if (xhr.status === 200) {
       var data = JSON.parse(xhr.responseText);
-      readToken = data.token || '';
-      if (readToken) localStorage.setItem(KEY_READ, readToken);
-      if (data.user && jwtToken) {
-        mode = 'jwt';
-        jwtRole = data.user.role || '';
+
+      if (data.mode) {
+        // New auth-init response (v0.10+)
+        if (data.mode === 'open') {
+          mode = 'none';
+          // No auth needed — clear any stale tokens
+          readToken = '';
+        } else if (data.mode === 'token') {
+          // User must provide token — check localStorage, lazy-prompt on 401
+          readToken = localStorage.getItem(KEY_READ) || '';
+          mode = readToken ? 'legacy' : 'none';
+        } else if (data.mode === 'full') {
+          // JWT login available
+          if (data.read_token) {
+            readToken = data.read_token;
+            localStorage.setItem(KEY_READ, readToken);
+          }
+          if (data.jwt_enabled && jwtToken) {
+            mode = 'jwt';
+          } else {
+            mode = readToken ? 'legacy' : 'none';
+            if (jwtToken) {
+              jwtToken = '';
+              localStorage.removeItem(KEY_JWT);
+            }
+          }
+        }
       } else {
-        mode = readToken ? 'legacy' : 'none';
-        // Discard stale JWT if server didn't validate it
-        if (jwtToken) {
-          jwtToken = '';
-          localStorage.removeItem(KEY_JWT);
+        // Legacy auth-init response (pre-v0.10) — backward compat
+        readToken = data.token || '';
+        if (readToken) localStorage.setItem(KEY_READ, readToken);
+        if (data.user && jwtToken) {
+          mode = 'jwt';
+          jwtRole = data.user.role || '';
+        } else {
+          mode = readToken ? 'legacy' : 'none';
+          if (jwtToken) {
+            jwtToken = '';
+            localStorage.removeItem(KEY_JWT);
+          }
         }
       }
     }

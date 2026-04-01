@@ -174,44 +174,38 @@ paths:
   # ----------------------------------------------------------
   /auth-init:
     get:
-      operationId: getAuthInit
-      summary: Web auth bootstrap
+      summary: Auth mode discovery
       description: |
-        Returns the API auth token for web UI pages. No authentication required.
-        Used by `auth.js` to transparently authenticate browser-side API calls.
-        The URL has no file extension so CDNs (Cloudflare) skip caching it.
-
-        When a valid JWT is present in the request, the response includes a `user`
-        field with the authenticated user's info. The `user` field is absent (not null)
-        when no JWT session is present, preserving backward compatibility.
+        Returns the engine's auth mode and any public read token.
+        Always available without authentication. Clients use this to
+        determine whether to prompt for a token, show a login form,
+        or skip auth entirely.
+      operationId: getAuthInit
       tags: [auth]
       security: []
       responses:
         "200":
-          description: Token payload
+          description: Auth mode info
           content:
             application/json:
               schema:
                 type: object
-                required: [token, guest_access]
+                required: [mode, jwt_enabled]
                 properties:
-                  token:
+                  mode:
                     type: string
-                    description: Bearer token for API authentication
-                  guest_access:
+                    enum: [open, token, full]
+                    description: |
+                      - open: no auth required
+                      - token: shared API token required (not returned here)
+                      - full: JWT login available, optional public read token
+                  read_token:
+                    type: string
+                    nullable: true
+                    description: Public read token (only in full mode with AUTH_TOKEN set)
+                  jwt_enabled:
                     type: boolean
-                    description: When true, the read token provides guest access without login. External dashboards should skip the login form and use Caddy-injected or explicit token for read access.
-                  user:
-                    type: object
-                    description: Present only when a valid JWT session exists
-                    properties:
-                      username:
-                        type: string
-                      role:
-                        type: string
-                        enum: [viewer, editor, admin]
-        "404":
-          description: Auth not configured (AUTH_TOKEN not set and auto-generation failed)
+                    description: Whether JWT login endpoints are available
 
   /auth/setup:
     post:

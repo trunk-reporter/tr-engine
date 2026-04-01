@@ -603,7 +603,7 @@ func TestWriteAuth(t *testing.T) {
 	t.Run("no_auth_configured_passes_all", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/", nil)
-		WriteAuth("", "")(okHandler).ServeHTTP(rec, req)
+		WriteAuth("", "", false)(okHandler).ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Errorf("expected 200, got %d", rec.Code)
 		}
@@ -612,7 +612,7 @@ func TestWriteAuth(t *testing.T) {
 	t.Run("GET_always_passes", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/", nil)
-		WriteAuth(writeToken, authToken)(okHandler).ServeHTTP(rec, req)
+		WriteAuth(writeToken, authToken, false)(okHandler).ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Errorf("expected 200 for GET, got %d", rec.Code)
 		}
@@ -622,7 +622,7 @@ func TestWriteAuth(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/", nil)
 		req = setAuthContext(req, 1, "u", "editor", "jwt")
-		WriteAuth(writeToken, authToken)(okHandler).ServeHTTP(rec, req)
+		WriteAuth(writeToken, authToken, false)(okHandler).ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Errorf("expected 200 for editor, got %d", rec.Code)
 		}
@@ -632,7 +632,7 @@ func TestWriteAuth(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/", nil)
 		req = setAuthContext(req, 1, "u", "admin", "jwt")
-		WriteAuth(writeToken, authToken)(okHandler).ServeHTTP(rec, req)
+		WriteAuth(writeToken, authToken, false)(okHandler).ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Errorf("expected 200 for admin, got %d", rec.Code)
 		}
@@ -642,7 +642,7 @@ func TestWriteAuth(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/", nil)
 		req = setAuthContext(req, 1, "u", "viewer", "jwt")
-		WriteAuth(writeToken, authToken)(okHandler).ServeHTTP(rec, req)
+		WriteAuth(writeToken, authToken, false)(okHandler).ServeHTTP(rec, req)
 		if rec.Code != http.StatusForbidden {
 			t.Errorf("expected 403 for viewer, got %d", rec.Code)
 		}
@@ -652,7 +652,7 @@ func TestWriteAuth(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/", nil)
 		req.Header.Set("Authorization", "Bearer "+writeToken)
-		WriteAuth(writeToken, authToken)(okHandler).ServeHTTP(rec, req)
+		WriteAuth(writeToken, authToken, false)(okHandler).ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Errorf("expected 200 with write token, got %d", rec.Code)
 		}
@@ -662,7 +662,7 @@ func TestWriteAuth(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/", nil)
 		req.Header.Set("Authorization", "Bearer wrong-token")
-		WriteAuth(writeToken, authToken)(okHandler).ServeHTTP(rec, req)
+		WriteAuth(writeToken, authToken, false)(okHandler).ServeHTTP(rec, req)
 		if rec.Code != http.StatusForbidden {
 			t.Errorf("expected 403 with wrong token, got %d", rec.Code)
 		}
@@ -672,7 +672,7 @@ func TestWriteAuth(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/", nil)
 		req.Header.Set("Authorization", "Bearer "+authToken)
-		WriteAuth("", authToken)(okHandler).ServeHTTP(rec, req)
+		WriteAuth("", authToken, false)(okHandler).ServeHTTP(rec, req)
 		if rec.Code != http.StatusForbidden {
 			t.Errorf("expected 403 when write token not set, got %d", rec.Code)
 		}
@@ -710,4 +710,68 @@ func TestRecoverer(t *testing.T) {
 			t.Errorf("expected error message, got %v", body)
 		}
 	})
+}
+
+func TestWriteAuth_OpenMode(t *testing.T) {
+	mw := WriteAuth("", "", false)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/talkgroups/1", nil)
+	mw(okHandler).ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("open mode POST should pass, got %d", rec.Code)
+	}
+}
+
+func TestWriteAuth_FullMode_NoTokens_RequiresJWTRole(t *testing.T) {
+	mw := WriteAuth("", "", true)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/talkgroups/1", nil)
+	mw(okHandler).ServeHTTP(rec, req)
+	if rec.Code != 403 {
+		t.Errorf("expected 403 for POST without role in full mode, got %d", rec.Code)
+	}
+}
+
+func TestWriteAuth_FullMode_EditorRole_Passes(t *testing.T) {
+	mw := WriteAuth("", "", true)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/talkgroups/1", nil)
+	req = setAuthContext(req, 1, "user", "editor", "jwt")
+	mw(okHandler).ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("expected 200 for editor POST, got %d", rec.Code)
+	}
+}
+
+func TestWriteAuth_FullMode_ViewerRole_Rejected(t *testing.T) {
+	mw := WriteAuth("", "", true)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/talkgroups/1", nil)
+	req = setAuthContext(req, 1, "user", "viewer", "jwt")
+	mw(okHandler).ServeHTTP(rec, req)
+	if rec.Code != 403 {
+		t.Errorf("expected 403 for viewer POST, got %d", rec.Code)
+	}
+}
+
+func TestWriteAuth_GETAlwaysPasses(t *testing.T) {
+	mw := WriteAuth("", "", true)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/systems", nil)
+	mw(okHandler).ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("GET should always pass, got %d", rec.Code)
+	}
+}
+
+func TestWriteAuth_DeprecatedWriteToken_StillWorks(t *testing.T) {
+	mw := WriteAuth("write-secret", "read-secret", true)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/talkgroups/1", nil)
+	req.Header.Set("Authorization", "Bearer write-secret")
+	req = setAuthContext(req, 0, "", "admin", "token")
+	mw(okHandler).ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("expected 200 with deprecated write token, got %d", rec.Code)
+	}
 }

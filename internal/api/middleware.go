@@ -440,16 +440,19 @@ func EditorOrAbove(next http.Handler) http.Handler {
 }
 
 // WriteAuth requires the write token for mutating HTTP methods (POST, PATCH, PUT, DELETE).
-// Read methods (GET, HEAD, OPTIONS) pass through unconditionally.
-// When JWT auth is active, it checks the user's role from context first.
-//   - editor or admin role → pass
-//   - viewer role → 403
-//   - no role (legacy path) → fall back to WRITE_TOKEN check
-func WriteAuth(writeToken, authToken string) func(http.Handler) http.Handler {
+// WriteAuth gates mutating HTTP methods (POST, PATCH, PUT, DELETE).
+// Read methods (GET, HEAD, OPTIONS) always pass through.
+//
+// Logic for writes:
+//  1. If no auth at all (no tokens, no JWT) → pass through (open mode)
+//  2. If caller has a role from JWTOrTokenAuth → check editor+ role
+//  3. Legacy fallback: check WRITE_TOKEN (deprecated)
+func WriteAuth(writeToken, authToken string, jwtEnabled bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if writeToken == "" && authToken == "" {
-				next.ServeHTTP(w, r) // no auth at all
+			// No auth configured at all — open mode
+			if writeToken == "" && authToken == "" && !jwtEnabled {
+				next.ServeHTTP(w, r)
 				return
 			}
 
@@ -471,7 +474,14 @@ func WriteAuth(writeToken, authToken string) func(http.Handler) http.Handler {
 				return
 			}
 
-			// Legacy fallback: no role in context
+			// No role in context — if JWT is enabled, this means caller is
+			// unauthenticated or used a read-only token. Reject.
+			if jwtEnabled {
+				WriteErrorWithCode(w, http.StatusForbidden, ErrForbidden, "write operations require login with editor or admin role")
+				return
+			}
+
+			// Legacy fallback: WRITE_TOKEN (deprecated path)
 			if writeToken == "" {
 				WriteErrorWithCode(w, http.StatusForbidden, ErrForbidden, "write operations require WRITE_TOKEN")
 				return

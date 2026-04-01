@@ -183,7 +183,7 @@ func NewServer(opts ServerOptions) *Server {
 			// Use JWTOrTokenAuth which handles JWT, API keys, and legacy token auth.
 			r.Use(JWTOrTokenAuth([]byte(opts.Config.JWTSecret), opts.Config.WriteToken, opts.Config.AuthToken, opts.DB))
 
-			r.Use(WriteAuth(opts.Config.WriteToken, opts.Config.AuthToken))
+			r.Use(WriteAuth(opts.Config.WriteToken, opts.Config.AuthToken, opts.Config.JWTSecret != ""))
 		}
 		r.Use(ResponseTimeout(opts.Config.WriteTimeout))
 

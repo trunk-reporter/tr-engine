@@ -407,7 +407,7 @@ body::after {
 .date-separator::before { left: 14px; }
 .date-separator::after { right: 14px; }
 .msg .nick {
-  font-weight: 500; min-width: 130px; max-width: 430px; text-align: right;
+  font-weight: 500; min-width: 130px; max-width: 250px; text-align: right;
   padding-right: 8px; flex-shrink: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -952,16 +952,16 @@ html.nerd .statusbar .nerd-btn { font-size: 9px; }
     font-size: 11px;
     min-width: auto;
   }
- .msg .nick {
-   font-weight: 500;
-   flex: 0 1 auto;
-   min-width: 0;
-   max-width: min(40vw, 320px);
-   text-align: right;
-   padding-right: 8px;
-   overflow: hidden;
-   text-overflow: ellipsis;
-   white-space: nowrap;
+  .msg .nick {
+    font-weight: 500;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: min(40vw, 320px);
+    text-align: right;
+    padding-right: 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
   .msg .body {
     padding-left: 0;
@@ -3408,19 +3408,17 @@ es.addEventListener('rate_update', (e) => {
     if (data.decode_rate !== undefined) {
       const rate = Number(data.decode_rate);
 
-      // 👇 Ignore junk / weak decode values
-      if (rate < 5) return;
-
-      titlebarLag.textContent = `decode: ${rate.toFixed(2)}%`;
+      // Make sure this element exists
+      if (titlebarLag) {
+        titlebarLag.textContent = `decode: ${rate.toFixed(1)} msg/s`;
+      }
     }
-
   } catch (err) {
     console.warn('bad rate_update event:', err);
   }
 });
-
-
-
+  
+ 
   // ── Transcription events ──
   es.addEventListener('transcription', (e) => {
     lastEventId = e.lastEventId;

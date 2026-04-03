@@ -143,7 +143,7 @@ LIMIT 1;
 -- name: FindCallForAudio :one
 SELECT call_id, start_time FROM calls
 WHERE system_id = $1 AND tgid = $2
-    AND start_time BETWEEN $3::timestamptz - interval '5 seconds' AND $3::timestamptz + interval '5 seconds'
+    AND start_time BETWEEN $3::timestamptz - interval '10 seconds' AND $3::timestamptz + interval '10 seconds'
 ORDER BY ABS(EXTRACT(EPOCH FROM (start_time - $3::timestamptz)))
 LIMIT 1;
 

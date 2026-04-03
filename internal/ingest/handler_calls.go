@@ -258,9 +258,10 @@ func (p *Pipeline) handleCallEnd(payload []byte) error {
 	entry, ok := p.activeCalls.Get(call.ID)
 	matchedKey := call.ID
 	if !ok {
-		// Fuzzy match: TR may adjust start_time by 1-2s between call_start and
-		// call_end, which changes the ID since it embeds start_time.
-		matchedKey, entry, ok = p.activeCalls.FindByTgidAndTime(call.Talkgroup, startTime, 5*time.Second)
+		// Fuzzy match: TR may adjust start_time between call_start and call_end
+		// (1-2s for P25, up to ~6s for analog), which changes the ID since it
+		// embeds start_time.
+		matchedKey, entry, ok = p.activeCalls.FindByTgidAndTime(call.Talkgroup, startTime, 10*time.Second)
 	}
 	if !ok {
 		// Call started before we were running, or duplicate. Try DB lookup.

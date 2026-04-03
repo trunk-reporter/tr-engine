@@ -457,8 +457,9 @@ func (db *DB) FindCallByTrCallID(ctx context.Context, trCallID string, startTime
 }
 
 // FindCallForAudio finds a call matching the audio metadata.
-// Uses fuzzy start_time matching (±5s) to handle trunk-recorder shifting
-// start_time by 1-2s between call_start/call_end and audio messages.
+// Uses fuzzy start_time matching (±10s) to handle trunk-recorder shifting
+// start_time between call_start/call_end and audio messages. Analog systems
+// can have up to ~6s delta between recording start and MQTT call_start.
 func (db *DB) FindCallForAudio(ctx context.Context, systemID, tgid int, startTime time.Time) (int64, time.Time, error) {
 	row, err := db.Q.FindCallForAudio(ctx, sqlcdb.FindCallForAudioParams{
 		SystemID: systemID,
@@ -471,7 +472,7 @@ func (db *DB) FindCallForAudio(ctx context.Context, systemID, tgid int, startTim
 	return row.CallID, row.StartTime.Time, nil
 }
 
-// FindCallFuzzy checks if a call exists matching (system_id, tgid, start_time ± 5s).
+// FindCallFuzzy checks if a call exists matching (system_id, tgid, start_time ± 10s).
 // Returns call_id and start_time if found, or 0/zero-time/ErrNoRows if not found.
 func (db *DB) FindCallFuzzy(ctx context.Context, systemID, tgid int, startTime time.Time) (int64, time.Time, error) {
 	return db.FindCallForAudio(ctx, systemID, tgid, startTime)
@@ -494,7 +495,7 @@ type DvcfCallMatch struct {
 	TgGroup       string
 }
 
-// FindCallBySystemName finds a call by system_name + tgid + start_time (±5s).
+// FindCallBySystemName finds a call by system_name + tgid + start_time (±10s).
 // Used by the DVCF handler which has short_name but no instance_id.
 func (db *DB) FindCallBySystemName(ctx context.Context, systemName string, tgid int, startTime time.Time) (*DvcfCallMatch, error) {
 	row, err := db.Q.FindCallBySystemName(ctx, sqlcdb.FindCallBySystemNameParams{

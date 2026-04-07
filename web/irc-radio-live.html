@@ -1987,7 +1987,7 @@ function ensureChannel(tg) {
 function resolveChannel(systemId, tgid) {
   return tgidToChannel.get(tgKey(systemId, tgid));
 }
-
+  
 function nickSourcePriority(source) {
   switch (source) {
     case 'manual': return 4;
@@ -2009,6 +2009,22 @@ function resolveNick(systemId, unitId, alphaTag, source = 'event') {
     if (!cachedNick || incomingPriority >= cachedPriority) {
       unitNickCache.set(key, incomingNick);
       unitNickSource.set(key, incomingPriority);
+
+function nickQuality(nick) {
+  if (!nick) return 0;
+  if (/^unit-\d+$/i.test(nick)) return 1;
+  if (/^[A-Z0-9-]{1,6}$/.test(nick)) return 2; // likely compact radio alias
+  return 10 + Math.min(nick.length, 20); // prefer richer/descriptive tags
+}
+
+function resolveNick(systemId, unitId, alphaTag) {
+  const key = unitKey(systemId, unitId);
+  const cachedNick = unitNickCache.get(key);
+
+  if (alphaTag && alphaTag.trim()) {
+    const incomingNick = toNick(alphaTag, unitId);
+    if (!cachedNick || nickQuality(incomingNick) > nickQuality(cachedNick)) {
+      unitNickCache.set(key, incomingNick);
       return incomingNick;
     }
     return cachedNick;

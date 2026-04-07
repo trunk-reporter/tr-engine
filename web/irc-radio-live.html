@@ -1150,6 +1150,7 @@ const channelUnread = new Map();
 // Reverse lookups
 const tgidToChannel = new Map();   // `${system_id}:${tgid}` → chanName
 const unitNickCache = new Map();   // `${system_id}:${unit_id}` → alpha_tag
+const unitNickSource = new Map();  // `${system_id}:${unit_id}` → source priority
 const systemNames = new Map();     // system_id → system_name
 const collidedNames = new Set();   // base channel names that have had collisions
 
@@ -1768,7 +1769,8 @@ function saveUnitTag(user, newTag) {
       const uk = unitKey(user.systemId, user.unitId);
       const oldNick = user.nick;
       unitNickCache.delete(uk);
-      const newNick = resolveNick(user.systemId, user.unitId, newTag);
+      unitNickSource.delete(uk);
+      const newNick = resolveNick(user.systemId, user.unitId, newTag, 'manual');
 
       for (const [chanName, ch] of channels) {
         if (ch.users.has(uk)) {
@@ -1986,16 +1988,35 @@ function resolveChannel(systemId, tgid) {
   return tgidToChannel.get(tgKey(systemId, tgid));
 }
 
-function resolveNick(systemId, unitId, alphaTag) {
-  const key = unitKey(systemId, unitId);
-  if (alphaTag && alphaTag.trim()) {
-    const nick = toNick(alphaTag, unitId);
-    unitNickCache.set(key, nick);
-    return nick;
+function nickSourcePriority(source) {
+  switch (source) {
+    case 'manual': return 4;
+    case 'directory': return 3;
+    case 'event': return 2;
+    case 'alias': return 1;
+    default: return 0;
   }
-  if (unitNickCache.has(key)) return unitNickCache.get(key);
+}
+
+function resolveNick(systemId, unitId, alphaTag, source = 'event') {
+  const key = unitKey(systemId, unitId);
+  const cachedNick = unitNickCache.get(key);
+  const cachedPriority = unitNickSource.get(key) || 0;
+  const incomingPriority = nickSourcePriority(source);
+
+  if (alphaTag && alphaTag.trim()) {
+    const incomingNick = toNick(alphaTag, unitId);
+    if (!cachedNick || incomingPriority >= cachedPriority) {
+      unitNickCache.set(key, incomingNick);
+      unitNickSource.set(key, incomingPriority);
+      return incomingNick;
+    }
+    return cachedNick;
+  }
+  if (cachedNick) return cachedNick;
   const fallback = toNick(null, unitId);
   unitNickCache.set(key, fallback);
+  unitNickSource.set(key, nickSourcePriority('fallback'));
   return fallback;
 }
 
@@ -2759,10 +2780,10 @@ function callsToMessages(calls, chanName, systemId) {
     } else if (srcList.length > 0) {
       const txSorted = [...srcList].sort((a, b) => (a.pos || 0) - (b.pos || 0));
       for (const tx of txSorted) {
-        const nick = resolveNick(sid, tx.src, tx.tag);
+        const nick = resolveNick(sid, tx.src, tx.tag, 'alias');
         const txTime = tx.time ? new Date(tx.time) : (call.start_time ? new Date(call.start_time) : new Date());
         const dur = tx.duration ? fmtDuration(tx.duration) : '';
-        if (ch) ensureUserInChannel(ch, chanName, sid, tx.src, tx.tag);
+        if (ch) ensureUserInChannel(ch, chanName, sid, tx.src, tx.tag, 'alias');
         msgs.push({
           ts: ts(txTime), date: txTime, nick, src: tx.src, callId: call.call_id,
           pos: tx.pos || 0, txDuration: tx.duration || 0,
@@ -2798,11 +2819,11 @@ function unitEventsToMessages(events, chanName) {
     if (loadedIds.has(evt.id)) continue;
     loadedIds.add(evt.id);
 
-    const nick = resolveNick(evt.system_id, evt.unit_rid, evt.unit_alpha_tag);
+    const nick = resolveNick(evt.system_id, evt.unit_rid, evt.unit_alpha_tag, 'event');
     const evtTime = new Date(evt.time);
 
     if (evt.event_type === 'join') {
-      if (ch) ensureUserInChannel(ch, chanName, evt.system_id, evt.unit_rid, evt.unit_alpha_tag);
+      if (ch) ensureUserInChannel(ch, chanName, evt.system_id, evt.unit_rid, evt.unit_alpha_tag, 'event');
       msgs.push({
         ts: ts(evtTime), date: evtTime,
         kind: 'join', text: `${nick} has joined ${chanName}`,
@@ -2999,7 +3020,7 @@ async function loadStarredHistory() {
         : [{ src: 0, tag: call.tg_alpha_tag || 'TG ' + call.tgid }];
 
       for (const tx of txList) {
-        const nick = tx.src ? resolveNick(systemId, tx.src, tx.tag) : (call.tg_alpha_tag || 'TG ' + call.tgid);
+        const nick = tx.src ? resolveNick(systemId, tx.src, tx.tag, 'alias') : (call.tg_alpha_tag || 'TG ' + call.tgid);
         const txTime = tx.time ? new Date(tx.time) : new Date(call.start_time);
         const dur = tx.duration ? fmtDuration(tx.duration) : (call.duration ? fmtDuration(call.duration) : '');
 
@@ -3204,7 +3225,7 @@ async function bootstrapAffiliations() {
       const ch = channels.get(chanName);
       if (!ch) continue;
 
-      const nick = resolveNick(aff.system_id, aff.unit_id, aff.unit_alpha_tag);
+      const nick = resolveNick(aff.system_id, aff.unit_id, aff.unit_alpha_tag, 'directory');
       const role = roleForNick(nick);
       const prefix = role === 'op' ? '@' : '';
       const online = aff.status === 'affiliated';
@@ -3234,6 +3255,7 @@ async function bootstrapUnitNicks() {
       if (u.alpha_tag && u.alpha_tag.trim()) {
         const nick = toNick(u.alpha_tag, u.unit_id);
         unitNickCache.set(unitKey(u.system_id, u.unit_id), nick);
+        unitNickSource.set(unitKey(u.system_id, u.unit_id), nickSourcePriority('directory'));
         seeded++;
       }
     }
@@ -3662,14 +3684,14 @@ function handleCallStart(call) {
   let srcNick = null;
 
   if (srcList.length > 0) {
-    srcNick = resolveNick(call.system_id, srcList[0].src, srcList[0].tag);
-    ensureUserInChannel(ch, chanName, call.system_id, srcList[0].src, srcList[0].tag);
+    srcNick = resolveNick(call.system_id, srcList[0].src, srcList[0].tag, 'alias');
+    ensureUserInChannel(ch, chanName, call.system_id, srcList[0].src, srcList[0].tag, 'alias');
   } else if (units.length > 0) {
-    srcNick = resolveNick(call.system_id, units[0].unit_id, units[0].alpha_tag);
-    ensureUserInChannel(ch, chanName, call.system_id, units[0].unit_id, units[0].alpha_tag);
+    srcNick = resolveNick(call.system_id, units[0].unit_id, units[0].alpha_tag, 'directory');
+    ensureUserInChannel(ch, chanName, call.system_id, units[0].unit_id, units[0].alpha_tag, 'directory');
   } else if (call.unit) {
-    srcNick = resolveNick(call.system_id, call.unit, call.unit_alpha_tag);
-    ensureUserInChannel(ch, chanName, call.system_id, call.unit, call.unit_alpha_tag);
+    srcNick = resolveNick(call.system_id, call.unit, call.unit_alpha_tag, 'event');
+    ensureUserInChannel(ch, chanName, call.system_id, call.unit, call.unit_alpha_tag, 'event');
   }
 
   // Track active call — store src count so call_update can detect new transmissions
@@ -3704,7 +3726,7 @@ function handleCallStart(call) {
 }
 
 /** Ensure a unit is in a channel's nicklist */
-function ensureUserInChannel(ch, chanName, systemId, unitId, alphaTag) {
+function ensureUserInChannel(ch, chanName, systemId, unitId, alphaTag, source = 'event') {
   const uk = unitKey(systemId, unitId);
   if (ch.users.has(uk)) {
     // Mark online if they're transmitting
@@ -3712,7 +3734,7 @@ function ensureUserInChannel(ch, chanName, systemId, unitId, alphaTag) {
     if (u.online === false) { u.online = true; if (chanName === activeChannel) renderNicklist(); }
     return;
   }
-  const nick = resolveNick(systemId, unitId, alphaTag);
+  const nick = resolveNick(systemId, unitId, alphaTag, source);
   const role = roleForNick(nick);
   ch.users.set(uk, { nick, prefix: role === 'op' ? '@' : '', role, unitId, systemId, online: true });
   if (chanName === activeChannel) renderNicklist();
@@ -3734,15 +3756,15 @@ function handleCallUpdate(call) {
     // New key-ups since we last saw this call
     for (let i = tracked.srcCount; i < srcList.length; i++) {
       const tx = srcList[i];
-      const nick = resolveNick(systemId, tx.src, tx.tag);
-      ensureUserInChannel(ch, chanName, systemId, tx.src, tx.tag);
+      const nick = resolveNick(systemId, tx.src, tx.tag, 'alias');
+      ensureUserInChannel(ch, chanName, systemId, tx.src, tx.tag, 'alias');
       showTyping(chanName, nick);
     }
     tracked.srcCount = srcList.length;
   } else if (srcList.length > 0) {
     // No new transmissions, but refresh typing for latest speaker
     const last = srcList[srcList.length - 1];
-    showTyping(chanName, resolveNick(systemId, last.src, last.tag));
+    showTyping(chanName, resolveNick(systemId, last.src, last.tag, 'alias'));
   }
 
   // Also pick up any new units from the units array
@@ -3818,7 +3840,7 @@ function handleCallEnd(call) {
   // Scanner: enqueue for auto-play if this channel is scanned
   if (call.audio_file_path || (srcList && srcList.length > 0)) {
     const nick = (srcList && srcList.length > 0)
-      ? resolveNick(call.system_id, srcList[0].src, srcList[0].tag)
+      ? resolveNick(call.system_id, srcList[0].src, srcList[0].tag, 'alias')
       : (call.tg_alpha_tag || `TG ${call.tgid}`);
     scannerEnqueue(call.call_id, nick, chanName, isEmergency);
   }
@@ -3884,8 +3906,8 @@ function renderCallTransmissions(chanName, callId, systemId, srcList, isEmergenc
 
   const sorted = [...srcList].sort((a, b) => (a.pos || 0) - (b.pos || 0));
   for (const tx of sorted) {
-    const nick = resolveNick(systemId, tx.src, tx.tag);
-    ensureUserInChannel(ch, chanName, systemId, tx.src, tx.tag);
+    const nick = resolveNick(systemId, tx.src, tx.tag, 'alias');
+    ensureUserInChannel(ch, chanName, systemId, tx.src, tx.tag, 'alias');
 
     const txTime = tx.time ? new Date(tx.time) : new Date();
     const dur = tx.duration ? fmtDuration(tx.duration) : '';
@@ -3909,7 +3931,7 @@ function renderCallTransmissions(chanName, callId, systemId, srcList, isEmergenc
 function handleUnitEvent(evt) {
   const systemId = evt.system_id;
   const unitId = evt.unit_id;
-  const nick = resolveNick(systemId, unitId, evt.unit_alpha_tag);
+  const nick = resolveNick(systemId, unitId, evt.unit_alpha_tag, 'event');
   const tgid = evt.tgid;
 
   // Resolve or create channel

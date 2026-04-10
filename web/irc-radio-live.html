@@ -2660,7 +2660,7 @@ function saveChannelTag(newTag) {
       // Cancel edit UI and refresh display
       cancelChannelEdit();
       chanNameEl.textContent = finalName;
-      titlebarChan.textContent = finalName;
+      titlebarChan.textContent = state.tgid ? `${finalName} (TG ${state.tgid})` : finalName;
       renderTree();
     })
     .catch(err => {
@@ -2688,6 +2688,7 @@ function switchChannel(ch) {
 
   const state = channels.get(ch);
   const displayName = ch;
+  const titlebarDisplayName = state.tgid ? `${displayName} (TG ${state.tgid})` : displayName;
   const topic = state.description || state.tag || '';
 
   // Show/hide edit buttons based on whether channel has a tgid
@@ -2698,7 +2699,7 @@ function switchChannel(ch) {
   chanNameEl.textContent = displayName;
   chanTopicEl.textContent = topic;
   chanModeEl.textContent = state.mode ? `[${state.mode}]` : '';
-  titlebarChan.textContent = displayName;
+  titlebarChan.textContent = titlebarDisplayName;
   titlebarTopic.textContent = topic;
   inputPrompt.textContent = `[${displayName}]`;
 

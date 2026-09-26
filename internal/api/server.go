@@ -28,8 +28,9 @@ type Server struct {
 }
 
 type ServerOptions struct {
-	Config        *config.Config
-	DB            *database.DB
+	Config         *config.Config
+	TrustedProxies *TrustedProxies // proxies whose forwarding headers identify the client; nil trusts none
+	DB             *database.DB
 	MQTT          *mqttclient.Client
 	Live          LiveDataSource
 	Uploader      CallUploader      // nil if upload ingest not available
@@ -66,7 +67,7 @@ func NewServer(opts ServerOptions) *Server {
 	// Global middleware (no MaxBodySize here — upload endpoint needs a larger limit)
 	r.Use(RequestID)
 	r.Use(CORSWithOrigins(corsOrigins))
-	r.Use(RateLimiter(opts.Config.RateLimitRPS, opts.Config.RateLimitBurst))
+	r.Use(RateLimiter(opts.Config.RateLimitRPS, opts.Config.RateLimitBurst, opts.TrustedProxies))
 	r.Use(Recoverer)
 	r.Use(Logger(opts.Log))
 
@@ -129,7 +130,7 @@ func NewServer(opts ServerOptions) *Server {
 
 	// User auth endpoints — single AuthHandler instance shared across
 	// unauthenticated routes (login/refresh/logout) and authenticated (/auth/me)
-	authRateLimit := AuthRateLimiter()
+	authRateLimit := AuthRateLimiter(opts.TrustedProxies)
 	var authHandler *AuthHandler
 	if opts.Config.JWTSecret != "" {
 		authHandler = NewAuthHandler(opts.DB, []byte(opts.Config.JWTSecret), opts.Log)
@@ -146,19 +147,21 @@ func NewServer(opts ServerOptions) *Server {
 		r.With(authRateLimit).Post("/api/v1/auth/setup", setupHandler.Setup)
 	}
 
-	// Upload endpoint with custom auth (accepts form field key/api_key)
-	// Uploads are write operations — require WRITE_TOKEN when set.
-	// When auth is enabled but WRITE_TOKEN is not set, uploads are blocked
-	// (UploadAuth with empty token rejects all requests).
+	// Upload endpoint with custom auth (accepts form field key/api_key).
+	// Uploads are write operations. Accepted credentials:
+	//   - open mode (no credentials configured): none required
+	//   - WRITE_TOKEN (deprecated) when set
+	//   - token mode: the shared AUTH_TOKEN, which is a private secret there
+	//   - API keys (tre_ prefix)
+	// In full mode AUTH_TOKEN is the PUBLIC read token handed to every visitor
+	// by /auth-init, so it must never authorize uploads.
 	if opts.Uploader != nil {
-		uploadToken := opts.Config.WriteToken
-		if uploadToken == "" {
-			uploadToken = opts.Config.AuthToken // fall back to shared token in token mode
-		}
 		uploadHandler := NewUploadHandler(opts.Uploader, opts.Config.UploadInstanceID, opts.Log)
 		r.Group(func(r chi.Router) {
 			r.Use(MaxBodySize(50 << 20)) // 50 MB for audio uploads
-			r.Use(UploadAuthWithKeys(uploadToken, opts.DB))
+			if mw := uploadAuth(opts.Config, opts.DB); mw != nil {
+				r.Use(mw)
+			}
 			r.Post("/api/v1/call-upload", uploadHandler.Upload)
 		})
 	}
@@ -284,6 +287,21 @@ func NewServer(opts ServerOptions) *Server {
 		log:    opts.Log,
 		health: health,
 	}
+}
+
+// uploadAuth returns the auth middleware for POST /call-upload, or nil when no
+// credentials are configured at all (open mode).
+func uploadAuth(cfg *config.Config, keys apiKeyResolver) func(http.Handler) http.Handler {
+	if cfg.AuthToken == "" && cfg.WriteToken == "" && cfg.AdminPassword == "" {
+		return nil
+	}
+	token := cfg.WriteToken
+	if token == "" && cfg.AdminPassword == "" {
+		// Token mode: AUTH_TOKEN is a private shared secret. In full mode it is
+		// the public read token and is deliberately not accepted.
+		token = cfg.AuthToken
+	}
+	return UploadAuthWithKeys(token, keys)
 }
 
 // StartUpdateChecker begins periodic update checks if configured.

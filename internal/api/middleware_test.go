@@ -113,7 +113,7 @@ func TestCORSWithOrigins(t *testing.T) {
 
 func TestRateLimiter(t *testing.T) {
 	t.Run("allows_normal_traffic", func(t *testing.T) {
-		handler := RateLimiter(100, 100)(okHandler)
+		handler := RateLimiter(100, 100, nil)(okHandler)
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/", nil)
 		req.RemoteAddr = "1.2.3.4:1234"
@@ -125,7 +125,7 @@ func TestRateLimiter(t *testing.T) {
 
 	t.Run("blocks_excess_traffic", func(t *testing.T) {
 		// 1 req/s, burst of 2 — third request should be blocked
-		handler := RateLimiter(1, 2)(okHandler)
+		handler := RateLimiter(1, 2, nil)(okHandler)
 		for i := 0; i < 2; i++ {
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest("GET", "/", nil)
@@ -148,7 +148,7 @@ func TestRateLimiter(t *testing.T) {
 	})
 
 	t.Run("different_ips_independent", func(t *testing.T) {
-		handler := RateLimiter(1, 1)(okHandler)
+		handler := RateLimiter(1, 1, nil)(okHandler)
 		// Exhaust IP A
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/", nil)

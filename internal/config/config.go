@@ -62,6 +62,13 @@ type Config struct {
 	JWTSecret     string `env:"JWT_SECRET"`      // HMAC key for JWT signing; auto-generated if empty (sessions lost on restart)
 	AdminUsername string `env:"ADMIN_USERNAME" envDefault:"admin"` // default admin username seeded on first run
 	AdminPassword string `env:"ADMIN_PASSWORD"` // if set, seeds admin user on first run and enables JWT auth
+	JWTSecretIgnored bool // JWT_SECRET was set without ADMIN_PASSWORD and has been ignored
+	// Reverse proxies whose X-Forwarded-For / X-Real-IP headers are believed when
+	// working out a client's IP (used for per-IP rate limiting). Comma-separated
+	// IPs/CIDRs plus the keywords "loopback", "private" (RFC 1918 + IPv6 ULA) and
+	// "none". Requests from anywhere else are judged by their TCP peer address.
+	TrustedProxies string `env:"TRUSTED_PROXIES" envDefault:"loopback,private"`
+
 	RateLimitRPS   float64 `env:"RATE_LIMIT_RPS" envDefault:"20"`
 	RateLimitBurst int     `env:"RATE_LIMIT_BURST" envDefault:"40"`
 	CORSOrigins string `env:"CORS_ORIGINS"` // comma-separated allowed origins; empty = allow all (*)
@@ -255,6 +262,25 @@ func Load(overrides Overrides) (*Config, error) {
 		cfg.StreamListen = overrides.StreamListen
 	}
 
+	// Deprecated: AUTH_ENABLED=false disables all API auth. Clear every
+	// credential so the advertised auth mode (/auth-init) matches what the
+	// middleware enforces — previously ADMIN_PASSWORD survived, so auth-init
+	// reported "full" (login required) while the API was actually open.
+	if !cfg.AuthEnabled {
+		cfg.AuthToken = ""
+		cfg.WriteToken = ""
+		cfg.AdminPassword = ""
+		cfg.JWTSecret = ""
+	}
+
+	// JWT_SECRET only means something alongside ADMIN_PASSWORD. On its own it
+	// used to turn on JWT enforcement while /auth-init still reported "open",
+	// and it exposed the unauthenticated first-run /auth/setup endpoint.
+	if cfg.JWTSecret != "" && cfg.AdminPassword == "" {
+		cfg.JWTSecret = ""
+		cfg.JWTSecretIgnored = true
+	}
+
 	// Auto-generate JWT_SECRET if not configured. A random secret means all
 	// sessions are invalidated on restart — set JWT_SECRET in .env for persistence.
 	if cfg.JWTSecret == "" && cfg.AdminPassword != "" {
@@ -262,13 +288,6 @@ func Load(overrides Overrides) (*Config, error) {
 		if _, err := rand.Read(b); err == nil {
 			cfg.JWTSecret = base64.URLEncoding.EncodeToString(b)
 		}
-	}
-
-	// Deprecated: AUTH_ENABLED=false — preserve clearing behavior during transition.
-	// New deployments should simply omit AUTH_TOKEN and ADMIN_PASSWORD for open mode.
-	if !cfg.AuthEnabled {
-		cfg.AuthToken = ""
-		cfg.WriteToken = ""
 	}
 
 	return cfg, nil

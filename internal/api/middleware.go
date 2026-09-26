@@ -6,7 +6,6 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -174,8 +173,10 @@ func CORSWithOrigins(origins []string) func(http.Handler) http.Handler {
 
 
 // RateLimiter returns middleware that applies per-IP rate limiting.
-// rps is requests per second, burst is the maximum burst size.
-func RateLimiter(rps float64, burst int) func(http.Handler) http.Handler {
+// rps is requests per second, burst is the maximum burst size. The client IP
+// comes from proxies.ClientIP, so forwarding headers only count when the
+// request arrived through a trusted proxy.
+func RateLimiter(rps float64, burst int, proxies *TrustedProxies) func(http.Handler) http.Handler {
 	var mu sync.Mutex
 	limiters := make(map[string]*rate.Limiter)
 
@@ -204,7 +205,7 @@ func RateLimiter(rps float64, burst int) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ip := clientIP(r)
+			ip := proxies.ClientIP(r)
 			if !getLimiter(ip).Allow() {
 				w.Header().Set("Retry-After", "1")
 				WriteErrorWithCode(w, http.StatusTooManyRequests, ErrRateLimited, "rate limit exceeded")
@@ -243,26 +244,6 @@ func MaxBodySize(maxBytes int64) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
-}
-
-// clientIP extracts the client IP, checking X-Forwarded-For and X-Real-IP
-// headers first (for reverse proxy setups), then falling back to RemoteAddr.
-func clientIP(r *http.Request) string {
-	// X-Forwarded-For: client, proxy1, proxy2 — take the first (leftmost)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if ip, _, ok := strings.Cut(xff, ","); ok {
-			return strings.TrimSpace(ip)
-		}
-		return strings.TrimSpace(xff)
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
-	}
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return ip
 }
 
 // extractBearerToken reads the bearer token from the Authorization header
@@ -557,7 +538,7 @@ func WriteAuth(writeToken, authToken string, jwtEnabled bool) func(http.Handler)
 
 // AuthRateLimiter limits login/setup attempts to 5 per minute per IP.
 // Separate from the global RateLimiter to avoid locking out legitimate API usage.
-func AuthRateLimiter() func(http.Handler) http.Handler {
+func AuthRateLimiter(proxies *TrustedProxies) func(http.Handler) http.Handler {
 	var mu sync.Mutex
 	limiters := make(map[string]*rate.Limiter)
 	// Clean stale entries every 5 minutes
@@ -575,7 +556,7 @@ func AuthRateLimiter() func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ip := clientIP(r)
+			ip := proxies.ClientIP(r)
 			mu.Lock()
 			lim, ok := limiters[ip]
 			if !ok {

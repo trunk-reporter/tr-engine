@@ -255,6 +255,70 @@ func TestLoad_AuthEnabledFalse_ClearsTokens(t *testing.T) {
 	}
 }
 
+func TestLoad_AuthEnabledFalse_ClearsUserAuth(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/test")
+	t.Setenv("MQTT_BROKER_URL", "tcp://localhost:1883")
+	t.Setenv("AUTH_ENABLED", "false")
+	t.Setenv("ADMIN_PASSWORD", "should-be-cleared")
+	t.Setenv("JWT_SECRET", "should-be-cleared")
+
+	cfg, err := Load(Overrides{EnvFile: "nonexistent.env"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Middleware is skipped entirely when AUTH_ENABLED=false, so /auth-init
+	// must not advertise login ("full" mode) — both must be cleared.
+	if cfg.AdminPassword != "" || cfg.JWTSecret != "" {
+		t.Errorf("expected AdminPassword/JWTSecret cleared, got %q / %q", cfg.AdminPassword, cfg.JWTSecret)
+	}
+}
+
+func TestLoad_JWTSecretWithoutAdminPassword_Ignored(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/test")
+	t.Setenv("MQTT_BROKER_URL", "tcp://localhost:1883")
+	t.Setenv("JWT_SECRET", "orphan-secret")
+	t.Setenv("ADMIN_PASSWORD", "")
+
+	cfg, err := Load(Overrides{EnvFile: "nonexistent.env"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.JWTSecret != "" {
+		t.Errorf("expected JWTSecret ignored without ADMIN_PASSWORD, got %q", cfg.JWTSecret)
+	}
+	if !cfg.JWTSecretIgnored {
+		t.Error("expected JWTSecretIgnored=true")
+	}
+}
+
+func TestLoad_JWTSecretWithAdminPassword_Kept(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/test")
+	t.Setenv("MQTT_BROKER_URL", "tcp://localhost:1883")
+	t.Setenv("JWT_SECRET", "real-secret")
+	t.Setenv("ADMIN_PASSWORD", "hunter22hunter22")
+
+	cfg, err := Load(Overrides{EnvFile: "nonexistent.env"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.JWTSecret != "real-secret" || cfg.JWTSecretIgnored {
+		t.Errorf("expected JWTSecret kept, got %q (ignored=%v)", cfg.JWTSecret, cfg.JWTSecretIgnored)
+	}
+}
+
+func TestLoad_TrustedProxiesDefault(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/test")
+	t.Setenv("MQTT_BROKER_URL", "tcp://localhost:1883")
+
+	cfg, err := Load(Overrides{EnvFile: "nonexistent.env"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TrustedProxies != "loopback,private" {
+		t.Errorf("TrustedProxies = %q, want loopback,private", cfg.TrustedProxies)
+	}
+}
+
 func TestLoad_ExplicitAuthToken_Preserved(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://localhost/test")
 	t.Setenv("MQTT_BROKER_URL", "tcp://localhost:1883")

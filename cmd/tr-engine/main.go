@@ -421,7 +421,10 @@ func main() {
 		}
 	}
 	if !cfg.AuthEnabled {
-		log.Warn().Msg("AUTH_ENABLED is deprecated — remove AUTH_TOKEN and ADMIN_PASSWORD to disable auth")
+		log.Warn().Msg("AUTH_ENABLED=false: API authentication is disabled — AUTH_TOKEN, WRITE_TOKEN, ADMIN_PASSWORD and JWT_SECRET are ignored. AUTH_ENABLED is deprecated; remove AUTH_TOKEN and ADMIN_PASSWORD instead")
+	}
+	if cfg.JWTSecretIgnored {
+		log.Warn().Msg("JWT_SECRET is set without ADMIN_PASSWORD and has been ignored — set ADMIN_PASSWORD to enable user login")
 	}
 	if cfg.WriteToken != "" {
 		log.Warn().Msg("WRITE_TOKEN is deprecated — use ADMIN_PASSWORD for write access control. WRITE_TOKEN will be ignored in a future release.")
@@ -444,8 +447,14 @@ func main() {
 
 	// HTTP Server
 	httpLog := log.With().Str("component", "http").Logger()
+	trustedProxies, err := api.ParseTrustedProxies(cfg.TrustedProxies)
+	if err != nil {
+		log.Fatal().Err(err).Msg("invalid TRUSTED_PROXIES")
+	}
+
 	srv := api.NewServer(api.ServerOptions{
 		Config:         cfg,
+		TrustedProxies: trustedProxies,
 		DB:             db,
 		MQTT:           mqtt,
 		Live:           pipeline,

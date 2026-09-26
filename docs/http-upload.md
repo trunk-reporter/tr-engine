@@ -50,7 +50,7 @@ The upload endpoint checks credentials in this order:
 |-----------|--------------------------|------------------------|
 | Open mode | No credential required | No credential required |
 | Token mode | `AUTH_TOKEN` | `AUTH_TOKEN` entered by the user |
-| Full mode | API key (`tre_...`) or JWT bearer token | Public read token or JWT session |
+| Full mode | API key (`tre_...`) or `WRITE_TOKEN` — never the public read `AUTH_TOKEN` | Public read token or JWT session |
 | Legacy write-token mode | `WRITE_TOKEN` | `AUTH_TOKEN` |
 
 For new public-facing installs, prefer full mode: set `ADMIN_PASSWORD`, log in, and create a service API key for trunk-recorder uploads. `WRITE_TOKEN` remains accepted for backward compatibility, but it is deprecated.

@@ -22,19 +22,20 @@ import (
 
 // stubAuthStore is an in-memory authStore.
 type stubAuthStore struct {
-	mu       sync.Mutex
-	byHash   map[string]*database.APIKey
-	byID     map[int]*database.APIKey
-	anon     database.AnonymousAccess
-	retired  string
-	secret   []byte
-	merged   map[int]bool
-	audit    []database.AuditEntry
-	touched  []int
-	lookups  int   // ResolveAPIKeyByHash calls
-	idReads  int   // GetAPIKeyByID calls
-	failWith error // returned by every key lookup when set
-	nextID   int
+	mu            sync.Mutex
+	byHash        map[string]*database.APIKey
+	byID          map[int]*database.APIKey
+	anon          database.AnonymousAccess
+	retired       string
+	secret        []byte
+	merged        map[int]bool
+	audit         []database.AuditEntry
+	touched       []int
+	lookups       int   // ResolveAPIKeyByHash calls
+	idReads       int   // GetAPIKeyByID calls
+	failWith      error // returned by every key lookup when set
+	nextID        int
+	mergedQueries int // AnyMergedAwaySystem calls
 }
 
 func newStubAuthStore() *stubAuthStore {
@@ -127,6 +128,7 @@ func (s *stubAuthStore) GetOrCreateTicketSecret(context.Context) ([]byte, error)
 func (s *stubAuthStore) AnyMergedAwaySystem(_ context.Context, ids []int) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.mergedQueries++
 	for _, id := range ids {
 		if s.merged[id] {
 			return true, nil
@@ -135,9 +137,12 @@ func (s *stubAuthStore) AnyMergedAwaySystem(_ context.Context, ids []int) (bool,
 	return false, nil
 }
 
+// InsertAuditLog stores e as the real store does, path capped by
+// database.TruncateAuditPath.
 func (s *stubAuthStore) InsertAuditLog(_ context.Context, e database.AuditEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	e.Path = database.TruncateAuditPath(e.Path)
 	s.audit = append(s.audit, e)
 	return nil
 }

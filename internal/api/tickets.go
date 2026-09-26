@@ -63,6 +63,15 @@ func (h *TicketsHandler) Mint(w http.ResponseWriter, r *http.Request) {
 		ttl = auth.ClampTicketTTL(time.Duration(secs) * time.Second)
 	}
 
+	// Validate the narrowing before anything else looks at it: it is
+	// bounded (MaxTicketEntries) only from here on.
+	if req.Restriction != nil {
+		if err := req.Restriction.Validate(auth.KindTicket); err != nil {
+			writeTicketNarrowingError(w, err)
+			return
+		}
+	}
+
 	secret, err := h.authn.ticketSecret(r.Context())
 	if err != nil {
 		hlog.FromRequest(r).Error().Err(err).Msg("tickets: reading the ticket secret failed")
@@ -71,13 +80,35 @@ func (h *TicketsHandler) Mint(w http.ResponseWriter, r *http.Request) {
 	}
 	exp := time.Unix(h.authn.now().Add(ttl).Unix(), 0).UTC()
 	ticket, err := auth.SignTicket(secret, auth.TicketPayload{KeyID: p.KeyID, ExpiresAt: exp, Narrowing: req.Restriction})
+	if err != nil {
+		writeTicketNarrowingError(w, err)
+		return
+	}
+
+	if req.Restriction != nil {
+		// A narrowing naming a merged-away system would be refused on every
+		// use (resolveTicket); say so now, while the client can fix it.
+		merged, err := h.authn.mergedAway(r.Context(), req.Restriction.ReferencedSystems())
+		if err != nil {
+			hlog.FromRequest(r).Error().Err(err).Msg("tickets: checking the narrowing for merged systems failed")
+			WriteErrorWithCode(w, http.StatusServiceUnavailable, ErrServiceUnavail, "ticket signing is unavailable; try again")
+			return
+		}
+		if merged {
+			WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody,
+				"restriction: names a system that was merged into another; use the system it was merged into")
+			return
+		}
+	}
+	WriteJSON(w, http.StatusOK, ticketResponse{Ticket: ticket, ExpiresAt: exp})
+}
+
+// writeTicketNarrowingError answers 400 for a narrowing that Validate or
+// SignTicket refused.
+func writeTicketNarrowingError(w http.ResponseWriter, err error) {
 	if errors.Is(err, auth.ErrTicketTooLarge) {
 		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody, auth.ErrTicketTooLarge.Error())
 		return
 	}
-	if err != nil {
-		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody, "restriction: "+err.Error())
-		return
-	}
-	WriteJSON(w, http.StatusOK, ticketResponse{Ticket: ticket, ExpiresAt: exp})
+	WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody, "restriction: "+err.Error())
 }

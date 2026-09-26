@@ -309,7 +309,7 @@ curl -H "Authorization: Bearer $KEY" "http://localhost:8080/api/v1/talkgroups?li
 curl -N -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/events/stream
 ```
 
-With a key, `/health` also shows the trunk-recorder instances and other details.
+With a key that has unrestricted `listen`, `edit` or `admin`, `/health` also shows the trunk-recorder instances, the audio stream and other details. Without a key, or with a restricted key, it shows only `status`, `version` and `checks`.
 
 ### Web UI
 
@@ -382,16 +382,19 @@ STREAM_LISTEN=:9123
 # STREAM_OPUS_BITRATE=16000     # Opus encoder bitrate (bps), 0 = PCM passthrough
 # STREAM_MAX_CLIENTS=50         # max concurrent WebSocket listeners
 # STREAM_IDLE_TIMEOUT=30s       # tear down idle per-talkgroup encoders
+# STREAM_SOURCE_MAP=192.168.1.20=tr-butco,192.168.1.21=tr-warco   # sender IP → TR instance_id
 ```
+
+`STREAM_SOURCE_MAP` is only needed when several trunk-recorder instances use the same short name for **different** systems. tr-engine can't tell their simplestream packets apart by short name, so it drops audio from a sender it can't attribute and logs a WARN "dropping live audio: several trunk-recorder instances use this short name" with the sender's `source_ip`. Map each sender IP to its instance ID (comma-separated `ip=instance_id`; IPv6 addresses work too), or give the systems unique short names. A sender's instance is worked out again for every chunk: real trunk-recorder instances are preferred over the `WATCH_INSTANCE_ID` (file watch / `TR_DIR`) identity, which is preferred over the `UPLOAD_INSTANCE_ID` identity. A sender is dropped with a WARN whenever the preferred instances map its short name to different systems, including when such an instance appears after the sender was attributed (a second trunk-recorder, say), and `STREAM_SOURCE_MAP` is then required. Only `STREAM_SOURCE_MAP` entries take an instance out of other senders' candidates; an attribution tr-engine worked out by itself doesn't.
 
 Restart tr-engine after changing `.env`.
 
 ### Verify
 
-Check the health endpoint — a new `audio_stream` section appears when streaming is enabled:
+Check the health endpoint with a key that has unrestricted `listen`, `edit` or `admin` — a new `audio_stream` section appears when streaming is enabled (without such a key, `/health` shows only `status`, `version` and `checks`):
 
 ```bash
-curl http://localhost:8080/api/v1/health
+curl -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/health
 ```
 
 > **Note:** simplestream sends raw PCM audio over UDP. This is separate from the MQTT feed — you still need MQTT (or file watch) for call metadata, talkgroup names, unit events, etc. Streaming adds live audio on top of the existing data pipeline.

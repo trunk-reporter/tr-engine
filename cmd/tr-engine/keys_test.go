@@ -134,6 +134,20 @@ func TestRestrictionFlags(t *testing.T) {
 	if err != nil || len(r.Systems) != 2 || len(r.Talkgroups) != 1 || r.AllowAll {
 		t.Errorf("systems + talkgroups: %+v %v", r, err)
 	}
+	// Repeated list flags add up; none is silently dropped (r2-06).
+	c, r, err = build("--all-talkgroups", "--exclude-talkgroups", "1:5001", "--exclude-talkgroups", "1:5002,1:5003",
+		"--exclude-talkgroups", "")
+	if c != restrictionReplaced || err != nil ||
+		!r.Equal(&auth.Restriction{AllowAll: true, ExcludeTalkgroups: []auth.TG{{SystemID: 1, Tgid: 5001}, {SystemID: 1, Tgid: 5002}, {SystemID: 1, Tgid: 5003}}}) {
+		t.Errorf("repeated --exclude-talkgroups: %v %+v %v", c, r, err)
+	}
+	c, r, err = build("--systems", "1", "--systems", "2", "--talkgroups", "3:1", "--talkgroups", "3:2")
+	if err != nil || !r.Equal(&auth.Restriction{Systems: []int{1, 2}, Talkgroups: []auth.TG{{SystemID: 3, Tgid: 1}, {SystemID: 3, Tgid: 2}}}) {
+		t.Errorf("repeated --systems/--talkgroups: %+v %v", r, err)
+	}
+	if _, _, err := build("--exclude-talkgroups", "1:5001", "--exclude-talkgroups", "bogus", "--all-talkgroups"); err == nil {
+		t.Error("a bad value in a repeated flag was accepted")
+	}
 }
 
 func TestParseAccessArgs(t *testing.T) {
@@ -183,8 +197,27 @@ func TestLegacyVariableWarning(t *testing.T) {
 		"CORS_ORIGINS":   "CORS_ORIGINS is no longer needed: the API allows all origins and never uses cookies",
 		"AUTH_ENABLED":   "AUTH_ENABLED is no longer used",
 	} {
-		if got := legacyVariableWarning(name, res); !strings.Contains(got, want) {
+		if got := legacyVariableWarning(name, res, nil); !strings.Contains(got, want) {
 			t.Errorf("%s: %q, want it to contain %q", name, got, want)
+		}
+	}
+
+	// With this process's value looked up: the record describes it only if
+	// the value is the imported key's or the retired token (r2-14).
+	for _, c := range []struct {
+		name  string
+		check legacyValueCheck
+		want  string
+	}{
+		{"WRITE_TOKEN", legacyValueCheck{keyID: 3}, "imported as API key #3"},
+		{"WRITE_TOKEN", legacyValueCheck{}, "did not import (it recorded a different one), so clients sending it get 401 invalid_key"},
+		{"WRITE_TOKEN", legacyValueCheck{keyID: 9}, "did not import"},
+		{"AUTH_TOKEN", legacyValueCheck{retired: true}, "treated as anonymous"},
+		{"AUTH_TOKEN", legacyValueCheck{}, "tr-engine keys import"},
+	} {
+		check := c.check
+		if got := legacyVariableWarning(c.name, res, &check); !strings.Contains(got, c.want) {
+			t.Errorf("%s %+v: %q, want it to contain %q", c.name, c.check, got, c.want)
 		}
 	}
 }
@@ -221,7 +254,7 @@ func integrationDB(t *testing.T) (*database.DB, string) {
 	u.Path = "/" + name
 	// openCLIDatabase is what the commands use: config, schema, migrations.
 	t.Setenv("DATABASE_URL", u.String())
-	db, err := openCLIDatabase(ctx, config.Overrides{EnvFile: "nonexistent.env", DatabaseURL: u.String()}, &bytes.Buffer{})
+	db, err := openCLIDatabase(ctx, config.Overrides{EnvFile: "nonexistent.env", DatabaseURL: u.String()}, false, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("open database: %v", err)
 	}
@@ -281,6 +314,19 @@ func TestIntegrationKeysCLI(t *testing.T) {
 	if club.Restriction == nil || !club.Restriction.AllowAll || club.RateLimitRPS == nil || *club.RateLimitRPS != 3 {
 		t.Errorf("club key = %+v", club)
 	}
+	// Repeated exclusions are all stored, and create shows the restriction (r2-06).
+	out, errOut, err = runCmd(t, db, "keys", "create --name repeat --scopes listen --all-talkgroups --exclude-talkgroups 1:5001 --exclude-talkgroups 1:5002", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeat, _ := db.ResolveAPIKeyByHash(ctx, database.HashAPIKey(strings.TrimSpace(out)))
+	wantRepeat := &auth.Restriction{AllowAll: true, ExcludeTalkgroups: []auth.TG{{SystemID: 1, Tgid: 5001}, {SystemID: 1, Tgid: 5002}}}
+	if repeat == nil || !repeat.Restriction.Equal(wantRepeat) {
+		t.Errorf("repeat key = %+v", repeat)
+	}
+	if !strings.Contains(errOut, `"exclude_talkgroups":["1:5001","1:5002"]`) {
+		t.Errorf("create summary lacks the restriction: %q", errOut)
+	}
 
 	// update by ID and by prefix; absent flags change nothing.
 	if _, _, err := runCmd(t, db, "keys", fmt.Sprintf("update %d --name %s", club.ID, "club-v2"), ""); err != nil {
@@ -310,7 +356,24 @@ func TestIntegrationKeysCLI(t *testing.T) {
 		t.Errorf("list: %v\n%s", err, out)
 	}
 
-	// The CLI is not subject to the last-admin guard.
+	// The CLI is not subject to the last-admin guard, but warns when it
+	// takes away the last admin key (r1-16).
+	demoted, err := db.CreateAPIKey(ctx, database.NewAPIKey{Name: "demoted admin", Scopes: auth.Scopes{auth.ScopeAdmin}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, errOut, err = runCmd(t, db, "keys", "update "+strconv.Itoa(demoted.ID)+" --expires 2h", "")
+	if err != nil || !strings.Contains(errOut, "every active admin key expires by") {
+		t.Errorf("short expiry on the only admin key: %v %q", err, errOut)
+	}
+	_, errOut, err = runCmd(t, db, "keys", "update "+strconv.Itoa(demoted.ID)+" --scopes listen", "")
+	if err != nil || !strings.Contains(errOut, "no active admin key is left") {
+		t.Errorf("demote the only admin key: %v %q", err, errOut)
+	}
+	_, errOut, err = runCmd(t, db, "keys", "update "+strconv.Itoa(demoted.ID)+" --name still-listen", "")
+	if err != nil || strings.Contains(errOut, "warning") {
+		t.Errorf("rename of a non-admin key warned: %v %q", err, errOut)
+	}
 	admin, err := db.CreateAPIKey(ctx, database.NewAPIKey{Name: "only admin", Scopes: auth.Scopes{auth.ScopeAdmin}})
 	if err != nil {
 		t.Fatal(err)
@@ -348,8 +411,17 @@ func TestIntegrationKeysCLI(t *testing.T) {
 	if err != nil || imported.ID != id || !imported.Legacy || !strings.HasPrefix(imported.Prefix, "legacy_") {
 		t.Errorf("imported = %+v, %v", imported, err)
 	}
-	if _, _, err := runCmd(t, db, "keys", "import --name again --scopes admin", "short-secret"); err == nil {
-		t.Error("the same secret was imported twice")
+	if _, _, err := runCmd(t, db, "keys", "import --name again --scopes admin", "short-secret"); err == nil ||
+		!strings.Contains(err.Error(), "active key #") {
+		t.Errorf("the same secret imported twice: %v", err)
+	}
+	// Importing a revoked secret says it is revoked (r1-17).
+	if _, _, err := runCmd(t, db, "keys", "revoke "+strconv.Itoa(id), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCmd(t, db, "keys", "import --name again --scopes upload", "short-secret"); err == nil ||
+		!strings.Contains(err.Error(), "revoked on") || !strings.Contains(err.Error(), "keys create") {
+		t.Errorf("import of a revoked secret: %v", err)
 	}
 	if _, _, err := runCmd(t, db, "keys", "import --name shell --scopes listen", "$(openssl rand -hex 32)\n"); err == nil {
 		t.Error(`a secret with "$(" was imported`)
@@ -367,8 +439,12 @@ func TestIntegrationAccessCLI(t *testing.T) {
 	if err != nil || !strings.Contains(out, "anonymous access:     off") || !strings.Contains(out, "retired public token: none") {
 		t.Errorf("show: %v\n%s", err, out)
 	}
-	if _, _, err := runCmd(t, db, "access", "set --anonymous listen --all-talkgroups --exclude-talkgroups 1:5001", ""); err != nil {
+	if _, _, err := runCmd(t, db, "access", "set --anonymous listen --all-talkgroups --exclude-talkgroups 1:5001 --exclude-talkgroups 1:5002", ""); err != nil {
 		t.Fatal(err)
+	}
+	if a, _ := db.GetAnonymousAccess(ctx); !a.Restriction.Equal(&auth.Restriction{AllowAll: true,
+		ExcludeTalkgroups: []auth.TG{{SystemID: 1, Tgid: 5001}, {SystemID: 1, Tgid: 5002}}}) {
+		t.Errorf("repeated --exclude-talkgroups stored %+v", a.Restriction)
 	}
 	// Without restriction flags the stored restriction is kept.
 	if _, _, err := runCmd(t, db, "access", "set --anonymous off", ""); err != nil {
@@ -383,9 +459,18 @@ func TestIntegrationAccessCLI(t *testing.T) {
 		// no argument: a usage error, not a silent unrestricted policy.
 		t.Error("--talkgroups without a value was accepted")
 	}
+	// Allow-nothing policies get a hint that fits the command (r1-17).
 	_, _, err = runCmd(t, db, "access", "set --anonymous listen --exclude-talkgroups 1:5", "")
-	if err == nil || !strings.Contains(err.Error(), "--anonymous off") {
-		t.Errorf("allow-nothing policy: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "--all-talkgroups") || strings.Contains(err.Error(), "--anonymous off") {
+		t.Errorf("exclude-only policy: %v", err)
+	}
+	_, _, err = runCmd(t, db, "access", "set --anonymous listen --systems 1 --exclude-talkgroups 1:5", "")
+	if err != nil {
+		t.Errorf("systems + exclusions: %v", err)
+	}
+	if msg := allowsNothingError("off", &auth.Restriction{}).Error(); strings.Contains(msg, "--anonymous off") ||
+		!strings.Contains(msg, "--no-restriction") {
+		t.Errorf("allow-nothing hint with access off: %q", msg)
 	}
 	if _, _, err := runCmd(t, db, "access", "set --anonymous listen --no-restriction", ""); err != nil {
 		t.Fatal(err)
@@ -402,12 +487,43 @@ func TestIntegrationAccessCLI(t *testing.T) {
 	if !strings.Contains(out, "retired public token: stored") {
 		t.Errorf("show:\n%s", out)
 	}
+	// The retired public token can't be imported as a key (r1-05)...
+	if _, _, err := runCmd(t, db, "keys", "import --name prometheus --scopes admin", "old\n"); !errors.Is(err, database.ErrRetiredPublicToken) {
+		t.Errorf("import of the retired public token: %v", err)
+	}
+	// ...and a key imported before that rule blocks forgetting it.
+	mustImportRetired := func() int {
+		var id int
+		if err := db.Pool.QueryRow(ctx, `INSERT INTO api_keys (key_hash, key_prefix, name, scopes, legacy)
+			VALUES ($1, 'legacy_x', 'old import', '{admin}', true) RETURNING id`, database.HashAPIKey("old")).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	oldID := mustImportRetired()
+	if _, _, err := runCmd(t, db, "access", "forget-retired-token", ""); !errors.Is(err, database.ErrRetiredTokenIsKey) ||
+		!strings.Contains(err.Error(), fmt.Sprintf("key #%d", oldID)) {
+		t.Errorf("forget with a key holding the token: %v", err)
+	}
+	if h, _ := db.GetRetiredPublicTokenHash(ctx); h == "" {
+		t.Error("the retired token was forgotten although a key holds it")
+	}
+	if _, _, err := runCmd(t, db, "keys", "revoke "+strconv.Itoa(oldID), ""); err != nil {
+		t.Fatal(err)
+	}
 	_, errOut, err := runCmd(t, db, "access", "forget-retired-token", "")
 	if err != nil || !strings.Contains(errOut, "forgot") {
 		t.Errorf("forget: %v %q", err, errOut)
 	}
 	if h, _ := db.GetRetiredPublicTokenHash(ctx); h != "" {
 		t.Error("the retired token is still stored")
+	}
+	// Forgotten, it still can't be imported.
+	if _, _, err := runCmd(t, db, "keys", "import --name prometheus --scopes admin", "old\n"); !errors.Is(err, database.ErrRetiredPublicToken) {
+		t.Errorf("import of the forgotten public token: %v", err)
+	}
+	if _, errOut, err := runCmd(t, db, "access", "forget-retired-token", ""); err != nil || !strings.Contains(errOut, "no retired public token") {
+		t.Errorf("second forget: %v %q", err, errOut)
 	}
 }
 
@@ -478,6 +594,10 @@ func TestIntegrationSetupAuth(t *testing.T) {
 func TestIntegrationSetupAuthUpgrade(t *testing.T) {
 	db, _ := integrationDB(t)
 	ctx := context.Background()
+	// An upgraded database: its schema predates schema.sql's marker.
+	if _, err := db.Pool.Exec(ctx, `DELETE FROM data_fixups WHERE name = $1`, database.SchemaCreatedFixup); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.Pool.Exec(ctx, `INSERT INTO systems (system_id, system_type, name, sysid, wacn) VALUES (1, 'p25', 'x', '348', 'BEE00')`); err != nil {
 		t.Fatal(err)
 	}
@@ -516,5 +636,134 @@ func TestIntegrationSetupAuthUpgrade(t *testing.T) {
 	if strings.Contains(logs.String(), "legacy auth import") || !strings.Contains(logs.String(), "WRITE_TOKEN is no longer used (imported") ||
 		!strings.Contains(logs.String(), "is weak") {
 		t.Errorf("second start logs:\n%s", logs.String())
+	}
+
+	// Another engine on the database, or a changed .env, with different
+	// values: the warnings don't claim they were imported (r2-14).
+	other := &config.Config{UploadInstanceID: "http-upload", LegacyAuth: config.LegacyAuthEnv{
+		AuthToken: "another-auth-token-value", WriteToken: "another-write-token-value",
+	}}
+	logs.Reset()
+	if err := setupAuth(ctx, db, other, false, false, &stderr, zerolog.New(&logs)); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(logs.String(), "no longer used (imported") ||
+		strings.Count(logs.String(), "did not import (it recorded a different one)") != 2 {
+		t.Errorf("changed values:\n%s", logs.String())
+	}
+}
+
+// A database whose schema a CLI command created before the first server
+// start is fresh: the old variables aren't imported, anonymous access stays
+// off, and the bootstrap key is printed (r2-05).
+func TestIntegrationSetupAuthCLICreatedSchema(t *testing.T) {
+	db, _ := integrationDB(t) // the schema was created by openCLIDatabase
+	ctx := context.Background()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO systems (system_id, system_type, name) VALUES (1, 'p25', 'imported')`); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{UploadInstanceID: "http-upload", LegacyAuth: config.LegacyAuthEnv{
+		AdminPassword: "hunter22hunter22", AuthToken: "a-long-enough-auth-token", WriteToken: "a-long-enough-write-token",
+	}}
+	var stderr, logs bytes.Buffer
+	if err := setupAuth(ctx, db, cfg, false, false, &stderr, zerolog.New(&logs)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "tre_") {
+		t.Errorf("no bootstrap key printed:\n%s", stderr.String())
+	}
+	if !strings.Contains(logs.String(), "fresh database: nothing imported, anonymous access off") {
+		t.Errorf("logs:\n%s", logs.String())
+	}
+	if keys, _ := db.ListAPIKeys(ctx, true); len(keys) != 1 || keys[0].Name != database.BootstrapAdminKeyName {
+		t.Errorf("keys = %+v, want only the bootstrap key", keys)
+	}
+	if a, err := db.GetAnonymousAccess(ctx); err != nil || a.Access != database.AccessOff {
+		t.Errorf("anonymous access = %+v, %v; want off", a, err)
+	}
+}
+
+func TestStripMigrateFlag(t *testing.T) {
+	for _, c := range []struct {
+		in      string
+		out     string
+		migrate bool
+	}{
+		{"list", "list", false},
+		{"list --migrate", "list", true},
+		{"-migrate show", "show", true},
+		{"create --name x --migrate=true --scopes listen", "create --name x --scopes listen", true},
+		{"list --migrate=false", "list", false},
+		{"create --name migrate --scopes listen", "create --name migrate --scopes listen", false},
+	} {
+		out, migrate, err := stripMigrateFlag(strings.Fields(c.in))
+		if err != nil || strings.Join(out, " ") != c.out || migrate != c.migrate {
+			t.Errorf("%q: %q %v %v, want %q %v", c.in, out, migrate, err, c.out, c.migrate)
+		}
+	}
+	if _, _, err := stripMigrateFlag([]string{"list", "--migrate=maybe"}); !isUsage(err) {
+		t.Errorf("--migrate=maybe: %v, want a usage error", err)
+	}
+}
+
+// A keys/access command on a database from before API keys names the
+// migrations it would apply and refuses the irreversible ones (which break
+// an old engine still running on it) unless --migrate is given (r2-15).
+func TestIntegrationCLIRefusesIrreversibleMigrations(t *testing.T) {
+	db, dbURL := integrationDB(t)
+	ctx := context.Background()
+	// The old engine's users table (what "record and drop users" drops).
+	if _, err := db.Pool.Exec(ctx, `CREATE TABLE users (id serial PRIMARY KEY, username text NOT NULL,
+		role text NOT NULL CHECK (role IN ('viewer', 'editor', 'admin')), enabled boolean NOT NULL DEFAULT true)`); err != nil {
+		t.Fatal(err)
+	}
+	usersExist := func() bool {
+		var ok bool
+		if err := db.Pool.QueryRow(ctx, `SELECT to_regclass('users') IS NOT NULL`).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	overrides := config.Overrides{EnvFile: "nonexistent.env", DatabaseURL: dbURL}
+
+	var stderr bytes.Buffer
+	if cli, err := openCLIDatabase(ctx, overrides, false, &stderr); err == nil {
+		cli.Close()
+		t.Fatal("opened a pre-API-key database without --migrate")
+	} else if !strings.Contains(err.Error(), "record and drop users") || !strings.Contains(err.Error(), "--migrate") {
+		t.Errorf("error = %v", err)
+	}
+	if !usersExist() {
+		t.Fatal("the refused command dropped the users table")
+	}
+
+	stderr.Reset()
+	cli, err := openCLIDatabase(ctx, overrides, true, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli.Close()
+	if !strings.Contains(stderr.String(), "applying 1 pending schema migration(s): record and drop users") {
+		t.Errorf("stderr = %q", stderr.String())
+	}
+	if usersExist() {
+		t.Error("--migrate did not apply the migration")
+	}
+
+	// On an upgraded database whose server hasn't started yet, list/show
+	// say the legacy import is still to come.
+	if _, err := db.Pool.Exec(ctx, `DELETE FROM data_fixups WHERE name = $1`, database.SchemaCreatedFixup); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range [][2]string{{"access", "show"}, {"keys", "list"}} {
+		if _, errOut, err := runCmd(t, db, c[0], c[1], ""); err != nil || !strings.Contains(errOut, "hasn't run yet") {
+			t.Errorf("%s %s: %v %q", c[0], c[1], err, errOut)
+		}
+	}
+	if _, err := db.ImportLegacyAuth(ctx, database.LegacyAuthInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, errOut, err := runCmd(t, db, "access", "show", ""); err != nil || strings.Contains(errOut, "hasn't run yet") {
+		t.Errorf("after the import: %v %q", err, errOut)
 	}
 }

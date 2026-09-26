@@ -50,8 +50,11 @@ Commands:
 A number is always a key ID; select a key by its prefix with --prefix.
 create prints only the new key on stdout; import prints only the new ID.
 Restriction flags (only for keys whose scopes are exactly "listen") replace
-the whole restriction; --systems "" or --talkgroups "" is an empty list.
-Every command also takes --env-file and --database-url.
+the whole restriction; --systems "" or --talkgroups "" is an empty list, and
+a repeated list flag adds to the list.
+Every command also takes --env-file and --database-url, and --migrate to
+upgrade a database from a version before API keys (normally the first start
+of the server does that; without --migrate such a database is refused).
 
 Running engines apply changes within 30 s, open streams within 60 s.
 `
@@ -67,10 +70,15 @@ Commands:
   forget-retired-token
 
 set without restriction flags keeps the stored restriction; restriction
-flags replace it, and --no-restriction clears it.
+flags replace it, and --no-restriction clears it. --exclude-talkgroups only
+narrows an allow list: use it with --all-talkgroups ("everything except"),
+--systems or --talkgroups.
 forget-retired-token stops treating the pre-upgrade public AUTH_TOKEN as no
-credential (do this once no proxy injects it any more).
-Every command also takes --env-file and --database-url.
+credential (do this once no proxy injects it any more); requests carrying it
+then get 401, and it still can't be imported as a key.
+Every command also takes --env-file and --database-url, and --migrate to
+upgrade a database from a version before API keys (normally the first start
+of the server does that; without --migrate such a database is refused).
 
 Running engines apply changes within 30 s, open streams within 60 s.
 `
@@ -117,7 +125,11 @@ func runCLI(args []string, overrides config.Overrides, usage string, parse cliPa
 		fmt.Fprint(os.Stdout, usage)
 		return 0
 	}
-	action, err := parse(args, &overrides, time.Now())
+	args, migrate, err := stripMigrateFlag(args)
+	var action cliAction
+	if err == nil {
+		action, err = parse(args, &overrides, time.Now())
+	}
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
 	}
@@ -133,7 +145,7 @@ func runCLI(args []string, overrides config.Overrides, usage string, parse cliPa
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	db, err := openCLIDatabase(ctx, overrides, os.Stderr)
+	db, err := openCLIDatabase(ctx, overrides, migrate, os.Stderr)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
@@ -149,8 +161,11 @@ func runCLI(args []string, overrides config.Overrides, usage string, parse cliPa
 
 // openCLIDatabase connects like the server does (config, schema, migrations)
 // with logs on stderr at WARN. A failed migration is an error: the commands
-// write tables that migrations create.
-func openCLIDatabase(ctx context.Context, overrides config.Overrides, stderr io.Writer) (*database.DB, error) {
+// write tables that migrations create. Pending migrations are named on
+// stderr before they are applied; the irreversible ones (the conversion of a
+// pre-API-key database, which an old engine still running on it can't
+// survive) are refused unless migrate is set (--migrate).
+func openCLIDatabase(ctx context.Context, overrides config.Overrides, migrate bool, stderr io.Writer) (*database.DB, error) {
 	log := zerolog.New(stderr).With().Timestamp().Logger().Level(zerolog.WarnLevel)
 	cfg, err := config.Load(overrides)
 	if err != nil {
@@ -164,11 +179,60 @@ func openCLIDatabase(ctx context.Context, overrides config.Overrides, stderr io.
 		db.Close()
 		return nil, fmt.Errorf("schema initialization: %w", err)
 	}
+	pending, err := db.PendingMigrations(ctx)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("schema migration: %w", err)
+	}
+	var names, irreversible []string
+	for _, m := range pending {
+		names = append(names, m.Name)
+		if m.Irreversible {
+			irreversible = append(irreversible, m.Name)
+		}
+	}
+	if len(irreversible) > 0 && !migrate {
+		db.Close()
+		return nil, fmt.Errorf("this database is from a tr-engine version before API keys, and upgrading it (%s) "+
+			"converts its API keys and removes its user accounts: an older engine still running on it stops working, "+
+			"and the change can't be undone. Stop the old engine, back up the database and start this version's "+
+			"server once (it also carries AUTH_TOKEN/WRITE_TOKEN over), then run this command again; "+
+			"or run it again with --migrate to upgrade the database now (see docs/migrating-auth.md)",
+			strings.Join(irreversible, ", "))
+	}
+	if len(names) > 0 {
+		fmt.Fprintf(stderr, "applying %d pending schema migration(s): %s\n", len(names), strings.Join(names, ", "))
+	}
 	if err := db.Migrate(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("schema migration: %w", err)
 	}
 	return db, nil
+}
+
+// stripMigrateFlag removes --migrate (or -migrate, --migrate=true) from
+// args, which every keys/access command takes, and reports whether it was
+// given.
+func stripMigrateFlag(args []string) ([]string, bool, error) {
+	out := make([]string, 0, len(args))
+	migrate := false
+	for _, a := range args {
+		name, val, hasVal := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		if !strings.HasPrefix(a, "-") || name != "migrate" {
+			out = append(out, a)
+			continue
+		}
+		if !hasVal {
+			migrate = true
+			continue
+		}
+		b, err := strconv.ParseBool(val)
+		if err != nil {
+			return nil, false, usagef("--migrate: %q is not a boolean", val)
+		}
+		migrate = b
+	}
+	return out, migrate, nil
 }
 
 // newFlagSet returns a FlagSet for one command, with the connection flags
@@ -210,17 +274,35 @@ func flagsSet(fs *flag.FlagSet) map[string]bool {
 // restrictionFlags are the flags that describe a restriction (§10.2).
 type restrictionFlags struct {
 	allTalkgroups bool
-	systems       string
-	talkgroups    string
-	exclude       string
+	systems       listFlag
+	talkgroups    listFlag
+	exclude       listFlag
 	none          bool
+}
+
+// listFlag is a comma-separated list flag that may also be repeated: every
+// occurrence adds to the list. (A plain string flag keeps only the last
+// occurrence, which would silently drop the earlier ones of
+// "--exclude-talkgroups 1:5001 --exclude-talkgroups 1:5002".)
+type listFlag []string
+
+func (l *listFlag) String() string {
+	if l == nil {
+		return ""
+	}
+	return strings.Join(*l, ",")
+}
+
+func (l *listFlag) Set(v string) error {
+	*l = append(*l, v)
+	return nil
 }
 
 func (rf *restrictionFlags) register(fs *flag.FlagSet, withNone bool) {
 	fs.BoolVar(&rf.allTalkgroups, "all-talkgroups", false, "Allow every talkgroup (allow_all), minus --exclude-talkgroups")
-	fs.StringVar(&rf.systems, "systems", "", `Allowed system IDs, comma-separated ("" = none)`)
-	fs.StringVar(&rf.talkgroups, "talkgroups", "", `Allowed talkgroups as system_id:tgid, comma-separated ("" = none)`)
-	fs.StringVar(&rf.exclude, "exclude-talkgroups", "", "Talkgroups never allowed, as system_id:tgid, comma-separated")
+	fs.Var(&rf.systems, "systems", `Allowed system IDs, comma-separated or repeated ("" = none)`)
+	fs.Var(&rf.talkgroups, "talkgroups", `Allowed talkgroups as system_id:tgid, comma-separated or repeated ("" = none)`)
+	fs.Var(&rf.exclude, "exclude-talkgroups", "Talkgroups never allowed, as system_id:tgid, comma-separated or repeated")
 	if withNone {
 		fs.BoolVar(&rf.none, "no-restriction", false, "Remove the restriction (unrestricted)")
 	}
@@ -249,7 +331,7 @@ func (rf *restrictionFlags) build(set map[string]bool) (restrictionChange, *auth
 		return restrictionUnchanged, nil, nil
 	}
 	r := &auth.Restriction{AllowAll: rf.allTalkgroups, Systems: []int{}, Talkgroups: []auth.TG{}, ExcludeTalkgroups: []auth.TG{}}
-	for _, s := range splitList(rf.systems) {
+	for _, s := range splitList(rf.systems.String()) {
 		id, err := strconv.Atoi(s)
 		if err != nil || id <= 0 {
 			return 0, nil, usagef("--systems: %q is not a positive system ID", s)
@@ -257,10 +339,10 @@ func (rf *restrictionFlags) build(set map[string]bool) (restrictionChange, *auth
 		r.Systems = append(r.Systems, id)
 	}
 	var err error
-	if r.Talkgroups, err = parseTGList("--talkgroups", rf.talkgroups); err != nil {
+	if r.Talkgroups, err = parseTGList("--talkgroups", rf.talkgroups.String()); err != nil {
 		return 0, nil, err
 	}
-	if r.ExcludeTalkgroups, err = parseTGList("--exclude-talkgroups", rf.exclude); err != nil {
+	if r.ExcludeTalkgroups, err = parseTGList("--exclude-talkgroups", rf.exclude.String()); err != nil {
 		return 0, nil, err
 	}
 	return restrictionReplaced, r, nil
@@ -543,6 +625,7 @@ func keysList(ctx context.Context, env *cliEnv, all bool) error {
 	if err != nil {
 		return err
 	}
+	warnLegacyImportPending(ctx, env)
 	tw := tabwriter.NewWriter(env.stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tNAME\tPREFIX\tSCOPES\tSTATUS\tEXPIRES\tLAST USED\tRATE LIMIT\tRESTRICTION")
 	for _, k := range keys {
@@ -564,14 +647,26 @@ func keysList(ctx context.Context, env *cliEnv, all bool) error {
 	return nil
 }
 
+// warnLegacyImportPending notes on stderr that the one-time legacy import
+// hasn't run on this upgraded database yet, so what list/show print may
+// still change on the first server start.
+func warnLegacyImportPending(ctx context.Context, env *cliEnv) {
+	pending, err := env.db.LegacyAuthImportPending(ctx)
+	if err != nil || !pending {
+		return
+	}
+	fmt.Fprintln(env.stderr, "note: the one-time import of the old auth settings hasn't run yet: the first start of the "+
+		"server may import AUTH_TOKEN/WRITE_TOKEN as keys and set the anonymous access policy (see docs/migrating-auth.md)")
+}
+
 func keysCreate(ctx context.Context, env *cliEnv, in database.NewAPIKey) error {
 	key, err := env.db.CreateAPIKey(ctx, in)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintln(env.stdout, key.Plaintext)
-	fmt.Fprintf(env.stderr, "created key #%d %q (%s, scopes %s). Store it now: it will not be shown again.\n",
-		key.ID, key.Name, key.Prefix, strings.Join(key.Scopes.Strings(), ","))
+	fmt.Fprintf(env.stderr, "created key #%d %q (%s, scopes %s, restriction %s). Store it now: it will not be shown again.\n",
+		key.ID, key.Name, key.Prefix, strings.Join(key.Scopes.Strings(), ","), formatRestriction(key.Restriction))
 	fmt.Fprintln(env.stderr, "A key used in web pages that other people load is public: give such pages no key, or a restricted listen key.")
 	return nil
 }
@@ -586,7 +681,17 @@ func keysImport(ctx context.Context, env *cliEnv, in database.NewAPIKey) error {
 		return err
 	}
 	if !created {
-		return fmt.Errorf("this secret is already stored as key #%d %q (scopes %s); nothing was changed",
+		switch key.Status {
+		case database.KeyRevoked:
+			return fmt.Errorf("this secret is already stored as key #%d %q (scopes %s), which was revoked on %s; "+
+				"a revoked secret can't be imported again: create a new key with `tr-engine keys create` and configure the client with it",
+				key.ID, key.Name, strings.Join(key.Scopes.Strings(), ","), formatTime(key.RevokedAt, "?"))
+		case database.KeyExpired:
+			return fmt.Errorf("this secret is already stored as key #%d %q (scopes %s), which expired on %s; "+
+				"nothing was changed (extend it with `tr-engine keys update %d --expires ...` or --no-expiry)",
+				key.ID, key.Name, strings.Join(key.Scopes.Strings(), ","), formatTime(key.ExpiresAt, "?"), key.ID)
+		}
+		return fmt.Errorf("this secret is already stored as active key #%d %q (scopes %s); nothing was changed",
 			key.ID, key.Name, strings.Join(key.Scopes.Strings(), ","))
 	}
 	fmt.Fprintln(env.stdout, key.ID)
@@ -617,6 +722,10 @@ func keysUpdate(ctx context.Context, env *cliEnv, sel keySelector, p database.AP
 	if err != nil {
 		return err
 	}
+	before, err := env.db.GetAPIKeyByID(ctx, id)
+	if err != nil {
+		return err
+	}
 	key, err := env.db.PatchAPIKey(ctx, id, p, database.NoLastAdminGuard)
 	if err != nil {
 		return err
@@ -624,7 +733,41 @@ func keysUpdate(ctx context.Context, env *cliEnv, sel keySelector, p database.AP
 	fmt.Fprintf(env.stderr, "updated key #%d %q (%s): scopes %s, expires %s, rate limit %s, restriction %s; %s\n",
 		key.ID, key.Name, key.Prefix, strings.Join(key.Scopes.Strings(), ","), formatTime(key.ExpiresAt, "never"),
 		formatRateLimit(key.RateLimitRPS), formatRestriction(key.Restriction), cliApplyNote)
+	if before.Scopes.Has(auth.ScopeAdmin) {
+		warnAdminKeys(ctx, env, key)
+	}
 	return nil
+}
+
+// warnAdminKeys warns, after the CLI changed admin key k (which bypasses the
+// API's last-admin guard, §10.2), when no active admin key is left, or when
+// the only ones left expire within a day.
+func warnAdminKeys(ctx context.Context, env *cliEnv, k *database.APIKey) {
+	keys, err := env.db.ListAPIKeys(ctx, false)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	var latest *time.Time // latest expiry of an active admin key; nil with one that never expires
+	active := false
+	for i := range keys {
+		o := &keys[i]
+		if !o.Scopes.Has(auth.ScopeAdmin) || !o.ActiveAt(now) {
+			continue
+		}
+		if !active || (latest != nil && (o.ExpiresAt == nil || o.ExpiresAt.After(*latest))) {
+			latest = o.ExpiresAt
+		}
+		active = true
+	}
+	switch {
+	case !active:
+		fmt.Fprintln(env.stderr, `warning: no active admin key is left; create one with: tr-engine keys create --name "admin" --scopes admin`)
+	case latest != nil && latest.Before(now.Add(24*time.Hour)):
+		fmt.Fprintf(env.stderr, "warning: every active admin key expires by %s (key #%d was just changed); "+
+			"create one that lasts with: tr-engine keys create --name \"admin\" --scopes admin\n",
+			latest.UTC().Format(time.RFC3339), k.ID)
+	}
 }
 
 func keysRevoke(ctx context.Context, env *cliEnv, sel keySelector) error {
@@ -646,9 +789,7 @@ func keysRevoke(ctx context.Context, env *cliEnv, sel keySelector) error {
 	}
 	fmt.Fprintf(env.stderr, "revoked key #%d %q (%s); %s\n", key.ID, key.Name, key.Prefix, cliApplyNote)
 	if key.Scopes.Has(auth.ScopeAdmin) {
-		if exists, err := env.db.ActiveAdminKeyExists(ctx); err == nil && !exists {
-			fmt.Fprintln(env.stderr, `warning: no active admin key is left; create one with: tr-engine keys create --name "admin" --scopes admin`)
-		}
+		warnAdminKeys(ctx, env, key)
 	}
 	return nil
 }
@@ -658,6 +799,7 @@ func accessShow(ctx context.Context, env *cliEnv) error {
 	if err != nil {
 		return err
 	}
+	warnLegacyImportPending(ctx, env)
 	retired, err := env.db.GetRetiredPublicTokenHash(ctx)
 	if err != nil {
 		return err
@@ -683,7 +825,7 @@ func accessSet(ctx context.Context, env *cliEnv, access string, change restricti
 	}
 	a, err := env.db.SetAnonymousAccess(ctx, access, r)
 	if errors.Is(err, auth.ErrAnonymousAllowsNothing) {
-		return errors.New("the restriction allows nothing; use --anonymous off instead")
+		return allowsNothingError(access, r)
 	}
 	if err != nil {
 		return err
@@ -693,13 +835,26 @@ func accessSet(ctx context.Context, env *cliEnv, access string, change restricti
 	return nil
 }
 
+// allowsNothingError explains why `access set` refused a restriction that
+// allows nothing, with the fix that matches what was asked for.
+func allowsNothingError(access string, r *auth.Restriction) error {
+	switch {
+	case access == database.AccessOff:
+		return errors.New("the restriction allows nothing; to keep anonymous access off, run the command without restriction flags or with --no-restriction")
+	case r != nil && len(r.ExcludeTalkgroups) > 0:
+		return errors.New("the restriction allows nothing: --exclude-talkgroups only removes talkgroups from an allow list; " +
+			"add --all-talkgroups for \"everything except\", or --systems/--talkgroups")
+	}
+	return errors.New("the restriction allows nothing; allow something with --all-talkgroups, --systems or --talkgroups, or use --anonymous off")
+}
+
 func accessForgetRetiredToken(ctx context.Context, env *cliEnv) error {
 	cleared, err := env.db.ClearRetiredPublicToken(ctx)
 	if err != nil {
 		return err
 	}
 	if cleared {
-		fmt.Fprintf(env.stderr, "forgot the retired public token: a request carrying it is now an invalid key (401); %s\n", cliApplyNote)
+		fmt.Fprintf(env.stderr, "forgot the retired public token: a request carrying it is now an invalid key (401), and it still can't be imported as a key; %s\n", cliApplyNote)
 	} else {
 		fmt.Fprintln(env.stderr, "no retired public token was stored")
 	}

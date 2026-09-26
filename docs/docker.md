@@ -450,7 +450,10 @@ STREAM_LISTEN=:9123              # enables the UDP listener (disabled if not set
 # STREAM_OPUS_BITRATE=16000      # Opus encoder bitrate (bps)
 # STREAM_MAX_CLIENTS=50          # max concurrent WebSocket listeners
 # STREAM_IDLE_TIMEOUT=30s        # tear down idle per-talkgroup encoders
+# STREAM_SOURCE_MAP=172.18.0.1=tr-butco   # sender IP → TR instance_id (see below)
 ```
+
+`STREAM_SOURCE_MAP` (comma-separated `ip=instance_id`; IPv6 addresses work too) is only needed when several trunk-recorder instances use the same short name for **different** systems. tr-engine can't tell their packets apart by short name, so it drops audio from a sender it can't attribute, with a WARN "dropping live audio: several trunk-recorder instances use this short name" that names the sender's `source_ip` as tr-engine sees it (behind Docker's port mapping that can be a Docker gateway address). Map each sender to its instance ID, or give the systems unique short names. A sender's instance is worked out again for every chunk: real trunk-recorder instances are preferred over the `WATCH_INSTANCE_ID` (file watch / `TR_DIR`) identity, which is preferred over the `UPLOAD_INSTANCE_ID` identity. A sender is dropped with a WARN whenever the preferred instances map its short name to different systems, including when such an instance appears after the sender was attributed (a second trunk-recorder, say), and `STREAM_SOURCE_MAP` is then required. Only `STREAM_SOURCE_MAP` entries take an instance out of other senders' candidates; an attribution tr-engine worked out by itself doesn't.
 
 **Docker port mapping:** Add the UDP port to the `tr-engine` service in `docker-compose.yml`:
 
@@ -463,7 +466,7 @@ STREAM_LISTEN=:9123              # enables the UDP listener (disabled if not set
 
 The simplestream listener is unauthenticated: anything that can reach the port can inject audio. It listens on `127.0.0.1` by default, which works when trunk-recorder runs on the Docker host (use `"address": "127.0.0.1"` in the plugin config). If trunk-recorder is on another machine, set `STREAM_BIND_IP` in `.env` to the Docker host's LAN or VPN address. Set `STREAM_PORT` to change the host port (the container-internal port stays 9123).
 
-Restart with `docker compose up -d`. Verify via the health endpoint — a new `audio_stream` section appears when streaming is enabled.
+Restart with `docker compose up -d`. Verify via the health endpoint with a key that has unrestricted `listen`, `edit` or `admin` (`curl -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/health`) — a new `audio_stream` section appears when streaming is enabled. Without such a key, `/health` shows only `status`, `version` and `checks`.
 
 > **Note:** Streaming works alongside MQTT, not as a replacement. MQTT provides call metadata, talkgroup names, unit events, etc. Simplestream adds live audio on top.
 

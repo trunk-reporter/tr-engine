@@ -125,7 +125,8 @@ The `.env` file is auto-loaded from the current directory on startup. See `sampl
 | `TR_DIR` | * | | Path to trunk-recorder directory for auto-discovery |
 | `MQTT_TOPICS` | No | `#` | MQTT topic filter (match your TR plugin prefix with `/#`) |
 | `HTTP_ADDR` | No | `:8080` | HTTP listen address |
-| `RATE_LIMIT_RPS` | No | `20` | Per-IP rate limit (requests/second) for requests without a key, with a ticket or with a legacy key |
+| `RATE_LIMIT_RPS` | No | `20` | Per-IP rate limit (requests/second) for requests without a key, with a ticket, with a legacy key, with a key not in the 30 s key cache, and for uploads that carry their key in the `key`/`api_key` form field (see [docs/auth.md](docs/auth.md#rate-limiting)) |
+| `RATE_LIMIT_BURST` | No | `40` | Per-IP burst size for the same requests |
 | `TRUSTED_PROXIES` | No | `loopback,private` | Reverse proxies whose `X-Forwarded-For` is believed |
 | `AUDIO_DIR` | No | `./audio` | Audio file storage directory |
 | `STT_PROVIDER` | No | `whisper` | Transcription provider: `whisper`, `elevenlabs`, `deepinfra`, `imbe` |
@@ -231,7 +232,7 @@ Before marking implementation work complete, follow the testing, API contract, a
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /health` | Service health (public); TR instance status with a key |
+| `GET /health` | Service health (public); TR instance and audio stream status with a key that has unrestricted `listen`, `edit` or `admin` |
 | `GET /whoami` | What the caller's credential can do (public) |
 | `GET/POST /keys`, `PATCH/DELETE /keys/{id}` | API key management (admin) |
 | `GET/PUT /anonymous-access` | Anonymous access policy (admin) |
@@ -329,7 +330,11 @@ internal/
   api/
     server.go                   Chi router + HTTP server
     policy.go                   Route policy table (scope, restrictions, tickets) + SSE per-type scopes
-    middleware.go               Auth pipeline, rate limiting, CORS, body limits
+    middleware.go               RequestID, CORS, access log, no-store headers, body limits, timeouts
+    pipeline.go                 Auth pipeline: Match, Resolve, Authorize, Audit, upload key
+    authn.go                    Key and ticket resolution, per-IP and per-key rate limits
+    keycache.go                 Key cache (positive/negative LRUs) and rate limiter sets
+    streamauth.go               Re-checks open SSE/WebSocket connections; close signals
     events.go                   SSE event stream endpoint
     audio_stream.go             WebSocket live audio endpoint
     *.go                        Handler files for each resource

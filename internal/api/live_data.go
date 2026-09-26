@@ -330,7 +330,7 @@ type SSEEvent struct {
 	UnitID    int    `json:"unit_id,omitempty"`
 	Emergency bool   `json:"-"` // used for server-side filtering only
 	Data      []byte `json:"-"` // pre-serialized JSON payload
-	// Seq is the event bus's publish sequence number (the part of ID after
-	// the dash), used to keep replayed and live events apart.
+	// Seq is the event bus's publish sequence number, used to keep replayed
+	// and live events apart. It is never sent: ID carries it encrypted.
 	Seq uint64 `json:"-"`
 }

@@ -120,7 +120,7 @@ func checkSQLColumn(col string) {
 // " AND FALSE". Otherwise the clause is " AND (...)" with one parenthesized
 // term per restriction, all ANDed:
 //
-//	tgCol IS NOT NULL AND tgCol <> 0
+//	tgCol > 0 AND sysCol > 0
 //	AND <allow part>
 //	AND NOT EXISTS (SELECT 1 FROM unnest($d::int[], $e::int[]) AS x(s, t)
 //	                WHERE x.s = sysCol AND x.t = tgCol)   -- only with exclusions
@@ -164,7 +164,9 @@ func (p *Principal) SQL(sysCol, tgCol string, firstArg int) (string, []any) {
 	terms := make([]string, 0, len(p.Restrictions))
 	for i := range p.Restrictions {
 		r := &p.Restrictions[i]
-		conj := []string{tgCol + " IS NOT NULL", tgCol + " <> 0"}
+		// Like Restriction.AllowsTG: NULL, zero and negative IDs never
+		// pass (a NULL comparison is not true either).
+		conj := []string{tgCol + " > 0", sysCol + " > 0"}
 
 		if !r.AllowAll {
 			systems := int32IDs(r.Systems)

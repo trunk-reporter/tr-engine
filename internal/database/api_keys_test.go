@@ -178,11 +178,11 @@ func TestValidateKeyFields(t *testing.T) {
 	listen := auth.Scopes{auth.ScopeListen}
 	restr := &auth.Restriction{Systems: []int{2, 1, 2}}
 
-	scopes, r, err := validateKeyFields(auth.Scopes{auth.ScopeUpload, auth.ScopeAdmin}, nil, &future, rps(5), now)
+	scopes, r, err := validateKeyFields(auth.Scopes{auth.ScopeUpload, auth.ScopeAdmin}, nil, true, &future, rps(5), now)
 	if err != nil || strings.Join(scopes.Strings(), ",") != "admin,upload" || r != nil {
 		t.Fatalf("valid admin key: got (%v, %v, %v)", scopes, r, err)
 	}
-	_, r, err = validateKeyFields(listen, restr, nil, nil, now)
+	_, r, err = validateKeyFields(listen, restr, true, nil, nil, now)
 	if err != nil || len(r.Systems) != 2 || r.Systems[0] != 1 {
 		t.Fatalf("restricted listen key: got (%v, %v), want normalized systems [1 2]", r, err)
 	}
@@ -208,7 +208,7 @@ func TestValidateKeyFields(t *testing.T) {
 		{"rate_limit_rps", listen, nil, nil, rps(float32(math.Inf(1)))},
 	}
 	for i, b := range bad {
-		_, _, err := validateKeyFields(b.scopes, b.r, b.exp, b.rps, now)
+		_, _, err := validateKeyFields(b.scopes, b.r, true, b.exp, b.rps, now)
 		var fe *FieldError
 		if !errors.As(err, &fe) || fe.Field != b.field {
 			t.Errorf("case %d: err = %v, want a %s FieldError", i, err, b.field)

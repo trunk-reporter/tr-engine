@@ -10,7 +10,7 @@
 
 ## Important
 
-- [x] **`ReplaySince` returns zero events when `Last-Event-ID` is evicted** — `internal/ingest/eventbus.go:61-85`. If the client's last event ID fell off the ring buffer, `found` stays false and nothing is returned. Should fall back to returning all buffered events.
+- [x] **`ReplaySince` returns zero events when `Last-Event-ID` is evicted** — `internal/ingest/eventbus.go`. If the client's last event ID fell off the ring buffer, `found` stays false and nothing is returned. Should fall back to returning all buffered events. (Fixed; `ReplaySince` and `Subscribe` have since been replaced by `EventBus.SubscribeSince`, which registers and snapshots the ring under the publish lock and replays everything buffered when the ID is gone.)
 
 - [x] **`MergeSystems` ignores TX errors** — `internal/database/systems.go:120-228`. ~15 `tx.Exec` calls discard errors. A failed statement mid-transaction leaves the DB in an inconsistent state. Check every error.
 
@@ -20,7 +20,7 @@
 
 - [x] **No upper bound on pagination `limit`** — `internal/api/responses.go:44-68`. `?limit=1000000` on any paginated endpoint causes unbounded memory usage. Add a max (e.g. 1000).
 
-- [x] **`EventBus.Subscribe` never closes channel** — `internal/ingest/eventbus.go:44-58`. The `cancel()` function deletes from the subscriber map but doesn't close the channel. Not currently exploitable due to `select` with context, but breaks the Go producer-consumer contract.
+- [x] **`EventBus.Subscribe` never closes channel** — `internal/ingest/eventbus.go` (now `SubscribeSince`). The `cancel()` function deletes from the subscriber map but doesn't close the channel. Not currently exploitable due to `select` with context, but breaks the Go producer-consumer contract.
 
 - [x] **Identity resolution errors silently drop SSE events** — `internal/ingest/handler_calls.go:267-280`. When `idErr != nil` on `call_end`, the SSE event is silently not published and no warning is logged.
 

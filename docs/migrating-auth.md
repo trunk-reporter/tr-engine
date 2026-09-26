@@ -77,10 +77,10 @@ docker compose up -d tr-engine
 docker compose logs tr-engine --tail 100
 ```
 
-On this first start tr-engine runs its database migrations and the **one-time legacy import** ([what it does](#what-the-one-time-import-does)). It logs one summary line, for example:
+On this first start tr-engine runs its database migrations and the **one-time legacy import** ([what it does](#what-the-one-time-import-does)). It logs one summary line (tr-engine logs JSON lines; the text is in the `"message"` field), for example:
 
 ```
-legacy auth import: old mode "token"; imported AUTH_TOKEN as key #3 'legacy AUTH_TOKEN' (listen, upload); anonymous access stays off
+legacy auth import (old mode token): AUTH_TOKEN imported as API key #3 "legacy AUTH_TOKEN" [listen upload]; anonymous access stays off
 ```
 
 It also logs, once, the user accounts it removed:
@@ -88,6 +88,10 @@ It also logs, once, the user accounts it removed:
 ```
 removed 3 user accounts: alice (admin), bob (editor), carol (viewer, disabled) — give each person or their client an API key
 ```
+
+With a single account (the old full-mode default, the `admin` user created from `ADMIN_PASSWORD`) it reads "removed 1 user account: admin (admin) — ...".
+
+Start the server first, before any `tr-engine keys` or `tr-engine access` command. Those commands also bring the schema up to date and name the pending migrations on stderr, but on a database from before API keys they refuse the irreversible part (`convert api_keys to app keys`, `record and drop users`) unless you add `--migrate`, because an older engine still running on that database would stop working and the conversion can't be undone. With `--migrate` they convert the database, but the one-time legacy import still waits for the first server start: until then `keys list` and `access show` print a note on stderr that the import is still to come, and what they show may change.
 
 ### 4. Copy the bootstrap key, if one was printed
 
@@ -123,13 +127,20 @@ handle /api/* {
 
 The old nginx pattern (`set $auth "Bearer ..."; ... proxy_set_header Authorization $auth;`) goes too; just `proxy_pass`. Then reload the proxy (`docker compose restart caddy` for a bind-mounted Caddyfile).
 
-tr-engine is tolerant during the switch: it ignores an injected *old full-mode public `AUTH_TOKEN`* and an empty `Bearer` (treats them as no credential, and logs "a request carried the pre-upgrade public AUTH_TOKEN — a reverse proxy is probably still injecting it" at most once an hour). Any **other** injected value (for example a token-mode `AUTH_TOKEN`, which was imported as a key) is used as a key, so every anonymous visitor gets that key's access; remove it.
+tr-engine is tolerant during the switch: it treats an injected *old full-mode public `AUTH_TOKEN`* as no credential and logs "a request carried the pre-upgrade public AUTH_TOKEN — a reverse proxy is probably still injecting it" at most once an hour. It also treats an empty `Bearer` as no credential, but silently: a Caddy block whose `{$AUTH_TOKEN}` is now unset sends `Bearer ` with nothing after it and never logs a WARN. Any **other** injected value is treated as a key:
 
-Once no WARN has appeared for a while, forget the old public token:
+- If it is an active key (for example a token-mode `AUTH_TOKEN` or a `WRITE_TOKEN`, both imported as legacy keys), every anonymous visitor silently gets that key's access. Nothing fails, so don't take the absence of errors as proof that the injection is gone.
+- If it is not a key, every anonymous request fails with `401 invalid_key`. That happens for example with an `AUTH_TOKEN` that was never imported: with `AUTH_ENABLED=false` it is neither imported nor retired, and the same goes for a database whose schema this version created (see [fresh database](#what-the-one-time-import-does)) and for a token-mode value containing `$(`.
+
+Either way, remove the block.
+
+Check the proxy configuration itself (for example `grep -n Authorization Caddyfile`, or your nginx config) rather than relying on the WARN, since an empty injection never logs. Once the block is gone and no WARN has appeared for a while, forget the old public token:
 
 ```bash
 docker compose exec -T tr-engine tr-engine access forget-retired-token
 ```
+
+From then on a request carrying it gets `401 invalid_key`. The token can still never become a key: `keys import` refuses it, before and after this command. If an active key holds that value (imported by hand before imports refused it), the command refuses and names the key; revoke that key first.
 
 `CORS_ORIGINS` is no longer needed either: tr-engine answers every origin, without cookies.
 
@@ -152,8 +163,8 @@ docker compose exec -T tr-engine tr-engine keys create --name "prometheus" --sco
 
 Each `keys create` prints only the new key. Put each key into its client:
 
-- **tr-dashboard**: open it and paste the key into the "Connect to tr-engine" screen (or Settings → API key). A write token saved by an older dashboard is tried once as a key and kept only if the engine accepts it (an imported legacy token will be).
-- **`web/` pages**: use the "API key…" menu item, or the prompt that appears when a page needs a key. `admin.html` asks for an admin key separately and keeps it for the browser tab only.
+- **tr-dashboard**: open it and paste the key into the "Connect to tr-engine" screen (or Settings → API key). A write token saved by an older dashboard is tried once as a key and kept only if the engine accepts it (an imported legacy token will be). The old full-mode public `AUTH_TOKEN` is refused as a key. See tr-dashboard's [Authentication](https://github.com/trunk-reporter/tr-dashboard#authentication) section.
+- **`web/` pages**: use the "API key…" menu item, or the prompt that appears when a page needs a key. `admin.html` asks for an admin key separately and keeps it for the browser tab only; saving pages in `playground.html`, the debug report and the talkgroup-directory CSV import reuse it in that tab.
 - **Upload plugins**: put the key in `apiKey`. See [Upload plugins](#upload-plugins).
 - **Scripts**: send `Authorization: Bearer <key>`. Replace any `?token=` in URLs.
 - **Prometheus**: see [auth.md](auth.md#prometheus).
@@ -208,6 +219,8 @@ docker compose up -d tr-engine
 
 Until you do, every start logs one WARN per leftover variable, for example "AUTH_TOKEN is no longer used (imported as API key #3 'legacy AUTH_TOKEN' on 2026-09-26) — remove it from your configuration" or "ADMIN_PASSWORD is no longer used — tr-engine has no user accounts; clients use API keys".
 
+The "imported as API key #N" and "treated as anonymous" (retired public token) messages appear only when the value this process has for `AUTH_TOKEN`/`WRITE_TOKEN` is the one the import recorded. If you changed the value after the import (or this process reads another `.env`), tr-engine warns instead that the value was never imported, so clients sending it get `401 invalid_key`, and suggests registering it with `tr-engine keys import` ([step 9](#9-register-a-secret-the-import-missed-optional)) if it is still in use.
+
 ### 9. Register a secret the import missed (optional)
 
 If a client still uses an old secret that the import skipped (for example a `WRITE_TOKEN` you had already removed from `.env`, or a token that lived only in a script), and you can't change that client yet, register the secret as a legacy key. It is read from stdin, so it doesn't end up in your shell history:
@@ -217,6 +230,8 @@ docker compose exec -T tr-engine tr-engine keys import --name "legacy: nightly e
 ```
 
 Only the hash is stored. The same strength rules as the automatic import apply. Plan to replace it with a real key.
+
+`keys import` refuses the old full-mode **public** `AUTH_TOKEN`, both while it is retired and after `access forget-retired-token`: the old engine handed it to every visitor, so it can't become a key. Create a new key for a client that still uses it. It also refuses a secret that is already stored, and says whether that key is active, revoked (a revoked secret can't be imported again) or expired.
 
 ## What the one-time import does
 
@@ -235,7 +250,7 @@ The import runs on the first start of the new version, **once per database** (it
 
 Special cases:
 
-- **Fresh database** (the schema was created on this start): nothing is imported, and anonymous access stays `off`. You still get the bootstrap key and the per-variable warnings.
+- **Fresh database** (the schema was created by this version, whichever process created it: the server, a `tr-engine import`/`export`/`keys`/`access` command, or `psql -f schema.sql`; `schema.sql` records this as the `data_fixups` row `schema-created-with-api-key-auth`, which databases upgraded from older versions don't have): nothing is imported, and anonymous access stays `off`. You still get the bootstrap key and the per-variable warnings.
 - **`WRITE_TOKEN` equal to `AUTH_TOKEN` in full mode**: the token was published by `/auth-init` as the public read token, so it is **not** imported. tr-engine logs an ERROR ("WRITE_TOKEN was published by /auth-init as the public read token; not imported — create a new admin key") and prints a bootstrap key.
 - **`AUTH_TOKEN` equal to `WRITE_TOKEN` in token mode**: imported once, as `legacy WRITE_TOKEN`.
 - **Full-mode `AUTH_TOKEN`**: its SHA-256 is kept as the *retired public token*, so a proxy that still injects it is tolerated ([step 5](#5-remove-reverse-proxy-token-injection)).
@@ -246,7 +261,7 @@ Special cases:
 To see what happened later:
 
 ```bash
-docker compose logs tr-engine | grep -i -E "legacy|bootstrap|removed .* user accounts"
+docker compose logs tr-engine | grep -i -E "legacy|bootstrap|removed [0-9]+ user account"
 docker compose exec -T tr-engine tr-engine keys list --all
 docker compose exec -T postgres psql -U trengine trengine -c \
   "SELECT name, applied_at, detail FROM data_fixups WHERE name IN ('import-legacy-auth', 'removed-user-accounts', 'bootstrap-admin-key')"
@@ -288,7 +303,7 @@ docker compose exec -T tr-engine tr-engine keys create --name "trunk-recorder bu
 { "shortName": "butco", "apiKey": "tre_...", "systemId": 1 }
 ```
 
-Restart trunk-recorder. Rejected uploads are logged by tr-engine with the client IP, the system name and the reason (no key, unknown key, or "key #N lacks upload"). See [http-upload.md](http-upload.md).
+Restart trunk-recorder. Rejected uploads are logged by tr-engine as WARN "call upload rejected" with the client IP, the system name and a `reason` (`no key`, `unknown key`, `key #N lacks upload`, ...). Uploads that carry the key in the form are rate-limited per client IP; see [http-upload.md](http-upload.md). A legacy key (an imported `WRITE_TOKEN` or `AUTH_TOKEN`) in the form costs two per-IP tokens per upload, so it gets half the upload rate of a new key; that is one more reason to replace it with an `upload`-only key.
 
 ## Example: a public demo in full mode (gerty-style)
 

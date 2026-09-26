@@ -682,6 +682,16 @@ CREATE TABLE data_fixups (
     detail      jsonb
 );
 
+-- Marks a database whose schema this file created (by any process: the
+-- server, a `tr-engine` subcommand, or psql -f): there is no old auth
+-- configuration to carry over, so the one-time legacy auth import treats
+-- it as fresh. Migrations never write it, so a database upgraded from an
+-- older version doesn't carry it. The guard only matters if this file is
+-- ever run outside its transaction against a database that has data.
+INSERT INTO data_fixups (name)
+SELECT 'schema-created-with-api-key-auth'
+WHERE NOT EXISTS (SELECT 1 FROM systems);
+
 -- ============================================================
 -- 22. unit_tag_suggestions (review queue, permanent, low volume)
 --     Candidate unit alpha tags extracted from transcriptions where a

@@ -229,7 +229,7 @@ func writeKeyError(w http.ResponseWriter, err error) bool {
 	case errors.Is(err, database.ErrAPIKeyRevoked):
 		WriteErrorWithCode(w, http.StatusConflict, ErrConflict, "API key is revoked and can't be changed")
 	case errors.Is(err, database.ErrLastAdminKey):
-		WriteErrorWithCode(w, http.StatusConflict, ErrConflict, database.ErrLastAdminKey.Error())
+		WriteErrorWithCode(w, http.StatusConflict, ErrConflict, err.Error())
 	default:
 		WriteError(w, http.StatusInternalServerError, "API key operation failed")
 	}

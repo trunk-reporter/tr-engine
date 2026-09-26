@@ -524,10 +524,26 @@
     showPanel('panel-connect');
   }
 
+  // Pasted keys are cleaned like everywhere else (auth.js trAuth.cleanKey):
+  // a curly quote or zero-width character would make fetch() throw before
+  // sending, which would look like a network failure.
+  function cleanKey(raw) {
+    if (window.trAuth && typeof trAuth.cleanKey === 'function') return trAuth.cleanKey(raw);
+    var k = String(raw == null ? '' : raw).trim();
+    return { key: k, error: k ? '' : 'Paste an API key.' };
+  }
+
   async function connect(key, fromSession) {
     clearErr('connect-err');
-    key = String(key || '').trim();
-    if (!key) { showErr('connect-err', 'Paste an admin key first.'); return; }
+    if (!String(key || '').trim()) { showErr('connect-err', 'Paste an admin key first.'); return; }
+    var cleaned = cleanKey(key);
+    if (cleaned.error) {
+      if (fromSession) sessionClear();
+      showPanel('panel-connect');
+      showErr('connect-err', cleaned.error);
+      return;
+    }
+    key = cleaned.key;
     var btn = document.getElementById('connect-btn');
     btn.disabled = true; btn.textContent = 'Checking…';
     var r = await whoamiWith(key);

@@ -1,13 +1,18 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/rs/zerolog"
 )
 
 // okHandler is a trivial handler that writes 200 OK.
@@ -201,5 +206,90 @@ func TestResponseTimeout(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Errorf("%s: got %d, want 200 (not wrapped)", path, rec.Code)
 		}
+	}
+}
+
+// lockedBuffer is a bytes.Buffer safe for a logger written from server
+// goroutines.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Every request gets an access line, including refusals on paths that end in
+// /audio/live and WebSocket upgrades, which still work through the logger
+// (r1-09).
+func TestLoggerLogsEveryRequest(t *testing.T) {
+	var logs lockedBuffer
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/audio/live", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("refuse") != "" {
+			WriteErrorWithCode(w, http.StatusUnauthorized, ErrInvalidTicket, "invalid ticket")
+			return
+		}
+		c, err := wsUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		c.WriteMessage(websocket.TextMessage, []byte("hi"))
+		c.Close()
+	})
+	mux.HandleFunc("/foo/audio/live", func(w http.ResponseWriter, r *http.Request) {
+		WriteErrorWithCode(w, http.StatusUnauthorized, ErrInvalidKey, "invalid key")
+	})
+	srv := httptest.NewServer(RequestID(Logger(zerolog.New(&logs))(mux)))
+	defer srv.Close()
+
+	c, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/api/v1/audio/live", nil)
+	if err != nil {
+		t.Fatalf("upgrade through the logger failed: %v", err)
+	}
+	if _, msg, err := c.ReadMessage(); err != nil || string(msg) != "hi" {
+		t.Errorf("read = %q, %v", msg, err)
+	}
+	c.Close()
+	for _, path := range []string{"/foo/audio/live", "/api/v1/audio/live?refuse=1", "/api/v1/talkgroups/1%2Faudio%2Flive"} {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	want := []string{
+		`"path":"/api/v1/audio/live","status":101`,
+		`"path":"/foo/audio/live","status":401`,
+		`"path":"/api/v1/audio/live","status":401`,
+		`"path":"/api/v1/talkgroups/1/audio/live","status":404`,
+	}
+	for {
+		out := logs.String()
+		missing := ""
+		for _, w := range want {
+			if !strings.Contains(out, w) {
+				missing = w
+				break
+			}
+		}
+		if missing == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no access line with %s in:\n%s", missing, out)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

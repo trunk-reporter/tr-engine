@@ -404,10 +404,14 @@ func TestRestrictionRewriteSystem(t *testing.T) {
 	want := &Restriction{
 		Systems:           []int{1},
 		Talkgroups:        tgs("1:100", "2:5"),
-		ExcludeTalkgroups: tgs("1:5001", "2:7"),
+		ExcludeTalkgroups: tgs("1:5001", "2:7", "3:5001"),
 	}
 	if !reflect.DeepEqual(r, want) {
 		t.Errorf("after RewriteSystem(3, 1) = %+v, want %+v", r, want)
+	}
+	// Applying the same merge again changes nothing.
+	if r.RewriteSystem(3, 1) {
+		t.Errorf("second RewriteSystem(3, 1) = true (now %+v)", r)
 	}
 	if !reflect.DeepEqual(alias.Systems, aliasSystems) || !reflect.DeepEqual(alias.Talkgroups, aliasTGs) {
 		t.Error("RewriteSystem modified arrays shared with a copy")
@@ -423,8 +427,30 @@ func TestRestrictionRewriteSystem(t *testing.T) {
 	if pub.AllowsTG(1, 5001) {
 		t.Error("after merging 3 into 1, 1:5001 is visible although 3:5001 was excluded")
 	}
+	// Data still labelled with the merged-away ID stays excluded too.
+	if pub.AllowsTG(3, 5001) {
+		t.Error("after merging 3 into 1, 3:5001 is visible")
+	}
 	if !pub.AllowAll {
 		t.Error("RewriteSystem dropped AllowAll")
+	}
+
+	// An exclusion naming the surviving system hides the talkgroup under
+	// the merged-away ID as well: rows written under that ID around the
+	// merge are not moved (r2-07).
+	surv := &Restriction{AllowAll: true, ExcludeTalkgroups: tgs("1:600", "2:7")}
+	if !surv.RewriteSystem(3, 1) {
+		t.Fatal("RewriteSystem(3, 1) on an exclusion of 1:600 = false, want true")
+	}
+	if want := tgs("1:600", "2:7", "3:600"); !reflect.DeepEqual(surv.ExcludeTalkgroups, want) {
+		t.Errorf("exclusions = %v, want %v", surv.ExcludeTalkgroups, want)
+	}
+	if surv.AllowsTG(3, 600) || surv.AllowsTG(1, 600) || !surv.AllowsTG(3, 601) {
+		t.Errorf("after the rewrite: 3:600 %v, 1:600 %v, 3:601 %v",
+			surv.AllowsTG(3, 600), surv.AllowsTG(1, 600), surv.AllowsTG(3, 601))
+	}
+	if surv.RewriteSystem(3, 1) {
+		t.Error("second RewriteSystem(3, 1) of the symmetric exclusions = true")
 	}
 
 	unchanged := []*Restriction{
@@ -559,5 +585,39 @@ func TestRemovingAllowEntriesNeverWidens(t *testing.T) {
 	}
 	for _, seed := range seeds {
 		walk(seed, 0)
+	}
+}
+
+// The per-array limit applies to input; a stored restriction that merges
+// grew past it is still valid (r2-11). Everything else is checked alike.
+func TestRestrictionValidateStored(t *testing.T) {
+	big := &Restriction{AllowAll: true}
+	for i := 1; i <= MaxRestrictionEntries+200; i++ {
+		big.ExcludeTalkgroups = append(big.ExcludeTalkgroups, TG{SystemID: 1 + i%2, Tgid: i})
+	}
+	for _, kind := range []Kind{KindKey, KindAnonymous} {
+		if err := big.Validate(kind); err == nil {
+			t.Errorf("%s: Validate accepted %d exclusions", kind, len(big.ExcludeTalkgroups))
+		}
+		if err := big.ValidateStored(kind); err != nil {
+			t.Errorf("%s: ValidateStored: %v", kind, err)
+		}
+	}
+	if err := ValidateKey(Scopes{ScopeListen}, big); err == nil {
+		t.Error("ValidateKey accepted an oversized restriction")
+	}
+	if err := ValidateStoredKey(Scopes{ScopeListen}, big); err != nil {
+		t.Errorf("ValidateStoredKey: %v", err)
+	}
+	if err := ValidateStoredKey(Scopes{ScopeEdit}, big); err == nil {
+		t.Error("ValidateStoredKey accepted a restriction on an edit key")
+	}
+	if err := big.ValidateStored(KindTicket); !errors.Is(err, ErrTicketTooLarge) {
+		t.Errorf("ValidateStored(ticket) = %v, want ErrTicketTooLarge", err)
+	}
+	for _, bad := range []*Restriction{{Systems: []int{0}}, {}, {AllowAll: true, Systems: []int{1}}} {
+		if err := bad.ValidateStored(KindKey); err == nil {
+			t.Errorf("ValidateStored accepted %+v", bad)
+		}
 	}
 }

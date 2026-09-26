@@ -47,6 +47,12 @@ auth.js keeps the user's API key (if any) and handles auth for same-origin /api/
 - For WebSocket URLs, use: await trAuth.ticketUrl('/api/v1/audio/live').
 - await trAuth.ready() before the first request if the page needs to know who it is;
   trAuth.hasScope('edit') / trAuth.hasScope('admin') gate edit and admin features.
+- If the page takes a key in its own input, store it with trAuth.setKey(value) (it
+  cleans the value and rejects one that can't be a key, error code
+  invalid_key_format), or run it through trAuth.cleanKey(value) and show .error
+  instead of sending it. Never put the raw input in an Authorization header:
+  fetch() throws on characters like curly quotes or zero-width spaces, which looks
+  like a network failure.
 - Never put a key or token in a URL yourself, and never call /api/v1/auth-init
   (it no longer exists).
 
@@ -107,7 +113,11 @@ no logins. CORS allows any origin (no cookies), so the page can call the engine 
 
 1. Show a config bar with an API URL input (default: window.location.origin), an optional
    "API key" password field (keep the key in localStorage only if the user ticks
-   "remember"), and a "Connect" button.
+   "remember"), and a "Connect" button. Clean the pasted key first: drop invisible
+   characters (U+00AD, U+200B-U+200F, U+2060-U+2064, U+FEFF) and surrounding
+   whitespace and curly quotes, and refuse anything that isn't printable ASCII without
+   spaces with a clear message. fetch() throws on such header values, which looks like
+   a network failure.
 2. On connect, GET {apiUrl}/api/v1/whoami, with the Authorization header if a key was
    entered. 200 → show a green indicator plus whoami.scopes. 401 invalid_key → "key
    rejected". 404 → "this tr-engine is too old". If there is no key and

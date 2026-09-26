@@ -171,7 +171,16 @@ func normTGs(in []TG) []TG {
 //
 // Whether a key may carry a restriction at all depends on its scopes; see
 // ValidateKey.
-func (r *Restriction) Validate(kind Kind) error {
+func (r *Restriction) Validate(kind Kind) error { return r.validate(kind, true) }
+
+// ValidateStored checks a stored restriction the way Validate checks input,
+// except for the per-array MaxRestrictionEntries limit, which applies to
+// input only: a system merge keeps every exclusion and adds a copy under the
+// other system ID (RewriteSystem), which can grow a stored list past it. A
+// ticket narrowing is never stored and keeps its MaxTicketEntries limit.
+func (r *Restriction) ValidateStored(kind Kind) error { return r.validate(kind, false) }
+
+func (r *Restriction) validate(kind Kind, input bool) error {
 	switch kind {
 	case KindKey, KindAnonymous, KindTicket:
 	default:
@@ -193,7 +202,7 @@ func (r *Restriction) Validate(kind Kind) error {
 		{"talkgroups", len(r.Talkgroups)},
 		{"exclude_talkgroups", len(r.ExcludeTalkgroups)},
 	} {
-		if a.n > MaxRestrictionEntries {
+		if input && a.n > MaxRestrictionEntries {
 			return fmt.Errorf("%s: at most %d entries allowed, got %d", a.name, MaxRestrictionEntries, a.n)
 		}
 	}
@@ -236,6 +245,16 @@ func validateTGs(name string, tgs []TG) error {
 // be valid, and a restriction is only allowed when the scopes are exactly
 // ["listen"]; it is then validated as a KindKey restriction.
 func ValidateKey(scopes Scopes, r *Restriction) error {
+	return validateKey(scopes, r, true)
+}
+
+// ValidateStoredKey is ValidateKey for a key's stored restriction, which is
+// checked with ValidateStored (no MaxRestrictionEntries limit).
+func ValidateStoredKey(scopes Scopes, r *Restriction) error {
+	return validateKey(scopes, r, false)
+}
+
+func validateKey(scopes Scopes, r *Restriction, input bool) error {
 	if err := scopes.Validate(); err != nil {
 		return err
 	}
@@ -245,7 +264,7 @@ func ValidateKey(scopes Scopes, r *Restriction) error {
 	if len(scopes) != 1 || scopes[0] != ScopeListen {
 		return errors.New(`restriction is only allowed on keys whose scopes are exactly ["listen"]`)
 	}
-	return r.Validate(KindKey)
+	return r.validate(KindKey, input)
 }
 
 // AllowsNothing reports whether r is a restriction object whose allow part is
@@ -295,41 +314,89 @@ func (r *Restriction) SystemVisible(sys int) bool {
 	return false
 }
 
-// RewriteSystem rewrites every reference to system from into system to, as a
-// system merge requires: Systems entries and the system part of Talkgroups
-// and ExcludeTalkgroups entries. When anything changed, r is replaced by its
-// normalized form (which removes duplicates the rewrite created) and true is
-// returned. The old arrays are not modified, so copies sharing them are
-// unaffected. Non-positive IDs, from == to and a nil r change nothing.
+// RewriteSystem rewrites the restriction for a merge of system from into
+// system to: Systems entries and the system part of Talkgroups entries are
+// rewritten, and ExcludeTalkgroups is made symmetric across the two IDs:
+// every entry naming from gets a copy naming to, and every entry naming to
+// gets a copy naming from, and the originals are kept. Allow lists thus
+// follow the data to its new ID (data still carrying the old ID fails
+// closed), and exclusions hide the talkgroup under either ID, whichever one
+// the exclusion names: data written or buffered under the old ID around the
+// merge (after the merge moved the rows, before every writer learned the new
+// ID) stays excluded. An exclusion only ever narrows. When anything changed,
+// r is replaced by its normalized form and true is returned. The old arrays
+// are not modified, so copies sharing them are unaffected. Non-positive IDs,
+// from == to and a nil r change nothing.
 func (r *Restriction) RewriteSystem(from, to int) bool {
 	if r == nil || from == to || from <= 0 || to <= 0 {
 		return false
 	}
-	changed := false
+	touched := false
 	systems := make([]int, len(r.Systems))
 	for i, s := range r.Systems {
 		if s == from {
-			s, changed = to, true
+			s, touched = to, true
 		}
 		systems[i] = s
 	}
-	rewrite := func(in []TG) []TG {
-		out := make([]TG, len(in))
-		for i, t := range in {
-			if t.SystemID == from {
-				t.SystemID, changed = to, true
-			}
-			out[i] = t
+	tgs := make([]TG, len(r.Talkgroups))
+	for i, t := range r.Talkgroups {
+		if t.SystemID == from {
+			t.SystemID, touched = to, true
 		}
-		return out
+		tgs[i] = t
 	}
-	tgs := rewrite(r.Talkgroups)
-	excl := rewrite(r.ExcludeTalkgroups)
-	if !changed {
+	excl, mirrored := mirrorExclusions(r.ExcludeTalkgroups, from, to)
+	if !touched && !mirrored {
 		return false
 	}
-	*r = *(&Restriction{AllowAll: r.AllowAll, Systems: systems, Talkgroups: tgs, ExcludeTalkgroups: excl}).Normalize()
+	next := (&Restriction{AllowAll: r.AllowAll, Systems: systems, Talkgroups: tgs, ExcludeTalkgroups: excl}).Normalize()
+	if next.Equal(r) {
+		return false
+	}
+	*r = *next
 	return true
+}
+
+// MirrorExclusions is the exclusion half of RewriteSystem(a, b) (or (b, a)):
+// every ExcludeTalkgroups entry naming a gets a copy naming b and vice
+// versa. Replaying it over a chain of merges (a into b, b into c) until
+// nothing changes makes an exclusion naming any system of the chain name
+// all of them. It reports whether r changed; the old arrays are not
+// modified.
+func (r *Restriction) MirrorExclusions(a, b int) bool {
+	if r == nil || a == b || a <= 0 || b <= 0 {
+		return false
+	}
+	excl, mirrored := mirrorExclusions(r.ExcludeTalkgroups, a, b)
+	if !mirrored {
+		return false
+	}
+	excl = normTGs(excl)
+	if slices.Equal(excl, normTGs(r.ExcludeTalkgroups)) {
+		return false
+	}
+	next := r.Normalize()
+	next.ExcludeTalkgroups = excl
+	*r = *next
+	return true
+}
+
+// mirrorExclusions returns excl plus a copy under b of every entry naming a
+// and a copy under a of every entry naming b, and whether it added any. The
+// result may hold duplicates; excl is not modified.
+func mirrorExclusions(excl []TG, a, b int) ([]TG, bool) {
+	out := append(make([]TG, 0, len(excl)), excl...)
+	added := false
+	for _, t := range excl {
+		switch t.SystemID {
+		case a:
+			out, added = append(out, TG{SystemID: b, Tgid: t.Tgid}), true
+		case b:
+			out, added = append(out, TG{SystemID: a, Tgid: t.Tgid}), true
+		}
+	}
+	return out, added
 }
 
 // ReferencedSystems returns every system ID that r mentions in Systems,

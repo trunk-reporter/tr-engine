@@ -114,3 +114,20 @@ func TestRewriteSystemID(t *testing.T) {
 		}
 	})
 }
+
+func TestInstancesByShortName(t *testing.T) {
+	r := newTestResolver(map[string]*ResolvedIdentity{
+		"tr-b:county": {SystemID: 4, SystemName: "county"},
+		"tr-a:county": {SystemID: 3, SystemName: "county"},
+		"tr-a:city":   {SystemID: 5, SystemName: "city"},
+	})
+	if got := r.InstancesByShortName("county"); len(got) != 2 || got[0] != "tr-a" || got[1] != "tr-b" {
+		t.Errorf("InstancesByShortName(county) = %v, want [tr-a tr-b]", got)
+	}
+	if got := r.InstancesByShortName("city"); len(got) != 1 || got[0] != "tr-a" {
+		t.Errorf("InstancesByShortName(city) = %v, want [tr-a]", got)
+	}
+	if got := r.InstancesByShortName("none"); len(got) != 0 {
+		t.Errorf("InstancesByShortName(none) = %v, want none", got)
+	}
+}

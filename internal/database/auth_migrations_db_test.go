@@ -9,8 +9,12 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // The user-owned api_keys shape and the users table as the versions before
@@ -77,6 +81,16 @@ func authDB(t *testing.T) *DB {
 		t.Fatal("ApplySchemaIfEmpty on an empty database reported not fresh")
 	}
 	migrateTwice(t, db)
+	return db
+}
+
+// upgradedDB is authDB without schema.sql's SchemaCreatedFixup marker: a
+// database upgraded from a version before API-key auth, whose old auth
+// configuration the legacy import carries over.
+func upgradedDB(t *testing.T) *DB {
+	t.Helper()
+	db := authDB(t)
+	mustExec(t, db, `DELETE FROM data_fixups WHERE name = $1`, SchemaCreatedFixup)
 	return db
 }
 
@@ -395,5 +409,170 @@ func TestAuthMigrations_UsersWithoutLastLogin(t *testing.T) {
 	k, err := db.ResolveAPIKeyByHash(ctx, HashAPIKey("erin-key"))
 	if err != nil || k.Name != "e (erin)" || strings.Join(k.Scopes.Strings(), ",") != "edit" {
 		t.Errorf("converted key = %+v, %v", k, err)
+	}
+}
+
+// foreignUsersDDL is another application's users table in a shared schema,
+// with a table that references it.
+const foreignUsersDDL = `CREATE TABLE users (
+		id       serial PRIMARY KEY,
+		username text   NOT NULL,
+		email    text,
+		role     text,
+		enabled  boolean
+	);
+	CREATE TABLE orders (id serial PRIMARY KEY, user_id int REFERENCES users(id));
+	INSERT INTO users (username, email, role, enabled) VALUES
+		('alice', 'alice@shop.example', 'owner', true), ('bob', 'bob@shop.example', 'member', true);
+	INSERT INTO orders (user_id) VALUES (1), (2)`
+
+// assertForeignUsersKept checks that the other application's users table,
+// its rows and the foreign key to it survived.
+func assertForeignUsersKept(t *testing.T, db *DB) {
+	t.Helper()
+	ctx := context.Background()
+	var users, fks int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE email LIKE '%@shop.example'`).Scan(&users); err != nil || users != 2 {
+		t.Errorf("foreign users rows = %d (%v), want 2", users, err)
+	}
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_constraint
+		WHERE conrelid = 'orders'::regclass AND contype = 'f'`).Scan(&fks); err != nil || fks != 1 {
+		t.Errorf("orders foreign keys = %d (%v), want 1", fks, err)
+	}
+	var recorded bool
+	if err := db.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM data_fixups WHERE name = 'removed-user-accounts')`).Scan(&recorded); err != nil || recorded {
+		t.Errorf("the foreign users were recorded as removed tr-engine accounts (%v)", err)
+	}
+}
+
+// Another application's users table in the same schema is never read as
+// tr-engine's user list or dropped, on a fresh install or an upgrade (r1-14).
+func TestAuthMigrations_ForeignUsersTable(t *testing.T) {
+	t.Run("fresh install", func(t *testing.T) {
+		db := emptyDB(t)
+		mustExec(t, db, foreignUsersDDL)
+		if _, err := db.ApplySchemaIfEmpty(context.Background(), readSchema(t)); err != nil {
+			t.Fatal(err)
+		}
+		migrateTwice(t, db)
+		assertForeignUsersKept(t, db)
+	})
+
+	t.Run("fresh install, table without role or enabled", func(t *testing.T) {
+		db := emptyDB(t)
+		mustExec(t, db, `CREATE TABLE users (id serial PRIMARY KEY, username text, email text)`)
+		if _, err := db.ApplySchemaIfEmpty(context.Background(), readSchema(t)); err != nil {
+			t.Fatal(err)
+		}
+		migrateTwice(t, db)
+		if !tableExistsT(t, db, "users") {
+			t.Error("the foreign users table was dropped")
+		}
+	})
+
+	t.Run("upgrade of an engine that used the foreign table", func(t *testing.T) {
+		db := emptyDB(t)
+		ctx := context.Background()
+		if err := db.InitSchema(ctx, readSchema(t)); err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, db, `DROP TABLE api_keys, auth_settings, audit_log`)
+		// The old engine found a users table, skipped creating its own, added
+		// its columns and pointed api_keys.user_id at it.
+		mustExec(t, db, foreignUsersDDL)
+		mustExec(t, db, oldUsersColumnsDDL)
+		mustExec(t, db, oldAPIKeysDDL)
+		mustExec(t, db, `INSERT INTO api_keys (key_hash, key_prefix, user_id, role, label) VALUES
+			($1, 'tre_00000001', 1, 'admin', 'ops'), ($2, 'tre_00000002', NULL, 'viewer', 'reader')`,
+			HashAPIKey("owned"), HashAPIKey("unowned"))
+		migrateTwice(t, db)
+		assertForeignUsersKept(t, db)
+		for secret, want := range map[string]string{"owned": "ops/admin", "unowned": "reader/listen"} {
+			k, err := db.ResolveAPIKeyByHash(ctx, HashAPIKey(secret))
+			if err != nil || k.Name+"/"+strings.Join(k.Scopes.Strings(), ",") != want || k.RevokedAt != nil {
+				t.Errorf("key %s = %+v, %v; want %s, active", secret, k, err, want)
+			}
+		}
+	})
+}
+
+// Two processes migrating an old database at once: one waits for the other,
+// and neither fails (r1-15).
+func TestAuthMigrations_ConcurrentMigrate(t *testing.T) {
+	db := emptyDB(t)
+	ctx := context.Background()
+	if err := db.InitSchema(ctx, readSchema(t)); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `DROP TABLE api_keys, auth_settings, audit_log`)
+	mustExec(t, db, oldUsersDDL)
+	mustExec(t, db, oldUsersColumnsDDL)
+	mustExec(t, db, oldAPIKeysDDL)
+	mustExec(t, db, `INSERT INTO users (username, password_hash, role, enabled) VALUES ('erin', 'x', 'editor', true)`)
+	mustExec(t, db, `INSERT INTO api_keys (key_hash, key_prefix, user_id, role, label) VALUES ($1, 'tre_00000000', 1, 'editor', 'e')`,
+		HashAPIKey("erin-key"))
+
+	var dbs []*DB
+	for i := 0; i < 3; i++ {
+		other, err := Connect(ctx, db.Pool.Config().ConnString(), zerolog.Nop())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer other.Close()
+		dbs = append(dbs, other)
+	}
+	errs := make([]error, len(dbs))
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i, d := range dbs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := d.ApplySchemaIfEmpty(ctx, readSchema(t))
+			if err == nil {
+				err = d.Migrate(ctx)
+			}
+			errs[i] = err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("process %d: %v", i, err)
+		}
+	}
+	migrateTwice(t, db)
+	k, err := db.ResolveAPIKeyByHash(ctx, HashAPIKey("erin-key"))
+	if err != nil || k.Name != "e (erin)" || strings.Join(k.Scopes.Strings(), ",") != "edit" {
+		t.Errorf("converted key = %+v, %v", k, err)
+	}
+
+	// Several processes on an empty database: exactly one applies the schema.
+	empty := emptyDB(t)
+	var applied atomic.Int32
+	var wg2 sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		other, err := Connect(ctx, empty.Pool.Config().ConnString(), zerolog.Nop())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer other.Close()
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			fresh, err := other.ApplySchemaIfEmpty(ctx, readSchema(t))
+			if err != nil {
+				t.Errorf("apply schema: %v", err)
+			}
+			if fresh {
+				applied.Add(1)
+			}
+		}()
+	}
+	wg2.Wait()
+	if applied.Load() != 1 {
+		t.Errorf("%d processes applied the schema, want 1", applied.Load())
 	}
 }

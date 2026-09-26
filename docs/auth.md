@@ -103,10 +103,10 @@ Where to find it:
 
 Copy it into a password manager. Then:
 
-1. Use it to create named keys for your clients ([below](#creating-a-key-for-each-client)), including a named admin key for yourself.
-2. Revoke the bootstrap key: `tr-engine keys revoke --prefix tre_4f1c…` (use the prefix shown by `tr-engine keys list`). tr-dashboard's Access page and `web/admin.html` show a warning while a key named `bootstrap admin` is still active.
+1. Use it to create named keys for your clients ([below](#creating-a-key-for-each-client)), including a named admin key for yourself. Give that admin key no expiry: the API (tr-dashboard's Access page, `web/admin.html`) only lets you revoke the bootstrap key while another admin key lasts at least as long ([last-admin guard](#through-the-api)).
+2. Revoke the bootstrap key: `tr-engine keys revoke --prefix <prefix>`, with its whole prefix exactly as `tr-engine keys list` shows it (for example `tre_4f1c2a9b`), or by its ID. tr-dashboard's Access page and `web/admin.html` show a warning while a key named `bootstrap admin` is still active.
 
-This happens **once per database**. If an admin key already exists (for example one imported during an upgrade), no bootstrap key is created. A later start never creates another one: if every admin key has been revoked or has expired, tr-engine logs an ERROR with the recovery command, and you create a new admin key from the command line on the host:
+This happens **once per database**. If an admin key already exists (for example one imported during an upgrade), no bootstrap key is created. A later start never creates another one: if every admin key has been revoked, has expired or no longer has `admin`, tr-engine logs an ERROR ("no active admin API key exists") with the recovery command, and you create a new admin key from the command line on the host:
 
 ```bash
 tr-engine keys create --name "admin" --scopes admin
@@ -137,10 +137,17 @@ tr-engine access set  --anonymous off|listen [restriction flags|--no-restriction
 tr-engine access forget-retired-token
 ```
 
-- A bare number is always a key ID; to pick a key by its prefix, use `--prefix`.
-- `keys create` prints **only the new key** on stdout (all messages go to stderr), so a script can capture it. `keys import` prints only the new key's ID.
+- A bare number is always a key ID; to pick a key by its prefix, use `--prefix` with the **whole** prefix exactly as `keys list` shows it (`tre_` plus 8 hex characters, such as `tre_4f1c2a9b`, or `legacy_` plus 6 hex characters, such as `legacy_9f2c1a`). A shorter prefix matches nothing ("no key has the prefix ..."), and a prefix shared by several keys fails and lists their IDs; use the ID then.
+- `keys create` prints **only the new key** on stdout (all messages go to stderr, including the restriction as stored), so a script can capture it. `keys import` prints only the new key's ID. `keys list` and `access show` print their table on stdout; `update`, `revoke`, `set` and `forget-retired-token` report on stderr.
 - `keys list` hides revoked keys; `--all` shows them.
 - `--expires` takes a Go duration (`720h`), a number of days (`90d`), a date (`2026-12-31`, midnight UTC) or an RFC 3339 time.
+- `--systems`, `--talkgroups` and `--exclude-talkgroups` take comma-separated lists and can also be repeated; repeats add up (`--systems 1 --systems 2` is `--systems 1,2`).
+- Restriction flags on `keys update` and `access set` replace the whole restriction. `--exclude-talkgroups` only removes talkgroups from an allow list: combine it with `--all-talkgroups` ("everything except"), `--systems` or `--talkgroups`. A restriction that names a system involved in an earlier merge is rewritten on store, as the merge would have rewritten it ([merges](#system-merges-and-restrictions)).
+- `keys import` refuses a secret that is already stored (it names the key, and says whether it is active, revoked or expired), and refuses the pre-upgrade public `AUTH_TOKEN`, both while it is retired and after `access forget-retired-token`: the old engine handed that value to every visitor. Create a new key for a client that still uses it.
+- `access forget-retired-token` refuses while an active key holds the retired token's value (a key imported before imports refused it), and names the key to revoke first.
+- Every command first brings the database schema up to date, like the server, and names any pending migrations on stderr. On a database from a version before API keys it refuses to apply the irreversible conversion (`convert api_keys to app keys`, `record and drop users`) unless you add `--migrate`: an older engine still running on that database would stop working, and the change can't be undone. The recommended order is to start the new server first ([migrating-auth.md](migrating-auth.md)), which also carries `AUTH_TOKEN`/`WRITE_TOKEN` over.
+- `keys list` and `access show` print a note on stderr while the one-time legacy import is still to come (an upgraded database the new server hasn't started on yet): the first server start may still import old tokens as keys and set the anonymous policy.
+- Exit status: 0 on success, 1 on an error, 2 on a usage mistake (a command without arguments prints its usage and exits 2; `--help` exits 0).
 - In Docker, prefix every command with `docker compose exec -T tr-engine`. The `-T` matters when you capture the output:
 
   ```bash
@@ -162,7 +169,7 @@ curl -s -X POST http://localhost:8080/api/v1/keys \
 
 The response includes `"key": "tre_..."`, the only time the full key is shown. Changes through the API take effect at once, including on open streams.
 
-**Last-admin guard.** The API refuses (409) to revoke the last active admin key or to take `admin` away from it. The CLI is not subject to this guard; it is the recovery path.
+**Last-admin guard.** The API refuses (409) to revoke an active admin key, take `admin` away from it, give it an earlier expiry (or a first one), or set or lower its rate limit below 1 request/second, unless another active admin key lasts at least as long: one with no expiry, or with an expiry no earlier than this key's. Only admin keys that aren't rate-limited below 1 request/second count as that other key, since a key allowed one request an hour can't undo anything. So the only admin key can't be given an expiry, or such a rate limit, through the API; create a second admin key first. If a key did end up with an over-tight limit, `tr-engine keys update ID --no-rate-limit` removes it. The CLI is not subject to this guard (it is the recovery path), but `keys revoke` and `keys update` warn when no admin key is left, or when every remaining one expires within a day.
 
 **Rotating a key.** Keys can't be changed in place. Create a new key, switch the client to it, then revoke the old one. `last_used_at` (in `keys list` and the API) tells you when the old one stopped being used.
 
@@ -172,13 +179,15 @@ Give every client its own named key, with the least access it needs. Then a leak
 
 | Client | Scopes | Notes |
 |---|---|---|
-| tr-dashboard you use yourself | `edit` | `admin` only if you manage keys or run maintenance from it. Paste the key into the "Connect to tr-engine" screen or Settings → API key. |
-| `web/` demo pages | `listen` or `edit` | Browse with a listen or edit key. `admin.html` and `storage.html` ask for an admin key separately and keep it for the tab only. |
+| tr-dashboard you use yourself | `edit` | `admin` only if you manage keys or run maintenance from it. Paste the key into the "Connect to tr-engine" screen or Settings → API key. See tr-dashboard's [Authentication](https://github.com/trunk-reporter/tr-dashboard#authentication) section. |
+| `web/` demo pages | `listen` or `edit` | Browse with a listen or edit key. `admin.html` and `storage.html` ask for an admin key separately and keep it for the tab only (browser `sessionStorage`, `tr-engine-admin-key`). Saving a page in `playground.html`, sending a debug report (`debug-report.html`) and the CSV import on `talkgroup-directory.html` use the admin key entered on `admin.html` in the same tab; without one they send the stored key, which then needs `admin`. |
 | A trunk-recorder upload plugin | `upload` | One key per recorder host. See [Upload plugins](#upload-plugins). |
 | Prometheus | `listen` | See [Prometheus](#prometheus). |
 | A script or bot | whatever it needs | A reporting script needs `listen`; a tag-sync script needs `edit`. |
 | A public website's backend | `listen`, optionally restricted and rate-limited | The key stays on the server. |
 | A shared screen in a dispatch room | `listen`, restricted | A browser that others use holds a key, so treat that key as known to everyone who can touch the screen. |
+
+tr-dashboard and the `web/` pages refuse the old full-mode public `AUTH_TOKEN` when it is pasted as a key ("tr-engine ignored this value: it is the retired public AUTH_TOKEN, not an API key"), because the engine treats it as no credential. `web/auth.js` also silently forgets it if an older page had stored it.
 
 Examples:
 
@@ -205,7 +214,9 @@ trunk-recorder's rdio-scanner and OpenMHz upload plugins put the key in a form f
 }
 ```
 
-Only keys with `upload` can upload: anonymous access never allows it, and `listen`/`edit`/`admin` keys without `upload` are refused. When an upload is rejected, tr-engine logs a WARN (at most once a minute per client IP) with the IP, the system name from the form, and the reason (no key, unknown key, or "key #N lacks upload"). Full details: [http-upload.md](http-upload.md).
+Only keys with `upload` can upload: anonymous access never allows it, and `listen`/`edit`/`admin` keys without `upload` are refused. When an upload is rejected, tr-engine logs a WARN "call upload rejected" (at most once a minute per client IP) with the IP, the system name from the form, and the reason in a `reason` field (`no key`, `unknown key`, `key #N lacks upload`, `request body too large`, ...). Full details: [http-upload.md](http-upload.md).
+
+A key in a form field is not a header credential, so these uploads are rate-limited **per client IP** like requests without a key (see [Rate limiting](#rate-limiting)). A host that uploads more than `RATE_LIMIT_RPS` calls a second (default 20, bursts of 40), for example while clearing a backlog, gets `429`; send the key as `Authorization: Bearer` instead if the uploader can, or raise `RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`.
 
 ## Setting the anonymous access policy
 
@@ -231,7 +242,7 @@ tr-engine access set --anonymous listen --all-talkgroups --exclude-talkgroups 1:
 tr-engine access set --anonymous listen --systems 1 --talkgroups 2:9178,2:9179
 ```
 
-`access set` without restriction flags keeps the stored restriction (so `access set --anonymous off` and back to `listen` restores it); `--no-restriction` clears it. The restriction is kept even while access is `off`, so you can prepare it first.
+`access set` without restriction flags keeps the stored restriction (so `access set --anonymous off` and back to `listen` restores it); `--no-restriction` clears it. The restriction is kept even while access is `off`, so you can prepare it first. A restriction that names a system already merged into another is rewritten on store ([merges](#system-merges-and-restrictions)); `access show` and the API response show the stored form.
 
 The same through the API (admin key; both fields are required, and `"restriction": null` means unrestricted):
 
@@ -246,7 +257,7 @@ An API change applies at once, including to open anonymous streams (which close 
 What anonymous listeners get when access is `listen`:
 
 - Everything a `listen` key gets, except `POST /api/v1/tickets` and `/metrics`, which always need a key.
-- If the policy is **restricted**: only data for allowed talkgroups, and a 403 `restricted_credential` from the endpoints that can't filter by talkgroup (see the list under [Restricting what a credential sees](#restricting-what-a-credential-sees)).
+- If the policy is **restricted**: only data for allowed talkgroups, and a 403 `restricted_credential` from the endpoints that can't filter by talkgroup (see [What a restricted credential can use](#what-a-restricted-credential-can-use)).
 - Never console logs, never edits, never uploads.
 
 Everyone can see *whether* anonymous access is on and whether it is restricted (`GET /api/v1/whoami`), but only admins can see the lists (`GET /api/v1/anonymous-access`), because the exclude list names the talkgroups you consider sensitive.
@@ -272,10 +283,24 @@ Rules worth knowing:
 - **No restriction** (`null`) means everything. **Any** restriction object limits access, and one with nothing allowed (`{}`, or empty `systems` and `talkgroups` without `allow_all`) allows nothing. tr-engine refuses such a restriction on a key ("restriction allows nothing") and on the anonymous policy ("use access: off instead"). Removing the last allowed entry never turns into "everything".
 - Data without a talkgroup (unit registrations, recorder state, decode rates, control-channel messages) is **never** shown to a restricted credential.
 - IDs don't have to exist yet, so you can prepare a key before its system appears.
+- Each list (`systems`, `talkgroups`, `exclude_talkgroups`) holds at most 1000 entries when you set it. System merges can grow a stored exclusion list past that ([below](#system-merges-and-restrictions)); such a stored restriction stays valid, and sending it back unchanged (`PATCH /api/v1/keys/{id}` with the same restriction, `PUT /api/v1/anonymous-access`, or `access set` without restriction flags) is accepted.
 - Only `listen` keys can be restricted. An `edit` or `admin` key is always unrestricted.
-- When systems are merged (from the admin API, or automatically when two recorders turn out to watch the same P25 network), every restriction that names the old system is rewritten to the new one in the same transaction.
+- A restricted credential never sees data outside its restriction, but some traces of other activity remain. Call IDs are one sequence across all talkgroups, so gaps between the `call_id`s a restricted credential sees show roughly how many calls happened outside its restriction, though never what they were. (Live-event IDs are opaque and reveal nothing.)
 
-**What a restricted credential can use.** Every endpoint's policy is in [openapi.yaml](../openapi.yaml) as `x-restricted`:
+### System merges and restrictions
+
+Systems are merged from the admin API (`POST /api/v1/admin/systems/merge`), or automatically when two recorders turn out to watch the same P25 network. In the same transaction every stored restriction (keys and the anonymous policy) is rewritten:
+
+- Allow entries that name the old system (`systems`, and `old:tgid` in `talkgroups`) are rewritten to the surviving system.
+- `exclude_talkgroups` are kept **symmetric**: an entry that names either the old or the surviving system is kept, and a copy naming the other one is added (after a chain of merges, every system of the chain), so data that still carries the old ID, or is written under it around the merge, stays excluded. Expect merged-away IDs to remain in stored exclusions, and exclusion lists to grow (possibly past the 1000-entry limit for new input).
+- A restriction stored later that names a system involved in a merge (`keys create`/`update`, `access set`, or the same through the API) is rewritten the same way on store; the response or `keys list`/`access show` shows the stored form.
+- A ticket narrowing that names a merged-away system anywhere, `exclude_talkgroups` included, is refused when it is minted (`400 invalid_body`). A ticket minted before the merge fails with `401 invalid_ticket`, and a stream it opened closes with `ticket_expired`; clients mint a new one.
+
+A merge never leaves an allow entry pointing at a merged-away system and never voids an exclusion (exclusions keep the old ID next to the surviving one), but it **can widen access**: an allow entry that named either system then covers the whole merged system, including the data the other system already had. That is what you want when both are the same radio network. Before merging systems that are not, check restricted keys (`tr-engine keys list`) and the anonymous policy (`tr-engine access show`).
+
+### What a restricted credential can use
+
+Every endpoint's policy is in [openapi.yaml](../openapi.yaml) as `x-restricted`:
 
 - `enforced`: systems, sites, talkgroups, the talkgroup directory, calls (list, active, details, audio, frequencies, transmissions, transcriptions), call groups, transcription search and batch, live events and live audio. These return only allowed data; asking for a specific call or talkgroup outside the restriction is a 404, as if it didn't exist.
 - `deny` (403 `restricted_credential`): units and unit events, affiliations, unit-tag suggestions, P25 systems, encryption stats, talkgroup units, all stats and analytics, recorders, trunking messages, the transcription queue, audio jitter and `/metrics`. Their data either has no talkgroup, or would reveal other talkgroups' activity through totals. Restriction support for these is on the [roadmap](roadmap.md).
@@ -286,6 +311,7 @@ Operators rarely need to think about tickets; clients mint them. What to know:
 
 - Only a key with `listen` (a listen, edit or admin key) can mint one, with `POST /api/v1/tickets`. A ticket grants `listen` only, and only on `GET /api/v1/events/stream`, `GET /api/v1/audio/live` and `GET /api/v1/calls/{id}/audio`.
 - A ticket lives 1 to 60 minutes (10 by default). It is checked against its key on every use, so revoking or changing the key affects its tickets at once. A live-event stream or audio WebSocket opened with a ticket is closed when the ticket expires, and the client reconnects with a new one.
+- A ticket's narrowing can't name a system that was merged into another, not even in `exclude_talkgroups`: minting one is refused (`400 invalid_body`), and an older ticket that does stops working ([merges](#system-merges-and-restrictions)).
 - A single ticket can't be revoked. To cut a client off, revoke its key.
 - Tickets are signed with a random secret generated on first start and stored in the database (`auth_settings`, row `ticket_secret`). To invalidate every outstanding ticket, delete that row and restart tr-engine; a new secret is generated.
 - Tickets appear in access logs (they are in the URL). That is why they are short-lived and listen-only.
@@ -316,7 +342,7 @@ scrape_configs:
 
 A reverse proxy in front of tr-engine should pass requests through **unchanged**. In particular:
 
-- **Never inject an `Authorization` header** into requests. A proxy that adds a key to anonymous requests makes that key public (see [the one rule](#the-one-rule-a-key-that-reaches-other-peoples-browsers-is-public)). Use the anonymous access policy instead. Older setups did this (a Caddy `request_header @no_auth Authorization "Bearer {$AUTH_TOKEN}"` block); remove it. tr-engine ignores an injected pre-upgrade public `AUTH_TOKEN` and an empty `Bearer` (logging a WARN at most once an hour), but any other injected value makes every anonymous request fail with `401 invalid_key`.
+- **Never inject an `Authorization` header** into requests. A proxy that adds a key to anonymous requests makes that key public (see [the one rule](#the-one-rule-a-key-that-reaches-other-peoples-browsers-is-public)). Use the anonymous access policy instead. Older setups did this (a Caddy `request_header @no_auth Authorization "Bearer {$AUTH_TOKEN}"` block); remove it. tr-engine treats an injected pre-upgrade public `AUTH_TOKEN` as no credential and logs a WARN at most once an hour; it also treats an empty `Bearer` as no credential, silently (so a Caddy `{$AUTH_TOKEN}` block whose variable is now unset never shows up in the log). Any other injected value is treated as a key: if it is an active key (for example a token-mode `AUTH_TOKEN` or a `WRITE_TOKEN` imported as a legacy key), every visitor silently gets that key's access; otherwise every anonymous request fails with `401 invalid_key`. Either way, remove the block.
 - Pass the `Authorization` header through, and don't add CORS headers of your own: tr-engine answers every origin itself.
 - Disable response buffering for `/api/v1/events/stream` (tr-engine sends `X-Accel-Buffering: no` for nginx) and allow WebSocket upgrades on `/api/v1/audio/live`.
 - Set `TRUSTED_PROXIES` so rate limiting sees real client IPs. tr-engine only believes `X-Forwarded-For` / `X-Real-IP` from peers listed there (default `loopback,private`; comma-separated IPs and CIDRs, or `none`).
@@ -351,16 +377,17 @@ If your proxy asks for a username and password (`Authorization: Basic ...`), tr-
 ## Rate limiting
 
 - Requests without a key, with a ticket, with a legacy (imported) key, or with a key tr-engine hasn't seen in the last 30 seconds are limited **per client IP**: `RATE_LIMIT_RPS` (default 20) per second with bursts of `RATE_LIMIT_BURST` (default 40). Guessing keys therefore costs one IP token per guess.
-- Other keys are not limited unless you set `--rate-limit RPS` on the key (burst twice that).
+- Other keys sent in the `Authorization` header are not limited unless you set `--rate-limit RPS` on the key (burst twice that).
+- An upload that carries its key in the `key`/`api_key` form field (the rdio-scanner and OpenMHz plugins) has no header credential, so it is limited per client IP like a request without a key. It costs two tokens when the key isn't cached, and always for a legacy key (an imported `WRITE_TOKEN` or `AUTH_TOKEN`), so those uploads get half the per-IP rate. For high-volume uploaders, send the key as `Authorization: Bearer` (a legacy key still costs one IP token per request there), replace legacy upload keys with new `upload` keys, or raise `RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`.
 - Over the limit, tr-engine answers `429 rate_limited` with a `Retry-After` header.
 
 ## The audit log
 
-tr-engine records every change made with a key: every request with a key to a real endpoint whose method isn't GET, HEAD or OPTIONS, including the ones the endpoint refused. Each entry has the time, the key's ID and name, the actor, the method, the path (without query string), the status the client received and the request ID. Not recorded: requests without a key, failed authentication (those stay in the access log), call uploads and ticket minting (high volume, no state change worth auditing).
+tr-engine records every change made with a key: every request with a key to a real endpoint whose method isn't GET, HEAD or OPTIONS and that the auth layer let through, including refusals decided by the endpoint itself. Each entry has the time, the key's ID and name, the actor, the method, the path, the status the client received and the request ID. The path is stored without its query string and cut at 1024 bytes, with a "…(truncated, N bytes)" marker; the server limits the request line plus headers to 64 KiB (a larger request gets `431`). Not recorded: requests without a key, requests the auth layer refused (`401`, and `403 insufficient_scope` or `restricted_credential`, such as a listen key trying to edit), call uploads and ticket minting (high volume, no state change worth auditing). Those are only in the access log, which has a line for every request.
 
 - **Read it** in tr-dashboard's Access page, in `web/admin.html`, or with `GET /api/v1/admin/audit-log?limit=50&offset=0&key_id=&since=&until=` (admin).
 - **Actor.** A multi-user client can send an `X-Actor` header naming the end user it acted for ("alice@club"). It is recorded, and shown next to the key name in `unit_tag_suggestions.decided_by` and `system_merge_log.performed_by`, but it is informational only: tr-engine can't verify it.
-- **Retention:** `RETENTION_AUDIT_LOG` (default `8760h`, one year), purged by the daily maintenance run.
+- **Retention:** `RETENTION_AUDIT_LOG` (default `8760h`, one year), purged by the daily maintenance run. Without the environment variable, an admin can also change it at runtime with `PUT /api/v1/admin/maintenance/config` and key `retention_audit_log`.
 
 ## Troubleshooting
 
@@ -378,9 +405,11 @@ tr-engine records every change made with a key: every request with a key to a re
 | WARN "a request carried the pre-upgrade public AUTH_TOKEN" | A proxy still injects the old public token. | Remove the injection block. Once none is left, `tr-engine access forget-retired-token`. |
 | WARN "HTTP uploads were in use but no key can upload now" | After an upgrade, no key has `upload`. | Create an upload key and put it in the trunk-recorder plugin config. |
 | WARN "legacy key #N is weak" | An imported `AUTH_TOKEN`/`WRITE_TOKEN` is shorter than 16 characters. | Replace it with a new key and revoke it. |
-| ERROR "no active admin key" at startup | Every admin key was revoked or expired. | `tr-engine keys create --name "admin" --scopes admin` on the host. |
+| ERROR "no active admin API key exists" at startup | Every admin key was revoked, expired or no longer has `admin`. (`tr-engine keys revoke`/`update` also warn "no active admin key is left" when you do that.) | `tr-engine keys create --name "admin" --scopes admin` on the host. |
 | WARN "`AUTH_TOKEN` is no longer used" (or another old variable) | Old configuration left in `.env`. | Remove it; see [migrating-auth.md](migrating-auth.md). |
-| Uploads rejected; WARN "rejected upload ... key #N lacks upload" | The plugin uses a key without `upload`. | Create an upload key for it. |
+| Uploads rejected; WARN "call upload rejected" with `"reason":"key #N lacks upload"` | The plugin uses a key without `upload`. (Other reasons: `no key`, `unknown key`, `revoked key`, `expired key`, `request body too large`.) | Create an upload key for it. |
+| Uploads get `429 rate_limited` | Keys in the upload form field are rate-limited per client IP, at two tokens per upload for a legacy (imported) key. | Send the key as `Authorization: Bearer`, replace a legacy upload key with a new `upload` key, or raise `RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`. |
+| WARN "dropping live audio: several trunk-recorder instances use this short name" | Two instances use the same short name for different systems, so tr-engine can't tell which one sent a simplestream packet. | Set `STREAM_SOURCE_MAP=ip=instance_id,...`, or give the systems unique short names. |
 | Browser shows "This tr-engine doesn't support API keys yet" | tr-dashboard is newer than tr-engine. | Upgrade tr-engine. |
 
 ## Security notes
@@ -478,13 +507,13 @@ Error bodies look like `{"code": "...", "error": "human-readable message", "deta
 | 401 | `key_required` | No key and anonymous access doesn't cover this. Ask for a key. |
 | 401 | `invalid_key` | The key is unknown, revoked or expired. Re-run `whoami` and ask for a new key. Don't retry. |
 | 401 | `invalid_ticket` | Mint a new ticket and retry once. |
-| 403 | `insufficient_scope` | The key can't do this. Tell the user ("your key can't do this; it needs edit"); don't ask for a new key unprompted. |
+| 403 | `insufficient_scope` | The key can't do this. Tell the user ("your key can't do this; it needs edit"); don't ask for a new key unprompted. The message always reads "this operation needs the <scope> scope". |
 | 403 | `restricted_credential` | The credential is restricted and this endpoint can't filter. Hide the feature. |
 | 404 | `not_found` | Also returned for resources outside a restriction. |
 | 429 | `rate_limited` | Back off; `Retry-After` says how long. |
 | 503 | `service_unavailable` | The engine couldn't check your key. Retry later; this is not a bad key. |
 
-Every 401 carries `WWW-Authenticate: Bearer realm="tr-engine"`.
+Every 401 carries `WWW-Authenticate: Bearer realm="tr-engine"`. Other messages are informational and may change; branch on `code`. A wrong method on an existing path is `405` with code `bad_request`; a path that doesn't exist (including the removed `/auth/*`, `/users` and `/auth-init`) is `404 not_found` for every method.
 
 ## Tickets: live events, audio and WebSockets from a browser
 
@@ -508,6 +537,7 @@ Content-Type: application/json
 - A ticket is **not single-use**: an audio element can make many Range requests with the same URL. It works until it expires.
 - It reflects its key's **current** state: revoke or re-scope the key and its tickets stop working.
 - Treat the ticket as opaque.
+- Live-event IDs are opaque too (currently `<unix_ms>-<32 hex characters>`), unique within one engine process but not sequential. Don't parse or compare them; only send the last one back as `last_event_id`.
 
 Only mint tickets when you have a key. A small cache avoids a mint per request:
 
@@ -540,7 +570,7 @@ Things to handle:
 
 1. **Mint a fresh ticket before every (re)connect.** `EventSource`'s built-in reconnect reuses the old URL, and so the old ticket. Close it on `error` and reconnect yourself.
 2. **Resume without gaps.** You can't set `Last-Event-ID` on a new `EventSource`, so pass the last event ID you saw as `last_event_id` in the query string. The server buffers 60 seconds of events.
-3. **The `auth` event.** When the stream's credential stops allowing it, the server sends `event: auth` with `{"code": ...}` and closes. On `ticket_expired` (the normal end of a ticket's life; at most an hour), reconnect with a new ticket. On any other code (`invalid_key`, `key_required`, `insufficient_scope`), **don't** reconnect: re-run `whoami` and show the user what changed.
+3. **The `auth` event.** When the stream's credential stops allowing it, the server sends `event: auth` with `{"code": ...}` and closes. On `ticket_expired` (the normal end of a ticket's life, at most an hour; also sent when the ticket's narrowing names a system that has since been merged into another), reconnect with a new ticket. On any other code (`invalid_key` when the key is revoked or reaches its expiry, `key_required`, `insufficient_scope`), **don't** reconnect: re-run `whoami` and show the user what changed. The server re-checks every 60 seconds and at once on changes; if a re-check can't reach the database, the stream stays open with its current access until the next one.
 4. **Back off.** A `429` ends an `EventSource` for good; your reconnect loop must wait and retry.
 
 ```js
@@ -632,11 +662,16 @@ async function connectLiveAudio(onFrame) {
 }
 ```
 
-Close codes: `4401` with reason `invalid_key`, `key_required` or `ticket_expired`, and `4403` with reason `insufficient_scope`. Only `ticket_expired` should reconnect automatically. Any `Origin` is accepted.
+Close codes: `4401` with reason `invalid_key`, `key_required` or `ticket_expired`, and `4403` with reason `insufficient_scope`, sent in the same situations as the live-event `auth` signal (including key expiry and merged-away narrowings). Only `ticket_expired` should reconnect automatically. Any `Origin` is accepted.
+
+- The server sends a keepalive text message and a WebSocket ping every 15 seconds. `active_streams` in the keepalive counts live talkgroup streams; for a restricted credential, only those on talkgroups it may hear.
+- A connection from which the server receives nothing, pongs included, for 60 seconds is closed. Browsers answer pings automatically; other clients must too.
+- A client message over 64 KiB closes the connection with `1009`.
+- Operators: when several trunk-recorder instances use the same short name for different systems, tr-engine can't tell which instance sent a simplestream packet, and drops that sender's audio with a WARN rather than label it with the wrong system (restrictions depend on it). Map senders with `STREAM_SOURCE_MAP=ip=instance_id,...` (IPv6 addresses work too) or give the systems unique short names. A sender's instance is worked out again for every chunk: real trunk-recorder instances are preferred over the `WATCH_INSTANCE_ID` (file watch / `TR_DIR`) identity, which is preferred over the `UPLOAD_INSTANCE_ID` identity. A sender is dropped with a WARN whenever the preferred instances map its short name to different systems, including when such an instance appears after the sender was attributed (a second trunk-recorder, say), and `STREAM_SOURCE_MAP` is then required. Only `STREAM_SOURCE_MAP` entries take an instance out of other senders' candidates; an attribution tr-engine worked out by itself doesn't.
 
 ### Non-browser clients
 
-Anything that can set headers (curl, a server, a native app's HTTP library, Node's `fetch`-based SSE readers) can send `Authorization: Bearer` to the stream and audio endpoints too, and doesn't need tickets. Header-authenticated streams are not closed on a timer, but they still get the `auth` signal if the key is revoked or loses `listen`.
+Anything that can set headers (curl, a server, a native app's HTTP library, Node's `fetch`-based SSE readers) can send `Authorization: Bearer` to the stream and audio endpoints too, and doesn't need tickets. Header-authenticated streams have no ticket timer, but they still get the `auth` signal (`invalid_key`) when the key reaches its `expires_at` or is revoked, and `insufficient_scope` when it loses `listen`.
 
 ## Multi-user backends
 
@@ -674,6 +709,7 @@ app.post('/api/tr-ticket', requireLogin, async (req, res) => {
 - The ticket's access is the **intersection** of your key's access and the narrowing. It can never exceed the key.
 - A narrowing may hold at most 100 entries in total (the ticket has to fit in a URL). Narrow by system, or mint several tickets.
 - A narrowing that allows nothing is accepted and yields a ticket that sees nothing, which is handy for users with no access.
+- A narrowing that names a system that was merged into another, in any list including `exclude_talkgroups`, is refused with `400 invalid_body` ("restriction: names a system that was merged into another; use the system it was merged into"). Update your per-user lists after a merge. Stored key and anonymous restrictions keep merged-away IDs in their exclusions (next to a copy for the surviving system), so if you build narrowings from `GET /api/v1/keys` or `GET /api/v1/anonymous-access`, drop the entries naming a merged-away system and keep their copies for the surviving system.
 - To cut one user off, stop giving them tickets; their current ticket works until it expires (so keep TTLs short, like 5 minutes) and their stream is then closed. To cut everyone off at once, revoke the key.
 - A restricted narrowing means the browser's stream gets the per-type rules for restricted credentials (see below).
 
@@ -683,10 +719,11 @@ app.post('/api/tr-ticket', requireLogin, async (req, res) => {
 
 When `whoami.restricted` is true (a restricted listen key, a narrowed ticket, or a restricted anonymous policy):
 
-- Endpoints marked **`x-restricted: enforced`** in the OpenAPI spec work and return only allowed data. A specific call, call group or talkgroup outside the restriction is 404. Ambiguous talkgroup IDs only consider allowed talkgroups.
+- Endpoints marked **`x-restricted: enforced`** in the OpenAPI spec work and return only allowed data. A specific call, call group or talkgroup outside the restriction is 404. Ambiguous talkgroup IDs only consider allowed talkgroups. Counts cover only allowed data too: `total`, and a call group's `call_count`, which counts only the recordings the credential may see.
 - Endpoints marked **`x-restricted: deny`** answer `403 restricted_credential`. Don't call them: hide the feature (units, affiliations, stats, recorders, ...), and don't poll them.
 - Live events: only `call_start`, `call_update`, `call_end`, `transcription` and `unit_event` events for allowed talkgroups arrive. `recorder_update`, `rate_update`, `trunking_message`, `console` and unit events without a talkgroup (registrations) never do.
 - Live audio: only allowed talkgroups' audio is sent, whatever you subscribe to.
+- A restriction change reaches open streams in place: tr-engine swaps the stream's credential without closing it (and without an `auth` event) while it keeps `listen`. From then on, events for newly excluded talkgroups are filtered out, including the `call_end` of calls already in progress, so a client that tracks active calls from `call_start`/`call_end` should re-check them against `GET /api/v1/calls/active` (for example on a timer, or when `whoami` shows a changed restriction) rather than wait for a `call_end` that won't come.
 - Don't mix `enforced` and `deny` calls in one `Promise.all`; a 403 from one would hide the data from the other. Use `Promise.allSettled`.
 
 ### Reading the policy from the spec
@@ -732,7 +769,7 @@ A browser app on another origin can therefore call tr-engine directly with its k
 - **Caching.** `/api/v1` JSON responses are `Cache-Control: no-store` with `Vary: Authorization`; call audio is `Cache-Control: private`.
 - **`X-Request-ID`.** Send your own (at most 64 characters of `A-Z a-z 0-9 . _ -`) to correlate logs; tr-engine echoes it, or generates one.
 - **Uploads.** Upload clients need an `upload` key; see [http-upload.md](http-upload.md).
-- **Rate limits.** Anonymous, ticket and legacy-key requests are limited per IP; keys only if the operator set a per-key limit. Handle `429` with `Retry-After`.
+- **Rate limits.** Anonymous, ticket and legacy-key requests, and uploads with the key in a form field, are limited per IP; keys in the `Authorization` header only if the operator set a per-key limit. Handle `429` with `Retry-After`.
 
 ## Checklist for a new client
 

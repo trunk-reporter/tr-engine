@@ -2,11 +2,15 @@ package ingest
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/snarg/tr-engine/internal/api"
 )
@@ -42,6 +46,9 @@ func (p *Pipeline) ProcessUpload(ctx context.Context, instanceID string, format 
 	// OpenMHz doesn't always include short_name — use instanceID as fallback
 	if meta.ShortName == "" {
 		meta.ShortName = instanceID
+	}
+	if err := validateUploadMeta(meta, time.Now()); err != nil {
+		return nil, fmt.Errorf("%w: %w", api.ErrInvalidUpload, err)
 	}
 
 	result, err := p.ProcessUploadedCall(ctx, instanceID, meta, audioData, audioFilename)
@@ -80,8 +87,12 @@ func (p *Pipeline) ProcessUploadedCall(ctx context.Context, instanceID string, m
 	// Create call from audio metadata
 	callID, callStartTime, effectiveTgTag, err := p.createCallFromAudio(ctx, identity, meta, startTime)
 	if err != nil && strings.Contains(err.Error(), "no partition") {
-		// Auto-create missing partition and retry once
-		p.ensurePartitionsFor(startTime)
+		// Auto-create missing partition and retry once. A month outside
+		// the window ensurePartitionsFor accepts is the uploader's fault.
+		if perr := p.ensurePartitionsFor(startTime); errors.Is(perr, errPartitionOutOfRange) {
+			return nil, fmt.Errorf("%w: start time %s: %w", api.ErrInvalidUpload,
+				startTime.UTC().Format(time.RFC3339), perr)
+		}
 		callID, callStartTime, effectiveTgTag, err = p.createCallFromAudio(ctx, identity, meta, startTime)
 	}
 	if err != nil {
@@ -91,19 +102,9 @@ func (p *Pipeline) ProcessUploadedCall(ctx context.Context, instanceID string, m
 	// Save audio file (best-effort — still return success for the call record)
 	var audioPath string
 	if len(audioData) > 0 {
-		audioType := meta.AudioType
-		if audioType == "" {
-			if idx := strings.LastIndex(audioFilename, "."); idx >= 0 {
-				audioType = audioFilename[idx+1:]
-			}
-		}
-		if audioType == "" {
-			audioType = "m4a"
-		}
-
-		filename := buildAudioFilename(audioFilename, audioType, startTime)
-		audioKey := buildAudioRelPath(meta.ShortName, startTime, filename)
-		contentType := audioContentType(audioType)
+		ext := uploadAudioExt(meta.AudioType, audioFilename)
+		audioKey := p.newUploadAudioKey(ctx, identity.SystemID, startTime, callID, ext)
+		contentType := audioContentType(ext)
 
 		if err := p.saveAudio(ctx, audioKey, audioData, contentType); err != nil {
 			p.log.Error().Err(err).Int64("call_id", callID).Msg("failed to save uploaded audio file")
@@ -178,6 +179,118 @@ func (p *Pipeline) ProcessUploadedCall(ctx context.Context, instanceID string, m
 		StartTime:     startTime,
 		AudioFilePath: audioPath,
 	}, nil
+}
+
+// Limits on what an upload may claim (see validateUploadMeta).
+const (
+	// maxUploadShortNameLen caps the system short name an upload may
+	// create a system under.
+	maxUploadShortNameLen = 128
+	// maxUploadClockSkew is how far in the future an upload's start time
+	// may be. Older start times are bounded by the months
+	// ensurePartitionsFor accepts.
+	maxUploadClockSkew = 10 * time.Minute
+)
+
+// validateUploadMeta refuses uploaded metadata the engine must not act on:
+// a talkgroup or start time that isn't positive, a start time more than
+// maxUploadClockSkew ahead of now, and a system short name that could be
+// read as a path or holds control characters. The caller wraps the error in
+// api.ErrInvalidUpload (400).
+func validateUploadMeta(meta *AudioMetadata, now time.Time) error {
+	if meta.Talkgroup <= 0 {
+		return fmt.Errorf("talkgroup must be a positive integer, got %d", meta.Talkgroup)
+	}
+	if meta.StartTime <= 0 {
+		return errors.New("missing or invalid start time (dateTime / start_time, unix seconds)")
+	}
+	if start := time.Unix(meta.StartTime, 0); start.After(now.Add(maxUploadClockSkew)) {
+		return fmt.Errorf("start time %s is in the future", start.UTC().Format(time.RFC3339))
+	}
+	if err := validateUploadShortName(meta.ShortName); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateUploadShortName refuses a system short name holding a path
+// separator, "..", or a control character, or longer than
+// maxUploadShortNameLen bytes.
+func validateUploadShortName(name string) error {
+	if name == "" {
+		return errors.New("missing system short name")
+	}
+	if len(name) > maxUploadShortNameLen {
+		return fmt.Errorf("system short name is longer than %d bytes", maxUploadShortNameLen)
+	}
+	if name == "." || strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) ||
+		strings.IndexFunc(name, unicode.IsControl) >= 0 {
+		return fmt.Errorf("invalid system short name %q: no '/', '\\', '..' or control characters", name)
+	}
+	return nil
+}
+
+// uploadAudioExt picks the stored file's extension from the declared audio
+// type (an extension or a MIME type), then the uploaded file name's
+// extension: m4a, mp3, wav or ogg. Nothing declared means m4a (what the
+// upload plugins send); anything else is stored as bin.
+func uploadAudioExt(audioType, filename string) string {
+	known := map[string]string{
+		"m4a": "m4a", "mp4": "m4a", "aac": "m4a",
+		"audio/mp4": "m4a", "audio/m4a": "m4a", "audio/x-m4a": "m4a", "audio/aac": "m4a",
+		"mp3": "mp3", "audio/mpeg": "mp3", "audio/mp3": "mp3",
+		"wav": "wav", "audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav", "audio/vnd.wave": "wav",
+		"ogg": "ogg", "oga": "ogg", "opus": "ogg", "audio/ogg": "ogg", "audio/opus": "ogg",
+	}
+	fileExt := ""
+	if i := strings.LastIndex(filename, "."); i >= 0 {
+		fileExt = filename[i+1:]
+	}
+	declared := false
+	for _, c := range []string{audioType, fileExt} {
+		c = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(c), "."))
+		if c == "" {
+			continue
+		}
+		declared = true
+		if ext, ok := known[c]; ok {
+			return ext
+		}
+	}
+	if !declared {
+		return "m4a"
+	}
+	return "bin"
+}
+
+// uploadAudioKey is the storage key of an uploaded call's audio:
+// upload/<system_id>/<YYYY-MM-DD>/<call_id>[-<suffix>].<ext>. Every part is
+// chosen by the engine, never by the uploader, so an upload can't name, and
+// so can't replace, another call's file. (MQTT audio is stored under
+// <short_name>/<YYYY-MM-DD>/, whose second segment is never all digits.)
+func uploadAudioKey(systemID int, startTime time.Time, callID int64, suffix, ext string) string {
+	name := strconv.FormatInt(callID, 10)
+	if suffix != "" {
+		name += "-" + suffix
+	}
+	return fmt.Sprintf("upload/%d/%s/%s.%s", systemID, startTime.UTC().Format("2006-01-02"), name, ext)
+}
+
+// newUploadAudioKey returns uploadAudioKey for the call, with a random
+// suffix if a file is already stored under that key (left over from an
+// earlier database, since call IDs are unique): an upload never overwrites
+// a stored file.
+func (p *Pipeline) newUploadAudioKey(ctx context.Context, systemID int, startTime time.Time, callID int64, ext string) string {
+	key := uploadAudioKey(systemID, startTime, callID, "", ext)
+	if p.store == nil || !p.store.Exists(ctx, key) {
+		return key
+	}
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	alt := uploadAudioKey(systemID, startTime, callID, hex.EncodeToString(b[:]), ext)
+	p.log.Warn().Str("existing", key).Str("key", alt).Int64("call_id", callID).
+		Msg("an audio file is already stored under this upload's key; saving the upload under another name")
+	return alt
 }
 
 // ParseRdioScannerFields parses rdio-scanner trunk-recorder plugin form fields

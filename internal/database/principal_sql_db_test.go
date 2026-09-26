@@ -27,13 +27,15 @@ func (p sysTG) String() string {
 	return fmt.Sprintf("%d:%d", p.sys, *p.tg)
 }
 
-// sqlGrid is every (system, tgid) row the test queries: systems 1-3, and a
-// NULL, a 0 and three real tgids in each.
+// sqlGrid is every (system, tgid) row the test queries: systems -1 to 3,
+// and a NULL, a 0, a negative and three real tgids in each. Rows with a
+// system or tgid below 1 are never allowed to a restricted principal
+// (AllowsTG), however it is restricted.
 func sqlGrid() []sysTG {
 	var rows []sysTG
-	for sys := 1; sys <= 3; sys++ {
+	for sys := -1; sys <= 3; sys++ {
 		rows = append(rows, sysTG{sys: sys})
-		for _, tg := range []int{0, 100, 200, 300} {
+		for _, tg := range []int{0, -5, 100, 200, 300} {
 			tg := tg
 			rows = append(rows, sysTG{sys: sys, tg: &tg})
 		}
@@ -65,7 +67,7 @@ func principalRows(t *testing.T, db *DB, p *auth.Principal) []string {
 	clause, args := p.SQL("r.system_id", "r.tgid", 2)
 	rows, err := db.Pool.Query(context.Background(),
 		`SELECT r.system_id, r.tgid FROM restr_rows r WHERE r.system_id > $1`+clause,
-		append([]any{0}, args...)...)
+		append([]any{-1000}, args...)...)
 	if err != nil {
 		t.Fatalf("query with %q: %v", clause, err)
 	}
@@ -112,7 +114,8 @@ func TestPrincipalSQL(t *testing.T) {
 	}{
 		{name: "unrestricted sees everything, NULL and 0 too", p: &auth.Principal{Kind: auth.KindKey, Scopes: auth.Scopes{auth.ScopeListen}}},
 		{name: "nil principal sees nothing", p: nil, want: []string{}},
-		{name: "allow_all hides NULL and 0", p: restricted(auth.Restriction{AllowAll: true})},
+		{name: "allow_all hides NULL, 0 and negative IDs", p: restricted(auth.Restriction{AllowAll: true}),
+			want: []string{"1:100", "1:200", "1:300", "2:100", "2:200", "2:300", "3:100", "3:200", "3:300"}},
 		{name: "allow_all + exclude", p: restricted(auth.Restriction{AllowAll: true, ExcludeTalkgroups: tgs(1, 100, 2, 200)})},
 		{name: "systems only", p: restricted(auth.Restriction{Systems: []int{1}}),
 			want: []string{"1:100", "1:200", "1:300"}},

@@ -3,8 +3,10 @@ package database
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // AuditEntry is one state-changing API request made with a key (§9).
@@ -20,10 +22,33 @@ type AuditEntry struct {
 	RequestID string    `json:"request_id"`
 }
 
+// MaxAuditPathBytes caps the path stored in an audit entry. A route
+// parameter matches a segment of any length, so without a cap one request
+// could store a path of up to the header size limit.
+const MaxAuditPathBytes = 1024
+
+// TruncateAuditPath cuts anything from a '?' on, and a path longer than
+// MaxAuditPathBytes at a UTF-8 boundary, marking how long it was. Apply it
+// once, to the path as requested: its result can itself be longer than
+// MaxAuditPathBytes, and truncating that again would record the result's
+// length instead of the request's.
+func TruncateAuditPath(path string) string {
+	path, _, _ = strings.Cut(path, "?")
+	if len(path) <= MaxAuditPathBytes {
+		return path
+	}
+	cut := MaxAuditPathBytes
+	for cut > 0 && !utf8.RuneStart(path[cut]) {
+		cut--
+	}
+	return path[:cut] + "…(truncated, " + strconv.Itoa(len(path)) + " bytes)"
+}
+
 // InsertAuditLog records e. ID and Time are assigned by the database; an
-// empty Actor is stored as NULL, and anything from a '?' on is cut from Path.
+// empty Actor is stored as NULL, and Path, the path as requested, goes
+// through TruncateAuditPath here (callers pass it untruncated).
 func (db *DB) InsertAuditLog(ctx context.Context, e AuditEntry) error {
-	path, _, _ := strings.Cut(e.Path, "?")
+	path := TruncateAuditPath(e.Path)
 	var actor *string
 	if e.Actor != nil && *e.Actor != "" {
 		actor = e.Actor

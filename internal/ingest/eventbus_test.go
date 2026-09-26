@@ -1,6 +1,8 @@
 package ingest
 
 import (
+	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"runtime"
@@ -67,8 +69,8 @@ func TestEventBusPublishSubscribe(t *testing.T) {
 			if evt.Tgid != 100 {
 				t.Errorf("Tgid = %d, want 100", evt.Tgid)
 			}
-			if evt.ID == "" || !strings.HasSuffix(evt.ID, fmt.Sprintf("-%d", evt.Seq)) || evt.Seq != 1 {
-				t.Errorf("ID = %q, Seq = %d; want <ms>-1 and 1", evt.ID, evt.Seq)
+			if ms, opaque, ok := strings.Cut(evt.ID, "-"); !ok || len(ms) < 13 || len(opaque) != 32 || evt.Seq != 1 {
+				t.Errorf("ID = %q, Seq = %d; want <ms>-<32 hex> and 1", evt.ID, evt.Seq)
 			}
 			// Verify data is valid JSON
 			var payload map[string]string
@@ -618,5 +620,69 @@ func TestMatchesFilterPrincipal(t *testing.T) {
 	// The client filter still narrows what the principal allows.
 	if matchesFilter(events["call_start"], api.EventFilter{Types: []string{"call_end"}}, restrictedKey) {
 		t.Error("the client's type filter was ignored for a restricted principal")
+	}
+}
+
+// Event IDs don't reveal the global sequence: a restricted subscriber can't
+// count the events it wasn't shown from gaps between its IDs (r1-13). They
+// are still unique, and replay still finds them.
+func TestEventBusOpaqueIDs(t *testing.T) {
+	eb := NewEventBus(zerolog.Nop(), 64)
+	seen := map[string]bool{}
+	for i := 0; i < 50; i++ {
+		eb.Publish(EventData{Type: "call_end", SystemID: 1, Tgid: 100 + i%2, Payload: i})
+	}
+	ids := ringIDs(eb)
+	for i, id := range ids {
+		if seen[id] {
+			t.Fatalf("duplicate event ID %q", id)
+		}
+		seen[id] = true
+		_, opaque, _ := strings.Cut(id, "-")
+		if _, err := hex.DecodeString(opaque); err != nil || len(opaque) != 32 {
+			t.Errorf("ID %q: opaque part is not 32 hex digits", id)
+		}
+		if strings.HasSuffix(id, fmt.Sprintf("-%d", i+1)) {
+			t.Errorf("ID %q ends in its sequence number", id)
+		}
+	}
+	// Another bus (another process) numbers the same sequence differently.
+	other := NewEventBus(zerolog.Nop(), 4)
+	other.Publish(EventData{Type: "call_end", Payload: 0})
+	if o := ringIDs(other)[0]; o[strings.Index(o, "-"):] == ids[0][strings.Index(ids[0], "-"):] {
+		t.Error("two buses gave sequence 1 the same ID")
+	}
+
+	restricted := &auth.Principal{Kind: auth.KindKey, KeyID: 7, Scopes: auth.Scopes{auth.ScopeListen},
+		Restrictions: []auth.Restriction{{Talkgroups: []auth.TG{{SystemID: 1, Tgid: 100}}}}}
+	replay, _, cancel := eb.SubscribeSince(ids[9], api.EventFilter{}, holder(restricted))
+	defer cancel()
+	if len(replay) != 20 {
+		t.Errorf("replay after the 10th event = %d events, want the 20 later tg 100 ones", len(replay))
+	}
+}
+
+// Once the ring is full every publish evicts an event; that is warned about
+// at most once per evictionLogInterval, with a count (not once per event).
+func TestEventBusEvictionWarningRateLimited(t *testing.T) {
+	var logs bytes.Buffer
+	eb := NewEventBus(zerolog.New(&logs), 4)
+	for i := 0; i < 100; i++ {
+		eb.Publish(EventData{Type: "call_end", SystemID: 1, Tgid: 1, Payload: i})
+	}
+	if n := strings.Count(logs.String(), "replay buffer full"); n != 1 {
+		t.Fatalf("%d eviction warnings for 96 evictions, want 1:\n%s", n, logs.String())
+	}
+	if !strings.Contains(logs.String(), `"evicted":1`) {
+		t.Errorf("first warning should count the first eviction: %s", logs.String())
+	}
+	// After the interval the next eviction reports how many happened since.
+	eb.mu.Lock()
+	eb.evictLogTime = time.Now().Add(-evictionLogInterval)
+	eb.mu.Unlock()
+	logs.Reset()
+	eb.Publish(EventData{Type: "call_end", SystemID: 1, Tgid: 1, Payload: "x"})
+	if !strings.Contains(logs.String(), `"evicted":96`) {
+		t.Errorf("second warning = %s, want the 96 evictions since the first", logs.String())
 	}
 }

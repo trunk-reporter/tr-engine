@@ -413,6 +413,68 @@ func TestTickets(t *testing.T) {
 	})
 }
 
+// POST /tickets validates the narrowing (at most auth.MaxTicketEntries
+// entries) before checking it for merged systems, so an oversized narrowing
+// never reaches the database or the merged-systems cache (r2-03).
+func TestTicketMintValidatesNarrowingFirst(t *testing.T) {
+	store := newStubAuthStore()
+	k := store.add("listen", database.APIKey{Scopes: auth.Scopes{auth.ScopeListen}})
+	store.merged[3] = true
+	a := newTestAuthenticator(store)
+	h := NewTicketsHandler(a)
+	p := &auth.Principal{Kind: auth.KindKey, KeyID: k.ID, Scopes: auth.Scopes{auth.ScopeListen}}
+	mint := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/api/v1/tickets", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		h.Mint(rec, withPrincipal(req, p, k))
+		return rec
+	}
+	cached := func() int {
+		a.mergedMu.Lock()
+		defer a.mergedMu.Unlock()
+		return len(a.merged)
+	}
+
+	ids := make([]string, 5000)
+	for i := range ids {
+		ids[i] = strconv.Itoa(i + 1) // includes the merged system 3
+	}
+	rec := mint(`{"restriction":{"systems":[` + strings.Join(ids, ",") + `]}}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "ticket restriction too large") {
+		t.Errorf("oversized narrowing: %d %s, want 400 too large", rec.Code, rec.Body.String())
+	}
+	rec = mint(`{"restriction":{"talkgroups":["0:5"],"systems":[3]}}`)
+	if rec.Code != http.StatusBadRequest || strings.Contains(rec.Body.String(), "merged") {
+		t.Errorf("malformed narrowing: %d %s, want 400 for the bad talkgroup", rec.Code, rec.Body.String())
+	}
+	if store.mergedQueries != 0 || cached() != 0 {
+		t.Errorf("invalid narrowings reached the merged check: %d queries, %d cache entries", store.mergedQueries, cached())
+	}
+
+	rec = mint(`{"restriction":{"systems":[3]}}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "merged") {
+		t.Errorf("merged system: %d %s, want 400 merged", rec.Code, rec.Body.String())
+	}
+	if rec = mint(`{"restriction":{"systems":[1,2]}}`); rec.Code != http.StatusOK {
+		t.Errorf("valid narrowing: %d %s", rec.Code, rec.Body.String())
+	}
+	if store.mergedQueries != 2 || cached() != 2 {
+		t.Errorf("merged check: %d queries, %d cache entries, want 2 and 2", store.mergedQueries, cached())
+	}
+
+	// The cache never holds a list longer than a ticket narrowing.
+	long := make([]int, auth.MaxTicketEntries+1)
+	for i := range long {
+		long[i] = i + 10
+	}
+	if merged, err := a.mergedAway(t.Context(), long); err != nil || merged {
+		t.Fatalf("mergedAway(long) = %v, %v", merged, err)
+	}
+	if cached() != 2 {
+		t.Errorf("a list of %d systems was cached", len(long))
+	}
+}
+
 func TestRetiredPublicToken(t *testing.T) {
 	store := newStubAuthStore()
 	store.retired = database.HashAPIKey("old-public")
@@ -457,6 +519,16 @@ func TestAudit(t *testing.T) {
 	if e.KeyName != "ops script" || e.Method != "DELETE" || e.Path != "/api/v1/keys/7" || e.Status != 200 ||
 		e.RequestID != "req-1" || e.Actor == nil || *e.Actor != "alice" {
 		t.Errorf("entry = %+v (actor %v)", e, *e.Actor)
+	}
+
+	// A long path (a route parameter matches a segment of any length) is
+	// stored capped (r1-08).
+	long := "/api/v1/talkgroups/" + strings.Repeat("A", 200000)
+	do(shadow, "PATCH", long, bearer("admin"))
+	entries = store.auditEntries()
+	if last := entries[len(entries)-1]; len(last.Path) > database.MaxAuditPathBytes+64 ||
+		!strings.HasPrefix(last.Path, "/api/v1/talkgroups/AAAA") || !strings.Contains(last.Path, "truncated, 200019 bytes") {
+		t.Errorf("long path stored as %d bytes: %.80q...", len(last.Path), last.Path)
 	}
 
 	// The status the client received, including refusals from handlers.

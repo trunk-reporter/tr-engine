@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -44,6 +45,13 @@ type Pipeline struct {
 
 	// Event bus for SSE subscribers
 	eventBus *EventBus
+
+	// mergedSystems maps each system merged away while this process ran to
+	// the system its data now lives in (RewriteSystemID), for events
+	// published from state captured before the merge (queued transcriptions,
+	// in-flight handlers).
+	mergedMu      sync.RWMutex
+	mergedSystems map[int]int
 
 	// Live audio streaming (optional, nil if STREAM_LISTEN not set)
 	audioBus    *audio.AudioBus
@@ -191,6 +199,13 @@ type PipelineOptions struct {
 	// Live audio streaming
 	StreamListen      string
 	StreamInstanceID  string // TR instance ID for simplestream identity resolution
+	StreamSourceMap   string // STREAM_SOURCE_MAP: "ip=instance_id,..." simplestream sender attribution
+	// WatchInstanceID and UploadInstanceID (WATCH_INSTANCE_ID,
+	// UPLOAD_INSTANCE_ID) are the instances file watch / TR_DIR imports and
+	// HTTP uploads resolve identities under; the live audio router never
+	// prefers them over a trunk-recorder instance with the same short name.
+	WatchInstanceID  string
+	UploadInstanceID string
 	StreamIdleTimeout time.Duration
 	StreamOpusBitrate int // 0 = PCM passthrough, >0 = Opus bitrate in bps
 	Log               zerolog.Logger
@@ -261,6 +276,15 @@ func NewPipeline(opts PipelineOptions) *Pipeline {
 		audioBus = audio.NewAudioBus()
 		audioRouter = audio.NewAudioRouter(audioBus, identity, opts.StreamInstanceID, opts.StreamIdleTimeout, opts.StreamOpusBitrate)
 		audioRouter.SetLogger(log)
+		audioRouter.SetIngestOnlyInstances(opts.WatchInstanceID, opts.UploadInstanceID)
+		if opts.StreamSourceMap != "" {
+			if m, err := audio.ParseSourceMap(opts.StreamSourceMap); err != nil {
+				log.Error().Err(err).Msg("STREAM_SOURCE_MAP ignored: every sender is auto-learned instead")
+			} else {
+				audioRouter.SetSourceMap(m)
+				log.Info().Int("senders", len(m)).Msg("live audio senders mapped by STREAM_SOURCE_MAP")
+			}
+		}
 		if os.Getenv("STREAM_INSTANCE_ID") != "" {
 			log.Warn().Str("instance_id", opts.StreamInstanceID).
 				Msg("STREAM_INSTANCE_ID is deprecated — source IP auto-detection handles multi-instance setups automatically")
@@ -1212,10 +1236,43 @@ func beginningOfMonth(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, t.Location())
 }
 
+// The months ensurePartitionsFor creates partitions for, relative to the
+// current month. Maintenance keeps partitions ready 3 months ahead; the
+// file-watch backfill creates older ones itself (FileWatcher.ensurePartitions).
+const (
+	onDemandPartitionPastMonths   = 12
+	onDemandPartitionFutureMonths = 3
+)
+
+// errPartitionOutOfRange is ensurePartitionsFor refusing a month outside the
+// on-demand window.
+var errPartitionOutOfRange = errors.New("no partition for that month, and it is outside the months the engine creates partitions for on demand")
+
+// partitionMonthAllowed reports whether ensurePartitionsFor may create
+// partitions for the month containing t: from onDemandPartitionPastMonths
+// before now's month to onDemandPartitionFutureMonths after it. Partitions
+// are permanent and every query that can't prune them gets slower with each
+// one, so a bogus timestamp (a wrong clock, a crafted upload) must not create
+// them for arbitrary months.
+func partitionMonthAllowed(t, now time.Time) bool {
+	t, now = t.UTC(), now.UTC()
+	month := beginningOfMonth(t)
+	cur := beginningOfMonth(now)
+	return !month.Before(cur.AddDate(0, -onDemandPartitionPastMonths, 0)) &&
+		!month.After(cur.AddDate(0, onDemandPartitionFutureMonths, 0))
+}
+
 // ensurePartitionsFor creates monthly partitions for all partitioned tables for
 // the month containing the given timestamp. Called on-demand when an insert
-// fails with "no partition found".
-func (p *Pipeline) ensurePartitionsFor(t time.Time) {
+// fails with "no partition found". It refuses (errPartitionOutOfRange, logged)
+// a month partitionMonthAllowed doesn't allow.
+func (p *Pipeline) ensurePartitionsFor(t time.Time) error {
+	if !partitionMonthAllowed(t, time.Now()) {
+		p.log.Warn().Time("start_time", t).
+			Int("past_months", onDemandPartitionPastMonths).Int("future_months", onDemandPartitionFutureMonths).
+			Msg("not creating partitions for a call this far from now; the call is dropped (check the sender's clock)")
+		return errPartitionOutOfRange
+	}
 	ctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
 	defer cancel()
 
@@ -1229,6 +1286,7 @@ func (p *Pipeline) ensurePartitionsFor(t time.Time) {
 			p.log.Info().Str("result", result).Str("table", table).Msg("created on-demand partition")
 		}
 	}
+	return nil
 }
 
 // HandleMessage is the entry point called by the MQTT client for each message.
@@ -1711,6 +1769,19 @@ func (m *activeCallMap) FindByFreq(freq int64) (activeCallEntry, bool) {
 	return activeCallEntry{}, false
 }
 
+// RewriteSystemID moves the active calls of system oldID to newID after a
+// merge.
+func (m *activeCallMap) RewriteSystemID(oldID, newID int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, e := range m.calls {
+		if e.SystemID == oldID {
+			e.SystemID = newID
+			m.calls[k] = e
+		}
+	}
+}
+
 func (m *activeCallMap) Len() int {
 	m.mu.Lock()
 	n := len(m.calls)
@@ -1781,10 +1852,49 @@ func (p *Pipeline) SubscribeSince(lastEventID string, filter api.EventFilter, pr
 	return p.eventBus.SubscribeSince(lastEventID, filter, principal)
 }
 
-// RewriteSystemID updates the identity cache after a system merge,
-// rewriting all entries that point at oldSystemID to use newSystemID.
+// RewriteSystemID updates in-memory state after a system merge of
+// oldSystemID into newSystemID: the identity cache, the active calls, the SSE
+// replay buffer, and the alias PublishEvent applies to events published
+// later from state captured before the merge. Restrictions are checked
+// against these IDs, and the merge rewrote them to the new one: data left
+// under the old ID would slip past a rewritten exclusion (or disappear from
+// a rewritten allow list).
 func (p *Pipeline) RewriteSystemID(oldSystemID, newSystemID int) {
-	p.identity.RewriteSystemID(oldSystemID, newSystemID)
+	if p.identity != nil {
+		p.identity.RewriteSystemID(oldSystemID, newSystemID)
+	}
+	if oldSystemID <= 0 || newSystemID <= 0 || oldSystemID == newSystemID {
+		return
+	}
+	p.mergedMu.Lock()
+	if p.mergedSystems == nil {
+		p.mergedSystems = make(map[int]int)
+	}
+	for src, dst := range p.mergedSystems {
+		if dst == oldSystemID {
+			p.mergedSystems[src] = newSystemID
+		}
+	}
+	p.mergedSystems[oldSystemID] = newSystemID
+	p.mergedMu.Unlock()
+
+	if p.activeCalls != nil {
+		p.activeCalls.RewriteSystemID(oldSystemID, newSystemID)
+	}
+	if p.eventBus != nil {
+		p.eventBus.RewriteSystemID(oldSystemID, newSystemID)
+	}
+}
+
+// currentSystemID returns the system that id was merged into, following the
+// merges this process saw, or id itself if it was not merged away.
+func (p *Pipeline) currentSystemID(id int) int {
+	p.mergedMu.RLock()
+	defer p.mergedMu.RUnlock()
+	if to, ok := p.mergedSystems[id]; ok {
+		return to
+	}
+	return id
 }
 
 // MsgCount returns the total number of MQTT messages processed.
@@ -1822,9 +1932,12 @@ func (p *Pipeline) IngestMetrics() *api.IngestMetricsData {
 	}
 }
 
-// PublishEvent is a convenience method to publish an event through the event bus.
+// PublishEvent publishes an event through the event bus. An event of a
+// system merged away since its data was captured is published under the
+// merge target (currentSystemID), so restrictions see the current ID.
 func (p *Pipeline) PublishEvent(e EventData) {
 	if p.eventBus != nil {
+		e.SystemID = p.currentSystemID(e.SystemID)
 		p.eventBus.Publish(e)
 	}
 }

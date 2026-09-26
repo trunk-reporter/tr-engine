@@ -6,11 +6,13 @@ package database
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/snarg/tr-engine/internal/auth"
@@ -308,6 +310,131 @@ func TestAPIKeys_LastAdminGuard(t *testing.T) {
 	}
 }
 
+// A rate limit too low to lift again locks an admin key out just as an
+// expiry does: the guard covers it, and a key throttled like that doesn't
+// count as the admin key that remains (r2-13).
+func TestAPIKeys_LastAdminGuardRateLimit(t *testing.T) {
+	db := authDB(t)
+	ctx := context.Background()
+	limit := func(id int, rps *float32) error {
+		_, err := db.PatchAPIKey(ctx, id, APIKeyPatch{SetRateLimitRPS: true, RateLimitRPS: rps}, GuardLastAdmin)
+		return err
+	}
+	rps := func(v float32) *float32 { return &v }
+
+	only := mustCreateKey(t, db, "only", "admin")
+	for _, v := range []float32{0.0001, 0.5} {
+		if err := limit(only.ID, rps(v)); !errors.Is(err, ErrLastAdminKey) {
+			t.Errorf("rate limit %g on the only admin key: err = %v, want ErrLastAdminKey", v, err)
+		} else if !strings.Contains(err.Error(), "rate limit") {
+			t.Errorf("message = %q, want it to explain the rate limit", err)
+		}
+	}
+	// A limit it can still work with is fine, and so is raising or lifting one.
+	for _, v := range []*float32{rps(1), rps(50), nil} {
+		if err := limit(only.ID, v); err != nil {
+			t.Errorf("rate limit %v on the only admin key: %v", v, err)
+		}
+	}
+	// A rename leaves the limit alone and isn't guarded.
+	if _, err := db.PatchAPIKey(ctx, only.ID, APIKeyPatch{SetName: true, Name: "renamed"}, GuardLastAdmin); err != nil {
+		t.Errorf("rename: %v", err)
+	}
+
+	// With another usable admin key, the throttle is allowed...
+	second := mustCreateKey(t, db, "second", "admin")
+	if err := limit(only.ID, rps(0.0001)); err != nil {
+		t.Fatalf("throttle with another admin key: %v", err)
+	}
+	// ...and then the other key is the last usable one: it can't be
+	// revoked, demoted or throttled.
+	if _, err := db.RevokeAPIKey(ctx, second.ID, GuardLastAdmin); !errors.Is(err, ErrLastAdminKey) {
+		t.Errorf("revoke the last usable admin key: err = %v, want ErrLastAdminKey", err)
+	}
+	if _, err := db.PatchAPIKey(ctx, second.ID, APIKeyPatch{SetScopes: true, Scopes: scopesOf("edit")}, GuardLastAdmin); !errors.Is(err, ErrLastAdminKey) {
+		t.Errorf("demote the last usable admin key: err = %v, want ErrLastAdminKey", err)
+	}
+	if err := limit(second.ID, rps(0.1)); !errors.Is(err, ErrLastAdminKey) {
+		t.Errorf("throttle the last usable admin key: err = %v, want ErrLastAdminKey", err)
+	}
+	// Lowering the throttled key further is still guarded by the usable one;
+	// the CLI isn't guarded at all.
+	if err := limit(only.ID, rps(0.00001)); err != nil {
+		t.Errorf("lower an already throttled key: %v", err)
+	}
+	if _, err := db.PatchAPIKey(ctx, second.ID, APIKeyPatch{SetRateLimitRPS: true, RateLimitRPS: rps(0.1)}, NoLastAdminGuard); err != nil {
+		t.Errorf("CLI throttle: %v", err)
+	}
+}
+
+// An expiry is a removal on a timer: the guard covers it, and a key about to
+// expire doesn't count as the admin key that remains (r1-10).
+func TestAPIKeys_LastAdminGuardExpiry(t *testing.T) {
+	db := authDB(t)
+	ctx := context.Background()
+	in := func(d time.Duration) *time.Time { v := time.Now().Add(d); return &v }
+	expire := func(id int, d time.Duration) error {
+		_, err := db.PatchAPIKey(ctx, id, APIKeyPatch{SetExpiresAt: true, ExpiresAt: in(d)}, GuardLastAdmin)
+		return err
+	}
+
+	only := mustCreateKey(t, db, "only", "admin")
+	if err := expire(only.ID, 5*time.Second); !errors.Is(err, ErrLastAdminKey) {
+		t.Errorf("near-future expiry on the only admin key: err = %v, want ErrLastAdminKey", err)
+	}
+	if err := expire(only.ID, 365*24*time.Hour); !errors.Is(err, ErrLastAdminKey) {
+		t.Errorf("any expiry on the only admin key: err = %v, want ErrLastAdminKey", err)
+	}
+
+	second := mustCreateKey(t, db, "second", "admin")
+	// Another admin key without an expiry outlasts it: allowed.
+	if err := expire(only.ID, time.Hour); err != nil {
+		t.Fatalf("expiry with another lasting admin key: %v", err)
+	}
+	// Now the other one can't be revoked, demoted or given an expiry: the
+	// remaining key would be gone in an hour.
+	if _, err := db.RevokeAPIKey(ctx, second.ID, GuardLastAdmin); !errors.Is(err, ErrLastAdminKey) {
+		t.Errorf("revoke the lasting admin key: err = %v, want ErrLastAdminKey", err)
+	} else if !strings.Contains(err.Error(), "expires before") {
+		t.Errorf("message = %q, want it to explain the expiry", err)
+	}
+	if _, err := db.PatchAPIKey(ctx, second.ID, APIKeyPatch{SetScopes: true, Scopes: scopesOf("edit")}, GuardLastAdmin); !errors.Is(err, ErrLastAdminKey) {
+		t.Errorf("demote the lasting admin key: err = %v, want ErrLastAdminKey", err)
+	}
+	if err := expire(second.ID, 2*time.Hour); !errors.Is(err, ErrLastAdminKey) {
+		t.Errorf("expiry on the lasting admin key: err = %v, want ErrLastAdminKey", err)
+	}
+	// Moving the short expiry later is never guarded; clearing it makes the
+	// other key's changes fine again.
+	if err := expire(only.ID, 3*time.Hour); err != nil {
+		t.Errorf("later expiry: %v", err)
+	}
+	if _, err := db.PatchAPIKey(ctx, only.ID, APIKeyPatch{SetExpiresAt: true}, GuardLastAdmin); err != nil {
+		t.Fatalf("clear expiry: %v", err)
+	}
+	if err := expire(second.ID, 2*time.Hour); err != nil {
+		t.Errorf("expiry once the other key lasts: %v", err)
+	}
+	// Shortening the longest-lived admin key below it is refused too...
+	if err := expire(only.ID, 4*time.Hour); !errors.Is(err, ErrLastAdminKey) {
+		t.Errorf("expiry on the only lasting admin key: err = %v, want ErrLastAdminKey", err)
+	}
+	// ...while both expiring keys can be ordered: the later one outlasts.
+	if err := expire(second.ID, time.Hour); err != nil {
+		t.Errorf("earlier expiry on a key another outlasts: %v", err)
+	}
+	third := mustCreateKey(t, db, "third", "admin")
+	if _, err := db.RevokeAPIKey(ctx, second.ID, GuardLastAdmin); err != nil {
+		t.Errorf("revoke a key the others outlast: %v", err)
+	}
+	if _, err := db.RevokeAPIKey(ctx, third.ID, GuardLastAdmin); err != nil {
+		t.Errorf("revoke one of two lasting keys: %v", err)
+	}
+	if _, err := db.RevokeAPIKey(ctx, only.ID, GuardLastAdmin); !errors.Is(err, ErrLastAdminKey) {
+		t.Errorf("revoke the last admin key: err = %v, want ErrLastAdminKey", err)
+	}
+}
+
 // Concurrent requests that each take away one of the two remaining admin keys
 // must not both pass the guard.
 func TestAPIKeys_LastAdminGuardConcurrent(t *testing.T) {
@@ -392,7 +519,7 @@ func TestBootstrapAdminKey(t *testing.T) {
 	})
 
 	t.Run("not after a legacy admin import", func(t *testing.T) {
-		db := authDB(t)
+		db := upgradedDB(t)
 		mustExec(t, db, `INSERT INTO systems (system_type, name) VALUES ('p25', 'x')`)
 		res, err := db.ImportLegacyAuth(ctx, LegacyAuthInput{WriteToken: "write-token-0123456789"})
 		if err != nil || len(res.Detail.Imported) != 1 {
@@ -596,6 +723,20 @@ func TestAuditLog(t *testing.T) {
 		t.Errorf("page 2 = %+v (%d), %v", got, total, err)
 	}
 
+	// Long paths are capped at a UTF-8 boundary (r1-08).
+	if err := db.InsertAuditLog(ctx, AuditEntry{KeyID: 3, KeyName: "e", Method: "PATCH",
+		Path: "/api/v1/units/" + strings.Repeat("é", 2000) + "?q=1", Status: 400}); err != nil {
+		t.Fatal(err)
+	}
+	var stored string
+	if err := db.Pool.QueryRow(ctx, `SELECT path FROM audit_log WHERE key_id = 3`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.ValidString(stored) || len(stored) > MaxAuditPathBytes+64 || !strings.HasSuffix(stored, "…(truncated, 4014 bytes)") {
+		t.Errorf("stored long path = %d bytes, valid %v, ends %q", len(stored), utf8.ValidString(stored), stored[max(0, len(stored)-40):])
+	}
+	mustExec(t, db, `DELETE FROM audit_log WHERE key_id = 3`)
+
 	if _, err := db.PurgeAuditLogOlderThan(ctx, 0); err == nil {
 		t.Error("purge with zero retention was accepted")
 	}
@@ -650,6 +791,15 @@ func TestMergeSystems_RewritesRestrictions(t *testing.T) {
 	if merged, err := db.AnyMergedAwaySystem(ctx, []int{1, 2, 3}); err != nil || merged {
 		t.Fatalf("before merge: %v, %v", merged, err)
 	}
+	// Directory rows: the source's move to the target (r1-02); the target
+	// keeps its own non-empty values and fills gaps from the source.
+	mustExec(t, db, `INSERT INTO talkgroup_directory (system_id, tgid, alpha_tag, description, category) VALUES
+		(2, 100, 'SWAT-TAC', 'Secret SWAT tactical', 'Secret'),
+		(2, 200, 'FIRE-DISP', 'Fire dispatch', 'Fire'),
+		(1, 100, 'TGT-100', '', NULL),
+		(1, 300, 'EMS-1', 'EMS', 'EMS')`)
+	excl2 := &auth.Principal{Kind: auth.KindKey, KeyID: 99, Scopes: auth.Scopes{auth.ScopeListen},
+		Restrictions: []auth.Restriction{{AllowAll: true, ExcludeTalkgroups: []auth.TG{tg(1, 100)}}}}
 
 	g := auth.Generation()
 	if _, _, _, _, _, _, err := db.MergeSystems(ctx, 2, 1, "test"); err != nil {
@@ -663,10 +813,11 @@ func TestMergeSystems_RewritesRestrictions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Exclusions keep their source entries beside the rewritten ones.
 	want := &auth.Restriction{
 		Systems:           []int{1, 3},
 		Talkgroups:        []auth.TG{tg(1, 100), tg(1, 200)},
-		ExcludeTalkgroups: []auth.TG{tg(1, 5), tg(3, 5)},
+		ExcludeTalkgroups: []auth.TG{tg(1, 5), tg(2, 5), tg(3, 5)},
 	}
 	if !got.Restriction.Equal(want) {
 		t.Errorf("rewritten restriction = %+v, want %+v", got.Restriction, want)
@@ -679,8 +830,51 @@ func TestMergeSystems_RewritesRestrictions(t *testing.T) {
 	}
 	a, err := db.GetAnonymousAccess(ctx)
 	if err != nil || a.Access != AccessListen ||
-		!a.Restriction.Equal(&auth.Restriction{AllowAll: true, ExcludeTalkgroups: []auth.TG{tg(1, 7), tg(1, 8)}}) {
+		!a.Restriction.Equal(&auth.Restriction{AllowAll: true, ExcludeTalkgroups: []auth.TG{tg(1, 7), tg(1, 8), tg(2, 7), tg(2, 8)}}) {
 		t.Errorf("anonymous after merge = %+v, %v", a, err)
+	}
+
+	var srcRows int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM talkgroup_directory WHERE system_id = 2`).Scan(&srcRows); err != nil || srcRows != 0 {
+		t.Errorf("%d directory rows left on the merged-away system (%v)", srcRows, err)
+	}
+	var alpha, desc, cat string
+	if err := db.Pool.QueryRow(ctx, `SELECT alpha_tag, description, category FROM talkgroup_directory
+		WHERE system_id = 1 AND tgid = 100`).Scan(&alpha, &desc, &cat); err != nil ||
+		alpha != "TGT-100" || desc != "Secret SWAT tactical" || cat != "Secret" {
+		t.Errorf("merged directory row 1:100 = %q %q %q (%v)", alpha, desc, cat, err)
+	}
+	dir, total, err := db.SearchTalkgroupDirectory(ctx, excl2, TalkgroupDirectoryFilter{Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dirTGs []string
+	for _, r := range dir {
+		dirTGs = append(dirTGs, fmt.Sprintf("%d:%d", r.SystemID, r.Tgid))
+	}
+	if total != 2 || strings.Join(dirTGs, ",") != "1:200,1:300" {
+		t.Errorf("directory for exclude 1:100 after merge = %v (total %d), want [1:200 1:300]", dirTGs, total)
+	}
+
+	// Restrictions stored after the merge that name the merged-away system
+	// are rewritten as the merge would have rewritten them (r1-11).
+	if a, err := db.SetAnonymousAccess(ctx, AccessListen, &auth.Restriction{AllowAll: true,
+		ExcludeTalkgroups: []auth.TG{tg(2, 5001)}}); err != nil ||
+		!a.Restriction.Equal(&auth.Restriction{AllowAll: true, ExcludeTalkgroups: []auth.TG{tg(1, 5001), tg(2, 5001)}}) {
+		t.Errorf("anonymous policy set after merge = %+v, %v", a.Restriction, err)
+	}
+	if a, _ := db.GetAnonymousAccess(ctx); a.Restriction.AllowsTG(1, 5001) {
+		t.Error("stored anonymous policy allows 1:5001 although 2:5001 (merged into 1) was excluded")
+	}
+	late, err := db.CreateAPIKey(ctx, NewAPIKey{Name: "late", Scopes: scopesOf("listen"),
+		Restriction: &auth.Restriction{Systems: []int{2}, Talkgroups: []auth.TG{tg(2, 9)}}})
+	if err != nil || !late.Restriction.Equal(&auth.Restriction{Systems: []int{1}, Talkgroups: []auth.TG{tg(1, 9)}}) {
+		t.Errorf("key created after merge: %+v, %v", late, err)
+	}
+	patched, err := db.PatchAPIKey(ctx, late.ID, APIKeyPatch{SetRestriction: true,
+		Restriction: &auth.Restriction{AllowAll: true, ExcludeTalkgroups: []auth.TG{tg(2, 6)}}}, GuardLastAdmin)
+	if err != nil || !patched.Restriction.Equal(&auth.Restriction{AllowAll: true, ExcludeTalkgroups: []auth.TG{tg(1, 6), tg(2, 6)}}) {
+		t.Errorf("key patched after merge: %+v, %v", patched, err)
 	}
 
 	for _, c := range []struct {
@@ -702,6 +896,193 @@ func TestMergeSystems_RewritesRestrictions(t *testing.T) {
 	if err := db.Pool.QueryRow(ctx, `SELECT deleted_at IS NOT NULL FROM systems WHERE system_id = 3`).Scan(&deleted); err != nil || deleted {
 		t.Errorf("failed merge was not rolled back (deleted=%v, %v)", deleted, err)
 	}
+}
+
+// An exclusion naming the surviving system of a merge also hides the
+// merged-away ID, whether it was stored before the merge or after, and
+// along a chain of merges: rows written under the old ID around a merge are
+// never moved (r2-07).
+func TestMergeSystems_ExclusionsCoverMergedAwayIDs(t *testing.T) {
+	db := authDB(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO systems (system_id, system_type, name) VALUES
+		(1, 'p25', 'target'), (2, 'p25', 'source'), (5, 'p25', 'a'), (6, 'p25', 'b'), (7, 'p25', 'c')`)
+	tg := func(s, t int) auth.TG { return auth.TG{SystemID: s, Tgid: t} }
+	excluding := func(tgs ...auth.TG) *auth.Restriction {
+		return &auth.Restriction{AllowAll: true, ExcludeTalkgroups: tgs}
+	}
+
+	before, err := db.CreateAPIKey(ctx, NewAPIKey{Name: "before", Scopes: scopesOf("listen"), Restriction: excluding(tg(1, 600))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SetAnonymousAccess(ctx, AccessListen, excluding(tg(1, 600))); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, _, _, err := db.MergeSystems(ctx, 2, 1, "test"); err != nil {
+		t.Fatal(err)
+	}
+	// A straggler: a call written under the merged-away ID after the merge
+	// moved the rows (an ingest that resolved identity before the rewrite).
+	mustExec(t, db, `INSERT INTO calls (system_id, tgid, start_time) VALUES (2, 600, now())`)
+	after, err := db.CreateAPIKey(ctx, NewAPIKey{Name: "after", Scopes: scopesOf("listen"), Restriction: excluding(tg(1, 600))})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	anon, err := db.GetAnonymousAccess(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := map[string]*auth.Restriction{"anonymous": anon.Restriction, "after": after.Restriction}
+	if k, err := db.GetAPIKeyByID(ctx, before.ID); err != nil {
+		t.Fatal(err)
+	} else {
+		stored["before"] = k.Restriction
+	}
+	for name, r := range stored {
+		if !r.Equal(excluding(tg(1, 600), tg(2, 600))) {
+			t.Errorf("%s: stored %+v, want exclusions 1:600 and 2:600", name, r)
+		}
+		p := &auth.Principal{Kind: auth.KindKey, Scopes: auth.Scopes{auth.ScopeListen}, Restrictions: []auth.Restriction{*r}}
+		if p.AllowsTG(2, 600) {
+			t.Errorf("%s: AllowsTG(2, 600) = true", name)
+		}
+		clause, args := p.SQL("c.system_id", "c.tgid", 1)
+		var n int
+		if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM calls c WHERE c.tgid = 600`+clause, args...).Scan(&n); err != nil || n != 0 {
+			t.Errorf("%s: sees %d calls on talkgroup 600 (%v)", name, n, err)
+		}
+	}
+
+	// A chain: 5 merged into 6, then 6 into 7. An exclusion of 7:9, stored
+	// before or after, names all three.
+	chainBefore, err := db.CreateAPIKey(ctx, NewAPIKey{Name: "chain before", Scopes: scopesOf("listen"), Restriction: excluding(tg(7, 9))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, _, _, err := db.MergeSystems(ctx, 5, 6, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, _, _, err := db.MergeSystems(ctx, 6, 7, "test"); err != nil {
+		t.Fatal(err)
+	}
+	chainAfter, err := db.CreateAPIKey(ctx, NewAPIKey{Name: "chain after", Scopes: scopesOf("listen"), Restriction: excluding(tg(7, 9))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := db.GetAPIKeyByID(ctx, chainBefore.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, r := range map[string]*auth.Restriction{"chain before": k.Restriction, "chain after": chainAfter.Restriction} {
+		if !r.Equal(excluding(tg(5, 9), tg(6, 9), tg(7, 9))) {
+			t.Errorf("%s: %+v, want exclusions 5:9, 6:9 and 7:9", name, r)
+		}
+	}
+}
+
+// A merge can grow a stored exclusion list past the 1000-entry input limit;
+// that limit then applies to new input only, so the key and the policy can
+// still be edited, and the policy switched off (r2-11).
+func TestRestrictionsOutgrowingTheInputLimit(t *testing.T) {
+	db := authDB(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO systems (system_id, system_type, name) VALUES (1, 'p25', 'target'), (2, 'p25', 'source')`)
+	big := &auth.Restriction{AllowAll: true}
+	for i := 1; i <= 600; i++ {
+		big.ExcludeTalkgroups = append(big.ExcludeTalkgroups, auth.TG{SystemID: 2, Tgid: i})
+	}
+	key, err := db.CreateAPIKey(ctx, NewAPIKey{Name: "big", Scopes: scopesOf("listen"), Restriction: big})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SetAnonymousAccess(ctx, AccessListen, big); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, _, _, err := db.MergeSystems(ctx, 2, 1, "test"); err != nil {
+		t.Fatal(err)
+	}
+	k, err := db.GetAPIKeyByID(ctx, key.ID)
+	if err != nil || len(k.Restriction.ExcludeTalkgroups) != 1200 {
+		t.Fatalf("stored exclusions after the merge: %v (%v), want 1200", k, err)
+	}
+	stored := k.Restriction
+
+	rps := float32(5)
+	later := time.Now().Add(24 * time.Hour)
+	for name, p := range map[string]APIKeyPatch{
+		"rename":                           {SetName: true, Name: "renamed"},
+		"expiry":                           {SetExpiresAt: true, ExpiresAt: &later},
+		"rate limit":                       {SetRateLimitRPS: true, RateLimitRPS: &rps},
+		"rename with the same restriction": {SetName: true, Name: "again", SetRestriction: true, Restriction: stored},
+	} {
+		if _, err := db.PatchAPIKey(ctx, key.ID, p, GuardLastAdmin); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// A new restriction over the limit is still refused.
+	grown := *stored
+	grown.ExcludeTalkgroups = append(append([]auth.TG{}, stored.ExcludeTalkgroups...), auth.TG{SystemID: 1, Tgid: 9999})
+	if _, err := db.PatchAPIKey(ctx, key.ID, APIKeyPatch{SetRestriction: true, Restriction: &grown}, GuardLastAdmin); !isFieldErr(err, "restriction") {
+		t.Errorf("new oversized restriction: err = %v, want a restriction field error", err)
+	}
+	if _, err := db.CreateAPIKey(ctx, NewAPIKey{Name: "copy", Scopes: scopesOf("listen"), Restriction: stored}); !isFieldErr(err, "restriction") {
+		t.Errorf("new key with an oversized restriction: err = %v, want a restriction field error", err)
+	}
+
+	// The anonymous policy keeps its stored restriction while switching off
+	// and on again (what `access set --anonymous off` and the admin pages do).
+	anon, err := db.GetAnonymousAccess(ctx)
+	if err != nil || len(anon.Restriction.ExcludeTalkgroups) != 1200 {
+		t.Fatalf("anonymous after the merge: %+v (%v)", anon, err)
+	}
+	for _, access := range []string{AccessOff, AccessListen} {
+		if a, err := db.SetAnonymousAccess(ctx, access, anon.Restriction); err != nil || a.Access != access {
+			t.Errorf("set %s with the stored restriction: %+v, %v", access, a, err)
+		}
+	}
+	if _, err := db.SetAnonymousAccess(ctx, AccessListen, &grown); !isFieldErr(err, "restriction") {
+		t.Errorf("new oversized anonymous restriction: err = %v, want a restriction field error", err)
+	}
+}
+
+// A database whose schema this version created is fresh whichever process
+// created it (a CLI command, psql, a server that stopped before its import
+// committed): the old variables are not imported and anonymous access stays
+// off, even with data in it (r2-05). Only a database without the marker,
+// upgraded from an older version, carries them over.
+func TestImportLegacyAuth_SchemaMarkerMeansFresh(t *testing.T) {
+	ctx := context.Background()
+	in := LegacyAuthInput{AdminPassword: "p", AuthToken: strongAuth, WriteToken: strongWrite}
+
+	db := authDB(t) // FreshDatabase false: another process applied the schema
+	var marked bool
+	if err := db.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM data_fixups WHERE name = $1)`, SchemaCreatedFixup).Scan(&marked); err != nil || !marked {
+		t.Fatalf("schema.sql did not write its marker (%v)", err)
+	}
+	mustExec(t, db, `INSERT INTO systems (system_type, name) VALUES ('p25', 'imported')`)
+	res, err := db.ImportLegacyAuth(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertKeyCount(t, db, 0)
+	assertAnonymous(t, db, res, AccessOff)
+	assertRetired(t, db, "")
+	if r, _ := res.Detail.SkipReason("WRITE_TOKEN"); r != SkipFreshDatabase || !res.Detail.FreshDatabase {
+		t.Errorf("detail = %+v", res.Detail)
+	}
+
+	old := upgradedDB(t)
+	mustExec(t, old, `INSERT INTO systems (system_type, name) VALUES ('p25', 'old')`)
+	res, err = old.ImportLegacyAuth(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Detail.FreshDatabase || importedScopes(t, res, "WRITE_TOKEN") != "admin,upload" {
+		t.Errorf("upgraded database: detail = %+v", res.Detail)
+	}
+	assertAnonymous(t, old, res, AccessListen)
 }
 
 // legacyCase is one ImportLegacyAuth scenario on its own database.
@@ -1077,7 +1458,7 @@ func TestImportLegacyAuth(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			db := authDB(t)
+			db := upgradedDB(t)
 			if c.systems {
 				mustExec(t, db, `INSERT INTO systems (system_type, name) VALUES ('p25', 'butco')`)
 			}
@@ -1114,7 +1495,7 @@ func TestImportLegacyAuth(t *testing.T) {
 
 // No secret, or any part of one, ends up in the recorded detail.
 func TestImportLegacyAuth_DetailHasNoSecrets(t *testing.T) {
-	db := authDB(t)
+	db := upgradedDB(t)
 	ctx := context.Background()
 	mustExec(t, db, `INSERT INTO systems (system_type, name) VALUES ('p25', 'x')`)
 	in := LegacyAuthInput{AuthToken: "AAAAauthsecretZZZZ", WriteToken: "BBBBwritesecretYYYY", AdminPassword: "CCCCpasswordXXXX"}

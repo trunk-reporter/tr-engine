@@ -327,6 +327,30 @@ func (db *DB) MergeSystems(ctx context.Context, sourceID, targetID int, performe
 		return 0, 0, 0, 0, 0, 0, fmt.Errorf("delete source units: %w", err)
 	}
 
+	// Merge the talkgroup directory (imported CSV reference data). The
+	// target keeps its non-empty values and takes the source's where it has
+	// none. Leaving the rows on the source would hide them from directory
+	// enrichment of the merged talkgroups, and from restrictions: an
+	// exclusion rewritten to target:tgid would no longer match them.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO talkgroup_directory AS d (system_id, tgid, alpha_tag, mode, description, tag, category, priority, imported_at)
+		SELECT $1, tgid, alpha_tag, mode, description, tag, category, priority, imported_at
+		FROM talkgroup_directory WHERE system_id = $2
+		ON CONFLICT (system_id, tgid) DO UPDATE SET
+			alpha_tag   = COALESCE(NULLIF(d.alpha_tag, ''), EXCLUDED.alpha_tag),
+			mode        = COALESCE(NULLIF(d.mode, ''), EXCLUDED.mode),
+			description = COALESCE(NULLIF(d.description, ''), EXCLUDED.description),
+			tag         = COALESCE(NULLIF(d.tag, ''), EXCLUDED.tag),
+			category    = COALESCE(NULLIF(d.category, ''), EXCLUDED.category),
+			priority    = COALESCE(d.priority, EXCLUDED.priority),
+			imported_at = GREATEST(d.imported_at, EXCLUDED.imported_at)
+	`, targetID, sourceID); err != nil {
+		return 0, 0, 0, 0, 0, 0, fmt.Errorf("merge talkgroup directory: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM talkgroup_directory WHERE system_id = $1`, sourceID); err != nil {
+		return 0, 0, 0, 0, 0, 0, fmt.Errorf("delete source talkgroup directory: %w", err)
+	}
+
 	// Move unit tag suggestions. Evidence records each call's call group so
 	// another site's recording of the same transmission is not counted
 	// twice; point the source's evidence at the groups its calls now belong
@@ -466,6 +490,8 @@ func (db *DB) MergeSystems(ctx context.Context, sourceID, targetID int, performe
 
 	// Point API key and anonymous-policy restrictions at the target, so that
 	// allow lists keep their data and exclusions keep excluding (§3.2).
+	// Exclusions keep their source entries too, for data that still carries
+	// the source ID (auth.Restriction.RewriteSystem).
 	if _, _, err := rewriteRestrictionsForMerge(ctx, tx, sourceID, targetID); err != nil {
 		return 0, 0, 0, 0, 0, 0, fmt.Errorf("rewrite restrictions: %w", err)
 	}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // migration defines a single idempotent schema migration.
@@ -11,6 +13,10 @@ type migration struct {
 	name  string
 	sql   string
 	check string // query that returns true if the migration is already applied
+	// irreversible: applying it removes what an older engine running on the
+	// same database needs (its user accounts, its API key columns), so the
+	// CLI applies it only when asked (PendingMigrations).
+	irreversible bool
 }
 
 // migrations is the ordered list of schema migrations to apply.
@@ -195,7 +201,9 @@ ALTER TABLE systems ADD CONSTRAINT systems_system_type_check
 		// database and works as the manual SQL MigrationError prints. It does
 		// nothing unless api_keys still has the old label column (a database
 		// that gets api_keys from "create api_keys table" already has the new
-		// shape). users is resolved like the old code resolved it (unqualified).
+		// shape). users is resolved like the old code resolved it (unqualified),
+		// and read only if it is tr-engine's (trEngineUsersSQL); otherwise
+		// every key is treated as unowned.
 		//
 		// A user-owned key keeps the lower of its own role and its owner's
 		// current role (viewer < editor < admin) and gets " (<username>)" or
@@ -204,7 +212,8 @@ ALTER TABLE systems ADD CONSTRAINT systems_system_type_check
 		// admin → admin, and service-account keys (the documented upload
 		// credential) also get upload. A role outside the three maps to listen
 		// and the key is revoked.
-		name: "convert api_keys to app keys",
+		name:         "convert api_keys to app keys",
+		irreversible: true,
 		sql: `DO $mig$
 DECLARE
     key_rank  CONSTANT text := $r$CASE k.role WHEN 'admin' THEN 3 WHEN 'editor' THEN 2 WHEN 'viewer' THEN 1 ELSE 0 END$r$;
@@ -224,7 +233,7 @@ BEGIN
         ADD COLUMN IF NOT EXISTS rate_limit_rps real,
         ADD COLUMN IF NOT EXISTS legacy boolean NOT NULL DEFAULT false';
 
-    IF to_regclass('users') IS NOT NULL THEN
+    IF ` + trEngineUsersSQL + ` THEN
         EXECUTE 'UPDATE api_keys k SET revoked_at = COALESCE(k.revoked_at, now())
                  FROM users u WHERE u.id = k.user_id AND u.enabled IS NOT TRUE';
         EXECUTE $q$
@@ -263,12 +272,14 @@ $mig$`,
 		// tr-engine has no user accounts any more. Record who had one
 		// (data_fixups 'removed-user-accounts', logged once at startup) and drop
 		// the table. Runs after "convert api_keys to app keys", which reads it.
-		name: "record and drop users",
+		// A users table that isn't tr-engine's (trEngineUsersSQL) is left alone.
+		name:         "record and drop users",
+		irreversible: true,
 		sql: `DO $mig$
 DECLARE
     login_col text := 'NULL::timestamptz';
 BEGIN
-    IF to_regclass('users') IS NULL THEN
+    IF NOT ` + trEngineUsersSQL + ` THEN
         RETURN;
     END IF;
     IF EXISTS (SELECT 1 FROM pg_attribute
@@ -285,7 +296,7 @@ BEGIN
     EXECUTE 'DROP TABLE users CASCADE';
 END
 $mig$`,
-		check: `SELECT to_regclass('users') IS NULL`,
+		check: `SELECT NOT ` + trEngineUsersSQL,
 	},
 	{
 		name: "create auth_settings table",
@@ -317,42 +328,92 @@ $mig$`,
 	},
 }
 
+// trEngineUsersSQL is a SQL condition: the relation "users" resolves to
+// (unqualified, as the old engine resolved it) is the user table old
+// tr-engine versions created. It has the columns the auth migrations read,
+// and the trigger or role CHECK the old "create users table" migration
+// created with it. That migration skipped creating the table when any
+// "users" table existed, and then used it, so a database shared with another
+// application may hold that application's "users" table: it is never read
+// as tr-engine's user list or dropped.
+const trEngineUsersSQL = `(to_regclass('users') IS NOT NULL
+        AND (SELECT count(*) FROM pg_attribute WHERE attrelid = to_regclass('users')
+             AND attname IN ('username', 'role', 'enabled') AND attnum > 0 AND NOT attisdropped) = 3
+        AND (EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass('users') AND tgname = 'trg_users_updated_at')
+             OR EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass('users') AND contype = 'c'
+                        AND pg_get_constraintdef(oid) LIKE '%''viewer''%'
+                        AND pg_get_constraintdef(oid) LIKE '%''editor''%')))`
+
+// PendingMigration is a migration Migrate would apply now.
+type PendingMigration struct {
+	Name string
+	// Irreversible: it converts the old API keys or drops the old user
+	// accounts, which an older engine on the same database then loses.
+	Irreversible bool
+}
+
+// PendingMigrations returns the migrations Migrate would apply now, in
+// order, as Migrate decides it (a check that fails counts as pending).
+func (db *DB) PendingMigrations(ctx context.Context) ([]PendingMigration, error) {
+	conn, err := db.Pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire connection: %w", err)
+	}
+	defer conn.Release()
+	var pending []PendingMigration
+	for _, m := range migrations {
+		if m.check != "" {
+			var exists bool
+			if err := conn.QueryRow(ctx, m.check).Scan(&exists); err == nil && exists {
+				continue
+			}
+		}
+		pending = append(pending, PendingMigration{Name: m.name, Irreversible: m.irreversible})
+	}
+	return pending, nil
+}
+
 // Migrate runs all pending schema migrations.
 // For each migration, it first checks whether the change is already present.
 // If not, it attempts to apply it. If the apply fails (e.g. insufficient
 // privileges), the error is returned — the caller should treat this as fatal
 // since the application's queries depend on these columns existing.
+//
+// It holds schemaLockKey throughout, so a second process starting at the same
+// time waits, then finds the migrations applied.
 func (db *DB) Migrate(ctx context.Context) error {
-	var pending []migration
-	for _, m := range migrations {
-		if m.check != "" {
-			var exists bool
-			if err := db.Pool.QueryRow(ctx, m.check).Scan(&exists); err == nil && exists {
-				continue
+	return db.withSchemaLock(ctx, func(conn *pgxpool.Conn) error {
+		var pending []migration
+		for _, m := range migrations {
+			if m.check != "" {
+				var exists bool
+				if err := conn.QueryRow(ctx, m.check).Scan(&exists); err == nil && exists {
+					continue
+				}
 			}
+			pending = append(pending, m)
 		}
-		pending = append(pending, m)
-	}
 
-	if len(pending) == 0 {
+		if len(pending) == 0 {
+			return nil
+		}
+
+		// Try to apply each pending migration
+		applied := 0
+		for _, m := range pending {
+			if _, err := conn.Exec(ctx, m.sql); err != nil {
+				return &MigrationError{
+					failed:  m,
+					pending: pending[applied:],
+					err:     err,
+				}
+			}
+			db.log.Info().Str("migration", m.name).Msg("schema migration applied")
+			applied++
+		}
+		db.log.Info().Int("applied", applied).Msg("schema migrations complete")
 		return nil
-	}
-
-	// Try to apply each pending migration
-	applied := 0
-	for _, m := range pending {
-		if _, err := db.Pool.Exec(ctx, m.sql); err != nil {
-			return &MigrationError{
-				failed:  m,
-				pending: pending[applied:],
-				err:     err,
-			}
-		}
-		db.log.Info().Str("migration", m.name).Msg("schema migration applied")
-		applied++
-	}
-	db.log.Info().Int("applied", applied).Msg("schema migrations complete")
-	return nil
+	})
 }
 
 // MigrationError is returned when a migration fails.

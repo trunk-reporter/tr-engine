@@ -234,9 +234,21 @@ async function checkAdminKey(key) {
   return '';
 }
 
+// Pasted keys are cleaned like everywhere else (auth.js trAuth.cleanKey): a
+// curly quote or zero-width character would make fetch() throw before
+// sending, which would look like a network failure.
+function cleanKey(raw) {
+  if (window.trAuth && typeof trAuth.cleanKey === 'function') return trAuth.cleanKey(raw);
+  var k = String(raw == null ? '' : raw).trim();
+  return { key: k, error: k ? '' : 'Paste an API key.' };
+}
+
 async function init(key) {
-  key = String(key || sessionGet()).trim();
-  if (!key) { showNoAccess(''); return; }
+  var raw = String(key || sessionGet());
+  if (!raw.trim()) { showNoAccess(''); return; }
+  var cleaned = cleanKey(raw);
+  if (cleaned.error) { showNoAccess(cleaned.error); return; }
+  key = cleaned.key;
   var problem = await checkAdminKey(key);
   if (problem) { showNoAccess(problem); return; }
   adminKey = key;
@@ -279,17 +291,22 @@ function fmtNum(n) {
   return (n / 1000000).toFixed(1) + 'M';
 }
 
+// A Go duration as the engine sends it ("8760h0m0s", "1h30m0s", "90s"),
+// in the largest unit that reads well ('' when it isn't a duration).
 function fmtDuration(d) {
   if (!d) return '';
-  var h = 0, m = 0;
-  var s = d.replace(/[smhd]$/, '');
-  var unit = d.slice(-1);
-  var val = parseFloat(s) || 0;
-  if (unit === 'm') return Math.round(val) + ' min';
-  if (unit === 'd') return Math.round(val) + ' days';
-  if (unit === 's') return Math.round(val) + ' sec';
-  if (val >= 720) return (val / 24) + 'd';
-  return val + 'h';
+  var unitSecs = { h: 3600, m: 60, s: 1, ms: 0.001 };
+  var secs = 0;
+  var rest = String(d).replace(/(\d+(?:\.\d+)?)(ms|h|m|s)/g, function(all, n, u) {
+    secs += parseFloat(n) * unitSecs[u];
+    return '';
+  });
+  if (rest) return '';
+  function num(x) { return String(Math.round(x * 10) / 10); }
+  if (secs >= 2 * 86400) return num(secs / 86400) + ' days';
+  if (secs >= 3600) return num(secs / 3600) + 'h';
+  if (secs >= 60) return num(secs / 60) + ' min';
+  return num(secs) + ' sec';
 }
 
 // ── Storage Stats ──
@@ -372,7 +389,8 @@ function toggleExpand(table) {
 
 var retentionKeys = [
   'retention_raw_messages', 'retention_console_logs', 'retention_plugin_status',
-  'retention_trunking_messages', 'retention_checkpoints', 'retention_stale_calls'
+  'retention_trunking_messages', 'retention_checkpoints', 'retention_stale_calls',
+  'retention_audit_log'
 ];
 
 async function loadConfig() {

@@ -46,7 +46,9 @@ The endpoint reads the key from, in order:
 
 Form fields are read from the multipart body only, never from the URL query string. A field that holds an unknown, revoked or expired key is rejected with `401 invalid_key`; the other field is not tried.
 
-Give each trunk-recorder host its own `upload`-only key, so you can revoke one without touching the others, and so a leaked plugin config can't read or change anything. When an upload is rejected, tr-engine logs a WARN (at most once a minute per client IP) with the IP, the system name from the form, and the reason: no key, unknown key, or "key #N lacks upload".
+Give each trunk-recorder host its own `upload`-only key, so you can revoke one without touching the others, and so a leaked plugin config can't read or change anything. When an upload is rejected, tr-engine logs a WARN "call upload rejected" (at most once a minute per client IP) with the IP, the system name from the form, and the reason in its `reason` field: `no key`, `unknown key`, `key #N lacks upload`, `request body too large`, ...
+
+**Rate limits.** A key in the `key`/`api_key` form field is not a header credential, so these uploads are rate-limited **per client IP** like requests without a key (`RATE_LIMIT_RPS`, default 20 per second with bursts of `RATE_LIMIT_BURST`, default 40), and cost two tokens when the key isn't in the engine's 30-second key cache, and always for a legacy (imported) key such as an imported `WRITE_TOKEN`, so those uploads get half the per-IP rate. A trunk-recorder host that uploads faster than that, for example while clearing a backlog, gets `429 rate_limited`. If the uploader can send `Authorization: Bearer <key>` instead, a normal key isn't IP-limited (unless it has its own `--rate-limit`), while a legacy key still costs one IP token per upload; otherwise raise `RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`. Replace legacy upload keys with a new `upload` key (see [migrating-auth.md](migrating-auth.md#upload-plugins)).
 
 Upgrading from a version that used `AUTH_TOKEN` or `WRITE_TOKEN` for uploads? See [migrating-auth.md](migrating-auth.md#upload-plugins) for which old credentials still work.
 
@@ -192,16 +194,31 @@ Each call is uploaded to both services independently. The `apiKey` in the `syste
 4. The call goes through the standard ingest pipeline: identity resolution (auto-creates systems/sites), dedup check, call record creation, audio file storage, source/frequency processing, unit upserts, SSE event publishing, and transcription enqueue
 5. Returns `201 Created` with the call ID, or `409 Conflict` if the call is a duplicate
 
+### Where the audio is stored
+
+Uploaded audio is saved under the audio directory (or storage backend) as `upload/<system_id>/<YYYY-MM-DD>/<call_id>.<ext>`, with the UTC date of the call's start time. `ext` is `m4a`, `mp3`, `wav`, `ogg` or `bin`, taken from `audioType` or, failing that, the uploaded file's name (nothing declared means `m4a`; anything unrecognized is stored as `bin`). Every part of the path is chosen by tr-engine, never by the uploader, and an upload never overwrites a file: if one already exists under that name (left over from an earlier database), the upload is saved as `<call_id>-<random hex>.<ext>` instead, with a WARN.
+
+### What an upload may claim
+
+tr-engine refuses, with `400 invalid_body` and a message saying why:
+
+- a system short name (`systemLabel`, `system` or `short_name`) containing `/`, `\`, `..` or control characters, or longer than 128 bytes;
+- a talkgroup that is not a positive integer;
+- a missing or non-positive start time (`dateTime` / `start_time`);
+- a start time more than 10 minutes in the future (check the uploader's clock);
+- a start time in a month that has no database partition yet and lies outside the months tr-engine creates partitions for on demand: from 12 months before the current month to 3 months after it. (Partitions are permanent, so a bogus timestamp must not create them for arbitrary months.) To load older calls, use `WATCH_DIR` backfill, which creates older partitions itself.
+
 ## Responses
 
 | Status | Meaning |
 |--------|---------|
-| `201 Created` | Call ingested successfully. Response body contains `call_id`, `system_id`, `tgid`, `start_time`. |
-| `400 Bad Request` | Invalid multipart form, unrecognized format, or missing required fields. |
-| `401 Unauthorized` | `key_required` (no key) or `invalid_key` (unknown, revoked or expired key). |
+| `201 Created` | Call ingested successfully. Response body contains `call_id`, `system_id`, `tgid`, `start_time` and, when the audio was saved, `audio_file_path` (`upload/<system_id>/<YYYY-MM-DD>/<call_id>.<ext>`). |
+| `400 Bad Request` | Unrecognized format (`bad_request`), missing or malformed required fields, a refused short name, talkgroup or start time ([above](#what-an-upload-may-claim)), or (with a Bearer key) an invalid multipart form (`invalid_body`). |
+| `401 Unauthorized` | `key_required` (no key; also a body that isn't multipart without a Bearer header, or the old public `AUTH_TOKEN` in the form) or `invalid_key` (unknown, revoked or expired key). |
 | `403 Forbidden` | `insufficient_scope`: the key is valid but lacks the `upload` scope. |
 | `409 Conflict` | Duplicate call (same system, talkgroup, and start time within 5 seconds). |
 | `413 Request Too Large` | Upload exceeds the 50 MB limit. |
+| `429 Too Many Requests` | `rate_limited`: the per-IP limit for form-field keys (see above); wait `Retry-After` seconds. |
 
 ## Environment Variables
 

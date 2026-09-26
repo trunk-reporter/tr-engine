@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -19,6 +20,9 @@ import (
 type mockAudioStreamer struct {
 	bus     *audio.AudioBus
 	enabled bool
+	// streams are the live streams the mock reports (AudioJitterStats), and
+	// their count its ActiveEncoders.
+	streams map[string]audio.StreamJitterSnapshot
 }
 
 func (m *mockAudioStreamer) SubscribeAudio(filter audio.AudioFilter, principal *atomic.Pointer[auth.Principal]) (<-chan audio.AudioFrame, func()) {
@@ -32,11 +36,11 @@ func (m *mockAudioStreamer) UpdateAudioFilter(ch <-chan audio.AudioFrame, filter
 func (m *mockAudioStreamer) AudioStreamEnabled() bool { return m.enabled }
 
 func (m *mockAudioStreamer) AudioStreamStatus() *AudioStreamStatusData {
-	return &AudioStreamStatusData{Enabled: m.enabled, ConnectedClients: m.bus.SubscriberCount()}
+	return &AudioStreamStatusData{Enabled: m.enabled, ConnectedClients: m.bus.SubscriberCount(), ActiveEncoders: len(m.streams)}
 }
 
 func (m *mockAudioStreamer) AudioJitterStats() map[string]audio.StreamJitterSnapshot {
-	return nil
+	return m.streams
 }
 
 // newTestAudioStreamServer creates a test HTTP server with the audio stream
@@ -50,8 +54,15 @@ func newTestAudioStreamServer(streamer AudioStreamer, maxClients int) *httptest.
 // newTestAudioStreamServerAs is newTestAudioStreamServer with every
 // connection acting as p (nil: no principal, as without the pipeline).
 func newTestAudioStreamServerAs(streamer AudioStreamer, maxClients int, p *auth.Principal) *httptest.Server {
+	return newTestAudioStreamServerWith(streamer, maxClients, p, defaultKeepaliveInterval)
+}
+
+// newTestAudioStreamServerWith is newTestAudioStreamServerAs with the given
+// keepalive interval.
+func newTestAudioStreamServerWith(streamer AudioStreamer, maxClients int, p *auth.Principal, keepalive time.Duration) *httptest.Server {
 	r := chi.NewRouter()
 	h := NewAudioStreamHandler(streamer, maxClients)
+	h.keepaliveInterval = keepalive
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -233,5 +244,129 @@ func TestAudioStreamMaxClients(t *testing.T) {
 	}
 	if resp != nil && resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+}
+
+// A client message larger than wsMaxMessageBytes closes the connection
+// (1009) instead of being buffered whole (r1-01).
+func TestAudioStreamReadLimit(t *testing.T) {
+	streamer := &mockAudioStreamer{bus: audio.NewAudioBus(), enabled: true}
+	srv := newTestAudioStreamServer(streamer, 10)
+	defer srv.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv, "/api/v1/audio/live"), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	big := []byte(`{"type":"subscribe","tgids":[` + strings.Repeat("1,", wsMaxMessageBytes/2) + `1]}`)
+	if err := conn.WriteMessage(websocket.TextMessage, big); err != nil {
+		// The server may already have closed the connection mid-frame.
+		t.Logf("write oversized message: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		_, _, err := conn.ReadMessage()
+		if err == nil {
+			continue
+		}
+		if websocket.IsCloseError(err, websocket.CloseMessageTooBig) {
+			return
+		}
+		var ne interface{ Timeout() bool }
+		if errors.As(err, &ne) && ne.Timeout() {
+			t.Fatal("connection still open after an oversized message")
+		}
+		// Any other error (connection reset while the frame was still being
+		// written) also means the server gave up on the connection.
+		return
+	}
+}
+
+// A normal-sized subscribe message still works after the limit is set.
+func TestAudioStreamSubscribeWithinLimit(t *testing.T) {
+	bus := audio.NewAudioBus()
+	streamer := &mockAudioStreamer{bus: bus, enabled: true}
+	srv := newTestAudioStreamServer(streamer, 10)
+	defer srv.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv, "/api/v1/audio/live"), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+	tgids := make([]int, 1000)
+	for i := range tgids {
+		tgids[i] = 100000 + i
+	}
+	msg, _ := json.Marshal(subscribeMsg{Type: "subscribe", TGIDs: tgids})
+	if len(msg) >= wsMaxMessageBytes {
+		t.Fatalf("test message is %d bytes, over the limit", len(msg))
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	bus.Publish(audio.AudioFrame{SystemID: 1, TGID: 100999, SampleRate: 8000, Format: audio.AudioFormatPCM, Data: []byte{1}})
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if mt, _, err := conn.ReadMessage(); err != nil || mt != websocket.BinaryMessage {
+		t.Fatalf("read after subscribe: type %d, err %v; want a binary frame", mt, err)
+	}
+}
+
+// The keepalive comes with a ping, and a restricted principal's
+// active_streams counts only the streams it may hear (r1-12).
+func TestAudioStreamKeepaliveCounts(t *testing.T) {
+	streams := map[string]audio.StreamJitterSnapshot{
+		"1:100": {SystemID: 1, TGID: 100},
+		"1:101": {SystemID: 1, TGID: 101},
+		"2:100": {SystemID: 2, TGID: 100},
+	}
+	allowed := &auth.Restriction{Talkgroups: []auth.TG{{SystemID: 1, Tgid: 100}}}
+	excluded := &auth.Restriction{AllowAll: true, ExcludeTalkgroups: []auth.TG{{SystemID: 1, Tgid: 101}}}
+	for _, c := range []struct {
+		name string
+		p    *auth.Principal
+		want float64
+	}{
+		{"unrestricted", &auth.Principal{Kind: auth.KindKey, KeyID: 1, Scopes: auth.Scopes{auth.ScopeListen}}, 3},
+		{"allow list", &auth.Principal{Kind: auth.KindKey, KeyID: 2, Scopes: auth.Scopes{auth.ScopeListen},
+			Restrictions: []auth.Restriction{*allowed}}, 1},
+		{"exclusion", &auth.Principal{Kind: auth.KindAnonymous, Scopes: auth.Scopes{auth.ScopeListen},
+			Restrictions: []auth.Restriction{*excluded}}, 2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			streamer := &mockAudioStreamer{bus: audio.NewAudioBus(), enabled: true, streams: streams}
+			srv := newTestAudioStreamServerWith(streamer, 10, c.p, 100*time.Millisecond)
+			defer srv.Close()
+
+			conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv, "/api/v1/audio/live"), nil)
+			if err != nil {
+				t.Fatalf("dial failed: %v", err)
+			}
+			defer conn.Close()
+			var pings atomic.Int32
+			conn.SetPingHandler(func(data string) error {
+				pings.Add(1)
+				return conn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(time.Second))
+			})
+
+			conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				t.Fatalf("read failed: %v", err)
+			}
+			var msg map[string]any
+			if err := json.Unmarshal(data, &msg); err != nil {
+				t.Fatal(err)
+			}
+			if msg["type"] != "keepalive" || msg["active_streams"] != c.want {
+				t.Errorf("keepalive = %v, want active_streams %v", msg, c.want)
+			}
+			if pings.Load() == 0 {
+				t.Error("no ping arrived with the keepalive")
+			}
+		})
 	}
 }

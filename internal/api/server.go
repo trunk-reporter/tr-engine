@@ -82,6 +82,9 @@ func NewServer(opts ServerOptions) *Server {
 		// WriteTimeout set to 0 to allow long-lived SSE connections.
 		// Individual non-streaming handlers complete quickly due to DB query timeouts.
 		WriteTimeout: 0,
+		// The request line and headers: generous for long filter query
+		// strings and tickets, far below the 1 MB default.
+		MaxHeaderBytes: maxHeaderBytes,
 	}
 
 	return &Server{
@@ -90,6 +93,9 @@ func NewServer(opts ServerOptions) *Server {
 		health: health,
 	}
 }
+
+// maxHeaderBytes limits the request line plus headers (http.Server).
+const maxHeaderBytes = 64 << 10
 
 // routerOptions are buildRouter's dependencies.
 type routerOptions struct {

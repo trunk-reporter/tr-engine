@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 )
@@ -34,7 +35,15 @@ func RequestID(next http.Handler) http.Handler {
 func Logger(log zerolog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		h := hlog.NewHandler(log)
+		// Every request gets an access line, refusals included: failed and
+		// anonymous attempts are recorded nowhere else (§9). hlog's writer
+		// keeps http.Hijacker, so WebSocket upgrades work through it; their
+		// line is written when the socket closes.
 		accessLog := hlog.AccessHandler(func(r *http.Request, status, size int, dur time.Duration) {
+			if status == 0 && websocket.IsWebSocketUpgrade(r) {
+				// The upgrade wrote 101 on the hijacked connection.
+				status = http.StatusSwitchingProtocols
+			}
 			hlog.FromRequest(r).Info().
 				Str("method", r.Method).
 				Str("path", r.URL.Path).
@@ -43,15 +52,7 @@ func Logger(log zerolog.Logger) func(http.Handler) http.Handler {
 				Dur("duration_ms", dur).
 				Msg("request")
 		})
-		return h(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Skip access log wrapping for WebSocket endpoints — hlog's
-			// statusWriter doesn't implement http.Hijacker, breaking upgrades.
-			if strings.HasSuffix(r.URL.Path, "/audio/live") {
-				next.ServeHTTP(w, r)
-				return
-			}
-			accessLog(next).ServeHTTP(w, r)
-		}))
+		return h(accessLog(next))
 	}
 }
 

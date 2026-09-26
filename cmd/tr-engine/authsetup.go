@@ -132,9 +132,15 @@ func warnLegacyVariables(ctx context.Context, db *database.DB, legacy config.Leg
 // legacyValueCheck is what the engine does with a set AUTH_TOKEN or
 // WRITE_TOKEN value now.
 type legacyValueCheck struct {
-	value   string
-	keyID   int  // the API key whose secret it is; 0 = none
-	retired bool // the retired (or forgotten) public AUTH_TOKEN
+	value     string
+	keyID     int                // the API key whose secret it is (any status); 0 = none
+	keyStatus database.KeyStatus // that key's status
+	// retired: the stored retired public AUTH_TOKEN; requests carrying it
+	// are treated as anonymous (it is checked before the keys).
+	retired bool
+	// forgotten: a retired public AUTH_TOKEN forgotten with `tr-engine access
+	// forget-retired-token`; requests carrying it are looked up as a key.
+	forgotten bool
 }
 
 func checkLegacyValue(ctx context.Context, db *database.DB, value string) (legacyValueCheck, error) {
@@ -143,64 +149,109 @@ func checkLegacyValue(ctx context.Context, db *database.DB, value string) (legac
 	k, err := db.ResolveAPIKeyByHash(ctx, hash)
 	switch {
 	case err == nil:
-		c.keyID = k.ID
+		c.keyID, c.keyStatus = k.ID, k.Status
 	case !errors.Is(err, database.ErrAPIKeyNotFound):
 		return c, err
 	}
-	if c.retired, err = db.IsRetiredPublicToken(ctx, hash); err != nil {
+	// The same test the API makes (authenticator.resolveKey): only the
+	// stored retired token counts as no credential.
+	stored, err := db.GetRetiredPublicTokenHash(ctx)
+	if err != nil {
 		return c, err
 	}
+	c.retired = stored != "" && stored == hash
+	if !c.retired {
+		// IsRetiredPublicToken also matches the forgotten ones.
+		if c.forgotten, err = db.IsRetiredPublicToken(ctx, hash); err != nil {
+			return c, err
+		}
+	}
 	return c, nil
+}
+
+// keyStatusNote is added to a message naming the key check.keyID when that
+// key no longer works.
+func keyStatusNote(check *legacyValueCheck) string {
+	if check == nil || check.keyID == 0 {
+		return ""
+	}
+	switch check.keyStatus {
+	case database.KeyRevoked, database.KeyExpired:
+		return "; that key is " + string(check.keyStatus) + ", so clients sending it get 401 invalid_key"
+	}
+	return ""
 }
 
 // legacyVariableWarning is the per-start message for a removed auth variable
 // that is still set. check is what this process's AUTH_TOKEN or WRITE_TOKEN
 // value is now (nil when unknown: the message then follows the import's
-// record alone).
+// record alone). The import's record is used only when it describes this
+// value; otherwise the message says what the value is now.
 func legacyVariableWarning(name string, res database.LegacyAuthResult, check *legacyValueCheck) string {
 	const remove = " — remove it from your configuration; see docs/migrating-auth.md"
 	switch name {
 	case "AUTH_TOKEN", "WRITE_TOKEN":
-		// notThisValue: the import's record is about another value.
-		notThisValue := name + " is set to a value the one-time import on " + res.ImportedAt.UTC().Format("2006-01-02") +
-			" did not import (it recorded a different one), so clients sending it get 401 invalid_key: " +
-			"if it is still in use, register it with tr-engine keys import; otherwise remove it. See docs/migrating-auth.md"
+		date := res.ImportedAt.UTC().Format("2006-01-02")
+		// plain: the value is no key and no retired or forgotten token (or
+		// unknown), so a record that doesn't depend on the value describes it.
+		plain := check == nil || (check.keyID == 0 && !check.retired && !check.forgotten)
+		// recorded: the import recorded another value of this variable.
+		recorded := false
 		if k, ok := res.Detail.ImportedKey(name); ok {
-			if check != nil && check.keyID != k.KeyID {
-				return notThisValue
+			if check == nil || (check.keyID == k.KeyID && !check.retired) {
+				return fmt.Sprintf("%s is no longer used (imported as API key #%d '%s' on %s%s)%s",
+					name, k.KeyID, k.Name, date, keyStatusNote(check), remove)
 			}
-			return fmt.Sprintf("%s is no longer used (imported as API key #%d '%s' on %s)%s",
-				name, k.KeyID, k.Name, res.ImportedAt.UTC().Format("2006-01-02"), remove)
+			recorded = true
+		} else if reason, ok := res.Detail.SkipReason(name); ok {
+			switch reason {
+			case database.SkipPublicToken:
+				switch {
+				case check == nil || check.retired:
+					return name + " is no longer used (it was the public read token, so it was not imported; requests that still carry it are treated as anonymous)" + remove
+				case check.forgotten:
+					return name + " is no longer used (it was the public read token, so it was not imported, and it was forgotten with tr-engine access forget-retired-token: requests that still carry it get 401 invalid_key)" + remove
+				}
+				recorded = true
+			case database.SkipPublishedAsPublic:
+				if check == nil || check.retired || check.forgotten {
+					return name + " is no longer used (it equalled the public AUTH_TOKEN, so it was not imported)" + remove
+				}
+				recorded = true
+			case database.SkipShellSubstitution:
+				if check == nil || (plain && strings.Contains(check.value, "$(")) {
+					return name + ` is no longer used (it contained "$(", so it was not imported)` + remove
+				}
+				recorded = true
+			case database.SkipSameAsWriteToken:
+				w, ok := res.Detail.ImportedKey("WRITE_TOKEN")
+				if check == nil || (ok && check.keyID == w.KeyID && !check.retired) {
+					return name + " is no longer used (it equalled WRITE_TOKEN, imported as that key" + keyStatusNote(check) + ")" + remove
+				}
+				recorded = true
+			case database.SkipFreshDatabase:
+				if plain {
+					return name + " is no longer used (not imported into a new database; clients use API keys)" + remove
+				}
+			case database.SkipAuthDisabled:
+				if plain {
+					return name + " is no longer used (not imported: AUTH_ENABLED=false disabled it)" + remove
+				}
+			}
 		}
-		reason, _ := res.Detail.SkipReason(name)
-		switch reason {
-		case database.SkipPublicToken:
-			if check != nil && !check.retired {
-				return notThisValue
-			}
-			return name + " is no longer used (it was the public read token, so it was not imported; requests that still carry it are treated as anonymous)" + remove
-		case database.SkipPublishedAsPublic:
-			if check != nil && !check.retired {
-				return notThisValue
-			}
-			return name + " is no longer used (it equalled the public AUTH_TOKEN, so it was not imported)" + remove
-		case database.SkipShellSubstitution:
-			if check != nil && !strings.Contains(check.value, "$(") {
-				return notThisValue
-			}
-			return name + ` is no longer used (it contained "$(", so it was not imported)` + remove
-		case database.SkipFreshDatabase:
-			return name + " is no longer used (not imported into a new database; clients use API keys)" + remove
-		case database.SkipAuthDisabled:
-			return name + " is no longer used (not imported: AUTH_ENABLED=false disabled it)" + remove
-		case database.SkipSameAsWriteToken:
-			if w, ok := res.Detail.ImportedKey("WRITE_TOKEN"); check != nil && (!ok || check.keyID != w.KeyID) {
-				return notThisValue
-			}
-			return name + " is no longer used (it equalled WRITE_TOKEN, imported as that key)" + remove
-		}
-		if check != nil && check.keyID != 0 {
-			return fmt.Sprintf("%s is no longer used (its value is API key #%d)%s", name, check.keyID, remove)
+		// The import's record doesn't describe this value: say what it is.
+		switch {
+		case check == nil:
+		case check.retired:
+			return name + " is no longer used (its value is the retired public read token, so requests that still carry it are treated as anonymous)" + remove
+		case check.forgotten:
+			return name + " is no longer used (its value is a public read token that was forgotten with tr-engine access forget-retired-token: requests that still carry it get 401 invalid_key)" + remove
+		case check.keyID != 0:
+			return fmt.Sprintf("%s is no longer used (its value is API key #%d%s)%s", name, check.keyID, keyStatusNote(check), remove)
+		case recorded:
+			return name + " is set to a value the one-time import on " + date +
+				" did not import (it recorded a different one), so clients sending it get 401 invalid_key: " +
+				"if it is still in use, register it with tr-engine keys import; otherwise remove it. See docs/migrating-auth.md"
 		}
 		return name + " is no longer used — clients use API keys; register a secret that is still in use with tr-engine keys import. See docs/auth.md"
 	case "ADMIN_PASSWORD", "ADMIN_USERNAME", "JWT_SECRET":

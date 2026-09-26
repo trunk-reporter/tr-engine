@@ -63,12 +63,16 @@
     try { return new RegExp('[\\p{Cc}\\p{Cf}]', 'u'); } catch (e) { return /[\x00-\x1f\x7f-\x9f]/; }
   })();
 
-  // What an Authorization header can carry for a key: printable ASCII without
-  // spaces. Browsers refuse to send anything outside ISO-8859-1 (fetch throws
-  // before any request, which looks like a network failure), and the engine
-  // hashes the bytes it receives, so a non-ASCII value could never match.
+  // What this page accepts as a key: printable ASCII (U+0020-U+007E) after
+  // trimming. fetch throws before sending a header value with a line break or
+  // a character above U+00FF (which looks like a network failure), and Latin-1
+  // characters go out as single bytes that never match the UTF-8 the engine
+  // hashed at import, so both are refused here. Tabs are refused too: a legacy
+  // token containing one should be replaced with a real key. Inner spaces are
+  // allowed: an imported legacy key (AUTH_TOKEN/WRITE_TOKEN) may contain them,
+  // and the engine accepts it.
   function isSendableKey(key) {
-    return /^[\x21-\x7e]+$/.test(key);
+    return /^[\x20-\x7e]+$/.test(key);
   }
 
   function describeChar(ch) {
@@ -76,16 +80,15 @@
     while (hex.length < 4) hex = '0' + hex;
     var code = 'U+' + hex;
     if (CONTROL_CHAR.test(ch)) return 'an invisible character (' + code + ')';
+    if (/\s/.test(ch)) return 'a special space (' + code + ')';
     return '"' + ch + '" (' + code + ')';
   }
 
-  // Cleans a pasted key before it is sent: drops invisible characters,
-  // surrounding whitespace and typographic quotes, and straight quotes around
-  // a well-formed tre_ key (e.g. copied from KEY="tre_..."). Other straight
-  // quotes are kept, since an imported legacy key may contain them.
-  // Returns {key, error}: error is '' when key can be sent, otherwise a
-  // message saying why the value can't be a key (and key is '').
-  function cleanKey(raw) {
+  // Drops invisible characters, surrounding whitespace and typographic quotes,
+  // and straight quotes around a well-formed tre_ key (e.g. copied from
+  // KEY="tre_..."). Other straight quotes are kept, since an imported legacy
+  // key may contain them.
+  function normalizeKey(raw) {
     var key = String(raw == null ? '' : raw).replace(INVISIBLE_CHARS, '').trim()
       .replace(TYPO_QUOTES_AROUND, '').trim();
     var q = key.charAt(0);
@@ -93,8 +96,21 @@
       var unquoted = key.slice(1, -1).trim();
       if (MINTED_KEY.test(unquoted)) key = unquoted;
     }
+    return key;
+  }
+
+  // Cleans a pasted key before it is sent (normalizeKey), then refuses a
+  // value that can't be sent in a header (isSendableKey) and a key minted by
+  // tr-engine (tre_...) with a space in it. Anything else is left to the
+  // engine, which answers 401 invalid_key for a wrong value.
+  // Returns {key, error}: error is '' when key can be sent, otherwise a
+  // message saying why the value can't be a key (and key is '').
+  function cleanKey(raw) {
+    var key = normalizeKey(raw);
     if (!key) return { key: '', error: 'Paste an API key.' };
-    if (/\s/.test(key)) return { key: '', error: 'An API key has no spaces or line breaks.' };
+    if (/[\t\n\v\f\r\u0085\u2028\u2029]/.test(key)) {
+      return { key: '', error: 'An API key has no line breaks or tabs.' };
+    }
     if (!isSendableKey(key)) {
       var bad = Array.from(key).find(function (ch) { return !isSendableKey(ch); });
       return {
@@ -104,20 +120,27 @@
           '(curly quotes and invisible characters often come from documents, email or chat).'
       };
     }
+    if (key.slice(0, 4) === 'tre_' && key.indexOf(' ') >= 0) {
+      return {
+        key: '',
+        error: 'A tr-engine API key (tre_…) has no spaces. Copy the key again from where it was first shown.'
+      };
+    }
     return { key: key, error: '' };
   }
 
-  // The stored key, cleaned. A value that can't be sent in a header would
-  // make every API request on the page throw, so it is forgotten.
+  // The stored key, cleaned. A value outside isSendableKey is forgotten (it
+  // would either make every API request throw or never match a key). Nothing
+  // else is: the engine decides whether a sendable value is a key.
   function storedKey() {
-    var raw = storageGet(STORAGE_KEY) || '';
-    if (!raw.trim()) return '';
-    var c = cleanKey(raw);
-    if (c.error) {
+    var key = normalizeKey(storageGet(STORAGE_KEY) || '');
+    if (!key) return '';
+    if (!isSendableKey(key)) {
       warnOnce('unsendable-key', 'tr-engine: the stored API key contains characters an API key can’t have, so it was forgotten');
       storageRemove(STORAGE_KEY);
+      return '';
     }
-    return c.key;
+    return key;
   }
 
   // ── State ────────────────────────────────────────────────────────
@@ -489,8 +512,9 @@
     return applyKeyChange('');
   }
 
-  // trAuth.setKey: a value that can't be sent in a header would make every
-  // API request on the page throw, so it is refused, not stored.
+  // trAuth.setKey: a value outside isSendableKey is refused, not stored. Some
+  // of those would make every API request on the page throw; the rest could
+  // never match a key.
   function setKeyChecked(k) {
     if (!String(k == null ? '' : k).trim()) return clearKey();
     var c = cleanKey(k);

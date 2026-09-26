@@ -204,21 +204,81 @@ func TestLegacyVariableWarning(t *testing.T) {
 
 	// With this process's value looked up: the record describes it only if
 	// the value is the imported key's or the retired token (r2-14).
+	// A value that is another stored key is described as that key, not as
+	// "not imported" (r3-02); a forgotten public token gets 401, not
+	// anonymous access (r3-03).
+	active, revoked, expired := database.KeyActive, database.KeyRevoked, database.KeyExpired
+	noRecord := database.LegacyAuthResult{ImportedAt: testNow}
+	fresh := database.LegacyAuthResult{ImportedAt: testNow, Detail: database.LegacyAuthDetail{
+		Skipped: []database.LegacySkipped{{Variable: "AUTH_TOKEN", Reason: database.SkipFreshDatabase}}}}
 	for _, c := range []struct {
-		name  string
-		check legacyValueCheck
-		want  string
+		name    string
+		res     database.LegacyAuthResult
+		check   legacyValueCheck
+		want    string
+		notWant string
 	}{
-		{"WRITE_TOKEN", legacyValueCheck{keyID: 3}, "imported as API key #3"},
-		{"WRITE_TOKEN", legacyValueCheck{}, "did not import (it recorded a different one), so clients sending it get 401 invalid_key"},
-		{"WRITE_TOKEN", legacyValueCheck{keyID: 9}, "did not import"},
-		{"AUTH_TOKEN", legacyValueCheck{retired: true}, "treated as anonymous"},
-		{"AUTH_TOKEN", legacyValueCheck{}, "tr-engine keys import"},
+		{"WRITE_TOKEN", res, legacyValueCheck{keyID: 3, keyStatus: active}, "imported as API key #3 'legacy WRITE_TOKEN' on 2026-09-26) — remove it", "401"},
+		{"WRITE_TOKEN", res, legacyValueCheck{keyID: 3, keyStatus: revoked}, "imported as API key #3 'legacy WRITE_TOKEN' on 2026-09-26; that key is revoked, so clients sending it get 401 invalid_key)", ""},
+		{"WRITE_TOKEN", res, legacyValueCheck{}, "did not import (it recorded a different one), so clients sending it get 401 invalid_key", ""},
+		{"WRITE_TOKEN", res, legacyValueCheck{keyID: 9, keyStatus: active}, "WRITE_TOKEN is no longer used (its value is API key #9) — remove it", "401"},
+		{"WRITE_TOKEN", res, legacyValueCheck{keyID: 9, keyStatus: expired}, "(its value is API key #9; that key is expired, so clients sending it get 401 invalid_key)", "did not import"},
+		{"AUTH_TOKEN", res, legacyValueCheck{retired: true}, "treated as anonymous", ""},
+		{"AUTH_TOKEN", res, legacyValueCheck{forgotten: true}, "forget-retired-token: requests that still carry it get 401 invalid_key", "anonymous"},
+		{"AUTH_TOKEN", res, legacyValueCheck{keyID: 9, keyStatus: active}, "AUTH_TOKEN is no longer used (its value is API key #9) — remove it", "401"},
+		{"AUTH_TOKEN", res, legacyValueCheck{keyID: 9, keyStatus: revoked}, "(its value is API key #9; that key is revoked, so clients sending it get 401 invalid_key)", "did not import"},
+		{"AUTH_TOKEN", res, legacyValueCheck{}, "tr-engine keys import", ""},
+		{"AUTH_TOKEN", noRecord, legacyValueCheck{forgotten: true}, "forgotten with tr-engine access forget-retired-token: requests that still carry it get 401 invalid_key", "anonymous"},
+		{"AUTH_TOKEN", noRecord, legacyValueCheck{keyID: 4, keyStatus: active}, "(its value is API key #4)", ""},
+		{"AUTH_TOKEN", noRecord, legacyValueCheck{}, "register a secret that is still in use with tr-engine keys import", ""},
+		{"AUTH_TOKEN", fresh, legacyValueCheck{}, "not imported into a new database", ""},
+		{"AUTH_TOKEN", fresh, legacyValueCheck{keyID: 4, keyStatus: active}, "(its value is API key #4)", "new database"},
 	} {
 		check := c.check
-		if got := legacyVariableWarning(c.name, res, &check); !strings.Contains(got, c.want) {
-			t.Errorf("%s %+v: %q, want it to contain %q", c.name, c.check, got, c.want)
+		got := legacyVariableWarning(c.name, c.res, &check)
+		if !strings.Contains(got, c.want) || (c.notWant != "" && strings.Contains(got, c.notWant)) {
+			t.Errorf("%s %+v: %q, want it to contain %q and not %q", c.name, c.check, got, c.want, c.notWant)
 		}
+	}
+}
+
+// checkLegacyValue tells the stored retired token (anonymous) from a
+// forgotten one (401), and reports a stored key's status (r3-02, r3-03).
+func TestIntegrationCheckLegacyValue(t *testing.T) {
+	db, _ := integrationDB(t)
+	ctx := context.Background()
+
+	const public = "publicdemotoken1234567"
+	if err := db.SetRetiredPublicTokenHash(ctx, database.HashAPIKey(public)); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := checkLegacyValue(ctx, db, public); err != nil || !c.retired || c.forgotten || c.keyID != 0 {
+		t.Fatalf("retired: %+v %v", c, err)
+	}
+	if _, _, err := runCmd(t, db, "access", "forget-retired-token", ""); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := checkLegacyValue(ctx, db, public); err != nil || c.retired || !c.forgotten {
+		t.Fatalf("forgotten: %+v %v", c, err)
+	}
+
+	const rotated = "writetokenBBBBBBBBBBBBBBBBBBBBBBBB"
+	out, _, err := runCmd(t, db, "keys", "import --name rotated --scopes admin,upload", rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := strconv.Atoi(strings.TrimSpace(out))
+	if c, err := checkLegacyValue(ctx, db, rotated); err != nil || c.keyID != id || c.keyStatus != database.KeyActive || c.retired || c.forgotten {
+		t.Fatalf("imported key: %+v %v", c, err)
+	}
+	if _, _, err := runCmd(t, db, "keys", "revoke "+strconv.Itoa(id), ""); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := checkLegacyValue(ctx, db, rotated); err != nil || c.keyID != id || c.keyStatus != database.KeyRevoked {
+		t.Fatalf("revoked key: %+v %v", c, err)
+	}
+	if c, err := checkLegacyValue(ctx, db, "somethingelse1234567890"); err != nil || c != (legacyValueCheck{}) {
+		t.Fatalf("unknown value: %+v %v", c, err)
 	}
 }
 
@@ -735,6 +795,32 @@ func TestIntegrationCLIRefusesIrreversibleMigrations(t *testing.T) {
 	}
 	if !usersExist() {
 		t.Fatal("the refused command dropped the users table")
+	}
+
+	// export and import (skipAuthConversion) run without the irreversible
+	// migrations, still applying the others; import --dry-run always does
+	// this (it refuses --migrate).
+	if _, err := db.Pool.Exec(ctx, `DROP TABLE audit_log`); err != nil {
+		t.Fatal(err)
+	}
+	stderr.Reset()
+	if err := migrateForCLI(ctx, db, false, skipAuthConversion, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !usersExist() {
+		t.Fatal("export/import without --migrate dropped the users table")
+	}
+	var auditLog bool
+	if err := db.Pool.QueryRow(ctx, `SELECT to_regclass('audit_log') IS NOT NULL`).Scan(&auditLog); err != nil || !auditLog {
+		t.Errorf("the reversible migration was not applied: %v %v", auditLog, err)
+	}
+	if out := stderr.String(); !strings.Contains(out, "applying 1 pending schema migration(s): create audit_log table\n") ||
+		!strings.Contains(out, "(record and drop users)") || !strings.Contains(out, "--migrate") {
+		t.Errorf("stderr = %q", out)
+	}
+	var fixups int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM data_fixups WHERE name = 'removed-user-accounts'`).Scan(&fixups); err != nil || fixups != 0 {
+		t.Errorf("removed-user-accounts recorded: %d %v", fixups, err)
 	}
 
 	stderr.Reset()

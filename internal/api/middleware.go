@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -56,12 +57,23 @@ func Logger(log zerolog.Logger) func(http.Handler) http.Handler {
 	}
 }
 
+// Recoverer turns a handler panic into a JSON 500 and logs it, with its
+// stack, through the request's logger (it runs inside Logger, which also
+// records the 500 in the access line). http.ErrAbortHandler is re-raised:
+// it asks net/http to abort the response.
 func Recoverer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rv := recover(); rv != nil {
-				log := hlog.FromRequest(r)
-				log.Error().Interface("panic", rv).Msg("recovered from panic")
+				if rv == http.ErrAbortHandler {
+					panic(rv)
+				}
+				value, stack := rv, debug.Stack()
+				if hp, ok := rv.(*handlerPanic); ok {
+					value, stack = hp.value, hp.stack
+				}
+				hlog.FromRequest(r).Error().Interface("panic", value).Str("stack", string(stack)).
+					Str("method", r.Method).Str("path", r.URL.Path).Msg("recovered from panic")
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
 				fmt.Fprintf(w, `{"code":"internal_error","error":"internal server error"}`)
@@ -124,10 +136,36 @@ func ResponseTimeout(timeout time.Duration) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
-			h := http.TimeoutHandler(next, timeout, `{"code":"request_timeout","error":"request timeout"}`)
+			h := http.TimeoutHandler(keepPanicStack(next), timeout, `{"code":"request_timeout","error":"request timeout"}`)
 			h.ServeHTTP(w, r)
 		})
 	}
+}
+
+// handlerPanic carries a handler's panic value and the stack it happened on
+// across http.TimeoutHandler, which runs the handler in another goroutine
+// and re-panics in its own, so Recoverer's stack would not show the handler.
+type handlerPanic struct {
+	value any
+	stack []byte
+}
+
+func (p *handlerPanic) String() string { return fmt.Sprint(p.value) }
+
+// keepPanicStack re-panics a panic of next as a *handlerPanic that keeps its
+// stack (http.ErrAbortHandler stays as it is).
+func keepPanicStack(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rv := recover(); rv != nil {
+				if _, ok := rv.(*handlerPanic); ok || rv == http.ErrAbortHandler {
+					panic(rv)
+				}
+				panic(&handlerPanic{value: rv, stack: debug.Stack()})
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // MaxBodySize limits request body size. Returns 413 if exceeded.

@@ -17,7 +17,7 @@ import (
 )
 
 // The request pipeline (§6.2) runs on the root router, in this order:
-// RequestID, CORS, GetHead, Recoverer, Logger, APIHeaders, Match, Resolve
+// RequestID, CORS, GetHead, Logger, Recoverer, APIHeaders, Match, Resolve
 // (principal resolution with rate limiting), Authorize and Audit. Route-group
 // middleware (MaxBodySize, the upload middleware, ResponseTimeout) follows.
 

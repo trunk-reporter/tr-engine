@@ -110,8 +110,11 @@ type Pipeline struct {
 	// Maintenance state
 	maintenanceRunning atomic.Bool
 	lastMaintenance    atomic.Pointer[api.MaintenanceRunData]
-	retentionCfg       retentionConfig
-	retentionSources   retentionSource
+	// retentionMu guards retentionCfg and retentionSources: the admin API
+	// changes them while maintenance and GET /admin/maintenance read them.
+	retentionMu      sync.RWMutex
+	retentionCfg     retentionConfig
+	retentionSources retentionSource
 }
 
 // retentionConfig holds configurable retention durations for maintenance tasks.
@@ -411,6 +414,8 @@ func (p *Pipeline) loadRetentionOverrides(ctx context.Context) {
 		p.log.Warn().Err(err).Msg("failed to load config_overrides, using env/default retention")
 		return
 	}
+	p.retentionMu.Lock()
+	defer p.retentionMu.Unlock()
 	for key, value := range overrides {
 		if p.retentionSources.locked(key) {
 			continue // env var takes precedence
@@ -420,42 +425,32 @@ func (p *Pipeline) loadRetentionOverrides(ctx context.Context) {
 			p.log.Warn().Str("key", key).Str("value", value).Msg("invalid retention override, skipping")
 			continue
 		}
-		p.setRetentionValue(key, d)
-		// Set source to "db" since the override was loaded from the database.
-		switch key {
-		case "retention_raw_messages":
-			p.retentionSources.RawMessages = "db"
-		case "retention_console_logs":
-			p.retentionSources.ConsoleLogs = "db"
-		case "retention_plugin_status":
-			p.retentionSources.PluginStatus = "db"
-		case "retention_trunking_messages":
-			p.retentionSources.TrunkingMessages = "db"
-		case "retention_checkpoints":
-			p.retentionSources.Checkpoints = "db"
-		case "retention_stale_calls":
-			p.retentionSources.StaleCalls = "db"
-		case "retention_audit_log":
-			p.retentionSources.AuditLog = "db"
-		}
+		// The override was loaded from the database.
+		p.setRetentionValue(key, d, "db")
 	}
 }
 
 // SetRetention updates a retention setting and persists it to config_overrides.
 // Returns an error if the key is locked by an environment variable.
 func (p *Pipeline) SetRetention(ctx context.Context, key string, d time.Duration) error {
+	p.retentionMu.Lock()
+	defer p.retentionMu.Unlock()
 	if p.retentionSources.locked(key) {
 		return fmt.Errorf("key %q is locked by environment variable", key)
 	}
 	if err := p.db.SetConfigOverride(ctx, key, d.String()); err != nil {
 		return fmt.Errorf("persist config override: %w", err)
 	}
-	p.setRetentionValue(key, d)
+	p.setRetentionValue(key, d, "db")
 	return nil
 }
 
-// DeleteRetention removes a DB-stored retention override and resets to env/default.
+// DeleteRetention removes a DB-stored retention override and resets the setting
+// to its default. Settings fixed by an environment variable are locked and
+// can't be deleted.
 func (p *Pipeline) DeleteRetention(ctx context.Context, key string) error {
+	p.retentionMu.Lock()
+	defer p.retentionMu.Unlock()
 	if p.retentionSources.locked(key) {
 		return fmt.Errorf("key %q is locked by environment variable", key)
 	}
@@ -466,38 +461,45 @@ func (p *Pipeline) DeleteRetention(ctx context.Context, key string) error {
 	return nil
 }
 
-func (p *Pipeline) setRetentionValue(key string, d time.Duration) {
+// setRetentionValue sets a retention setting and where its value came from
+// ("env", "db" or "default", as GET /admin/maintenance reports it). The
+// caller holds retentionMu.
+func (p *Pipeline) setRetentionValue(key string, d time.Duration, source string) {
 	switch key {
 	case "retention_raw_messages":
-		p.retentionCfg.RawMessages = d
+		p.retentionCfg.RawMessages, p.retentionSources.RawMessages = d, source
 	case "retention_console_logs":
-		p.retentionCfg.ConsoleLogs = d
+		p.retentionCfg.ConsoleLogs, p.retentionSources.ConsoleLogs = d, source
 	case "retention_plugin_status":
-		p.retentionCfg.PluginStatus = d
+		p.retentionCfg.PluginStatus, p.retentionSources.PluginStatus = d, source
 	case "retention_trunking_messages":
-		p.retentionCfg.TrunkingMessages = d
+		p.retentionCfg.TrunkingMessages, p.retentionSources.TrunkingMessages = d, source
 	case "retention_checkpoints":
-		p.retentionCfg.Checkpoints = d
+		p.retentionCfg.Checkpoints, p.retentionSources.Checkpoints = d, source
 	case "retention_stale_calls":
-		p.retentionCfg.StaleCalls = d
+		p.retentionCfg.StaleCalls, p.retentionSources.StaleCalls = d, source
 	case "retention_audit_log":
-		p.retentionCfg.AuditLog = d
+		p.retentionCfg.AuditLog, p.retentionSources.AuditLog = d, source
 	}
 }
 
+// resetRetentionValue returns a setting whose override was deleted to its
+// default. The environment-variable branch is defensive only: DeleteRetention
+// refuses locked (env-set) keys before calling this. The caller holds
+// retentionMu.
 func (p *Pipeline) resetRetentionValue(key string) {
 	// Check env var first
 	if envKey, ok := retentionKeyToEnv[key]; ok {
 		if v := os.Getenv(envKey); v != "" {
 			if d, err := time.ParseDuration(v); err == nil {
-				p.setRetentionValue(key, d)
+				p.setRetentionValue(key, d, "env")
 				return
 			}
 		}
 	}
 	// Fall back to coded default
 	if def, ok := retentionKeyDefaults[key]; ok {
-		p.setRetentionValue(key, def)
+		p.setRetentionValue(key, def, "default")
 	}
 }
 
@@ -962,15 +964,18 @@ func (p *Pipeline) runMaintenanceWithResult() (*api.MaintenanceRunData, error) {
 	}
 
 	// 4. Purge expired data
+	p.retentionMu.RLock()
+	rc := p.retentionCfg
+	p.retentionMu.RUnlock()
 	for _, spec := range []struct {
 		table     string
 		col       string
 		retention time.Duration
 	}{
-		{"console_messages", "log_time", p.retentionCfg.ConsoleLogs},
-		{"plugin_statuses", "time", p.retentionCfg.PluginStatus},
-		{"trunking_messages", "time", p.retentionCfg.TrunkingMessages},
-		{"call_active_checkpoints", "snapshot_time", p.retentionCfg.Checkpoints},
+		{"console_messages", "log_time", rc.ConsoleLogs},
+		{"plugin_statuses", "time", rc.PluginStatus},
+		{"trunking_messages", "time", rc.TrunkingMessages},
+		{"call_active_checkpoints", "snapshot_time", rc.Checkpoints},
 	} {
 		n, err := p.db.PurgeOlderThan(ctx, spec.table, spec.col, spec.retention)
 		if err != nil {
@@ -985,7 +990,7 @@ func (p *Pipeline) runMaintenanceWithResult() (*api.MaintenanceRunData, error) {
 
 	// Audit log (RETENTION_AUDIT_LOG). Its purge refuses a retention that is
 	// not positive instead of emptying the log.
-	if n, err := p.db.PurgeAuditLogOlderThan(ctx, p.retentionCfg.AuditLog); err != nil {
+	if n, err := p.db.PurgeAuditLogOlderThan(ctx, rc.AuditLog); err != nil {
 		log.Warn().Err(err).Str("table", "audit_log").Msg("purge failed")
 	} else {
 		if n > 0 {
@@ -995,7 +1000,7 @@ func (p *Pipeline) runMaintenanceWithResult() (*api.MaintenanceRunData, error) {
 	}
 
 	// 5. Drop old weekly partitions (raw MQTT)
-	dropped, err := p.db.DropOldWeeklyPartitions(ctx, "mqtt_raw_messages", p.retentionCfg.RawMessages)
+	dropped, err := p.db.DropOldWeeklyPartitions(ctx, "mqtt_raw_messages", rc.RawMessages)
 	if err != nil {
 		log.Warn().Err(err).Msg("failed to drop old weekly partitions")
 	}
@@ -1005,7 +1010,7 @@ func (p *Pipeline) runMaintenanceWithResult() (*api.MaintenanceRunData, error) {
 	result.PartitionsDropped = dropped
 
 	// 6. Purge stale RECORDING calls (call_start with no call_end or audio)
-	stalePurged, err := p.db.PurgeStaleCalls(ctx, p.retentionCfg.StaleCalls)
+	stalePurged, err := p.db.PurgeStaleCalls(ctx, rc.StaleCalls)
 	if err != nil {
 		log.Warn().Err(err).Msg("failed to purge stale calls")
 	} else {
@@ -1045,6 +1050,8 @@ func (p *Pipeline) runMaintenanceWithResult() (*api.MaintenanceRunData, error) {
 
 // MaintenanceStatus returns the current maintenance configuration and last run results.
 func (p *Pipeline) MaintenanceStatus() *api.MaintenanceStatusData {
+	p.retentionMu.RLock()
+	defer p.retentionMu.RUnlock()
 	return &api.MaintenanceStatusData{
 		Config: api.MaintenanceConfigData{
 			RetentionRawMessages:               p.retentionCfg.RawMessages.String(),

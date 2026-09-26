@@ -308,7 +308,7 @@ Every 401 carries `WWW-Authenticate: Bearer realm="tr-engine"`. The existing cod
 - **SSE `Last-Event-ID`:** accepted from the `Last-Event-ID` header, or from a `last_event_id` query parameter (the header wins). The parameter exists because a client that re-creates an `EventSource` with a fresh ticket can't set the header.
 - **HEAD:** the root router uses chi's `middleware.GetHead`, so a HEAD request is served by the GET handler, and policy lookup uses the GET route (§6).
 - **`X-Request-ID`:** a client value is kept only if it is at most 64 characters of `[A-Za-z0-9._-]`; otherwise a new one is generated. This applies globally.
-- **Header size:** the server limits the request line plus headers to 64 KiB (`http.Server.MaxHeaderBytes`); a larger request gets `431 Request Header Fields Too Large` before any middleware runs.
+- **Header size:** the server sets `http.Server.MaxHeaderBytes` to 64 KiB for the request line plus headers. net/http reads up to `MaxHeaderBytes` + 4 KiB of slack before it gives up, so the effective limit is about 68 KiB; a larger request gets `431 Request Header Fields Too Large` before any middleware runs. Clients should stay under 64 KiB.
 
 ## 6. Route policy and the request pipeline
 
@@ -334,7 +334,7 @@ This is the root router's middleware order:
 
 1. **RequestID** (sanitized, §5)
 2. **CORS**: sets headers; `OPTIONS` → 204 and stop
-3. **Recoverer**, then **Logger** (as today)
+3. **GetHead** (§5), then **Logger**, then **Recoverer** inside it (so a panic is logged through the request's logger with its stack, method and path, and the access line records the 500; `http.ErrAbortHandler` is re-raised), then **APIHeaders** (`Cache-Control: no-store`, `Vary: Authorization` on `/api/v1`)
 4. **Match**:
    - `path := r.URL.RawPath`, or `r.URL.Path` if RawPath is empty. This is exactly what chi routes on.
    - `pattern := root.Find(chi.NewRouteContext(), method, path)`, where HEAD falls back to GET when there is no HEAD route. Always use a *fresh* route context; `Find` mutates the context it is given.
@@ -518,15 +518,16 @@ The principal is stored on the audio subscriber at `Subscribe` time, separately 
 
 ### 7.5 Long-lived connections: re-check and close signals
 
-Each SSE and WebSocket connection re-resolves its principal **every 60 s** and **immediately when the auth generation changes**:
+Each SSE and WebSocket connection re-resolves its principal **every 60 s**, **immediately when the auth generation changes** (also when it changed while the connection was starting), and **when its key's `expires_at` passes** (a timer armed from the key as last read, for key and ticket connections, and re-armed after every re-check):
 - key: re-read by ID, bypassing the cache;
 - ticket: the key re-read plus the ticket's narrowing, and the ticket's expiry;
 - anonymous: the current policy.
 
 Outcomes:
 - If the new principal no longer has `listen` (key revoked, expired or re-scoped; anonymous policy now `off`), the connection is closed with a signal.
-- If a ticket connection's ticket has expired, it is closed with `ticket_expired`.
+- If a ticket connection's ticket has expired, it is closed with `ticket_expired`. A separate timer closes it at the ticket's expiry, whatever the re-checks find. A ticket whose narrowing names a system that has since been merged into another (§3.2) also closes its connection with `ticket_expired`, since a new ticket minted for the merged system fixes it.
 - If scopes or restrictions changed but `listen` remains, the subscriber's principal is swapped atomically; no reconnect is needed.
+- If the re-check can't reach the database (the key, ticket or policy lookup fails), the connection stays open with its current principal, a WARN is logged, and the next re-check (the 60 s tick or a generation change) tries again. The expiry timer is not re-armed for a time that has already passed, so a failing lookup is not retried in a loop.
 
 Close signals, so clients can tell auth loss from a network blip:
 - **SSE:** send `event: auth` with `data: {"code":"invalid_key"|"key_required"|"insufficient_scope"|"ticket_expired"}`, then end the response.
@@ -632,7 +633,13 @@ The tr-dashboard Access page and `web/admin.html` show a warning while a key nam
 
 ### 10.2 CLI
 
-New subcommands follow the `export`/`import` pattern in `cmd/tr-engine`: their own FlagSet, `--env-file`/`--database-url`, `config.Load`, `database.Connect`, `InitSchema` + `Migrate`. They differ in three ways: **logs go to stderr at WARN level**, a `Migrate` failure is fatal, and pending migrations are named on stderr before they run. On a database from before API keys, the irreversible ones (`convert api_keys to app keys`, `record and drop users`) are refused unless `--migrate` is given, since an older engine still running on that database would stop working; the recommended order is to start the new server first, which also runs the legacy import. `keys list` and `access show` print a stderr note while that one-time import is still to come.
+New subcommands follow the `export`/`import` pattern in `cmd/tr-engine`: their own FlagSet, `--env-file`/`--database-url`, `config.Load`, `database.Connect`, `InitSchema` + `Migrate`. They differ in two ways: **logs go to stderr at WARN level**, and a `Migrate` failure is fatal (for `export`/`import` it is only a WARN).
+
+All four commands (`keys`, `access`, `export`, `import`) name pending migrations on stderr before they run, and none of them applies the irreversible ones (`convert api_keys to app keys`, `record and drop users`, §11.1) on a database from before API keys unless `--migrate` is given, since an older engine still running on that database would stop working. Without `--migrate`:
+- `keys` and `access` refuse such a database (they read and write the new auth tables), with a message naming the migrations and the two ways forward;
+- `export` and `import` apply the other migrations with `database.MigrateReversible` and run, leaving the irreversible ones to the server's first start, with a note on stderr (they don't touch the auth tables). `import --dry-run` never applies them, and `import --dry-run --migrate` is refused.
+
+The recommended order is to stop the old engine, back up the database with `pg_dump` (not `tr-engine export`, which doesn't carry the auth tables), and start the new server first, which also runs the legacy import. `keys list` and `access show` print a stderr note while that one-time import is still to come.
 
 ```
 tr-engine keys list   [--all]
@@ -674,12 +681,16 @@ The CLI is not subject to the last-admin guard; `keys revoke`/`update` warn when
 
 ### 11.1 Schema
 
-Migrations are appended to `internal/database/migrations.go`. **`Migrate` evaluates every `check` before applying anything**, so no migration may rely on the effects of another migration pending in the same run.
+Migrations are appended to `internal/database/migrations.go`. **`Migrate` evaluates every `check` before applying anything**, so no migration may rely on the effects of another migration pending in the same run. `Migrate` (and `InitSchema`) hold the session advisory lock `schemaLockKey` throughout, so a second process starting on the same database (another engine, or a CLI command run while the server starts) waits and then finds the migrations applied, instead of evaluating the same ones as pending and failing half-way.
+
+**Which `users` table is tr-engine's.** The old "create users table" migration skipped creating the table when any `users` table already existed, and then used it, so a database shared with another application may hold that application's `users`. Both migrations below therefore act on `users` only when `trEngineUsersSQL` holds: the relation `users` resolves to (unqualified, as the old engine resolved it) has the columns `username`, `role` and `enabled`, **and** either the trigger `trg_users_updated_at` or a CHECK constraint naming `'viewer'` and `'editor'`, both created with tr-engine's table. Any other `users` table is never read as tr-engine's user list and never dropped.
+
+**Irreversible migrations.** The two migrations below are marked `irreversible`: they convert the old API keys and drop the old user accounts, which an older engine still running on the same database can't survive, and they can't be undone. The server applies them on its first start (`Migrate`). The CLI applies them only with `--migrate` (§10.2); without it, `keys`/`access` refuse such a database, and `export`/`import` apply the other migrations with `database.MigrateReversible` and leave these two to the server's first start.
 
 - **Fresh databases** get the new tables from `schema.sql`: `api_keys` in its new shape, `auth_settings` and `audit_log`. The old "create api_keys table" migration is changed to create the new shape too; it only matters for databases that predate `api_keys` and were never initialized from the current `schema.sql`. The old "create users table" and "add display_name and last_login to users" migrations are **removed**, so `users` is never created again.
 - **Migration: api_keys → app-key model.** Its check is: column `scopes` exists **and** column `label` does not. It is a single `DO $$ ... $$` block, and every statement that touches old columns goes through `EXECUTE`. That keeps it parseable on databases without `users` or without the old columns, and keeps it usable as the manual SQL that `MigrationError` prints. When `api_keys.label` exists, it:
   1. adds `scopes text[]`, `restriction jsonb`, `expires_at timestamptz`, `revoked_at timestamptz`, `rate_limit_rps real` and `legacy boolean NOT NULL DEFAULT false`;
-  2. if `users` exists (`to_regclass('public.users') IS NOT NULL`):
+  2. if `users` is tr-engine's (`trEngineUsersSQL`, above):
      - revokes (`revoked_at = now()`) keys whose owner has `enabled = false`;
      - computes a user-owned key's role as the **lower** of the key's role and the owner's current role (viewer < editor < admin);
      - appends ` (<username>)` or ` (<username>, disabled)` to the name;
@@ -687,7 +698,7 @@ Migrations are appended to `internal/database/migrations.go`. **`Migrate` evalua
   4. renames `label` to `name`, filling empty names with `'key ' || key_prefix`;
   5. sets `scopes NOT NULL` and adds `CHECK (cardinality(scopes) > 0)`;
   6. drops `user_id`, `role`, `is_service_account` and `idx_api_keys_user_id`.
-- **Migration: record and drop users.** Its check: `users` doesn't exist. It is also a DO block. It first inserts into `data_fixups` (name `removed-user-accounts`, `ON CONFLICT DO NOTHING`) a JSON array of every user (`username, role, enabled, last_login`), then runs `DROP TABLE users CASCADE`. At startup, the engine logs a one-time summary from that row: "removed 3 user accounts: alice (admin), bob (editor), carol (viewer, disabled) — give each person or their client an API key".
+- **Migration: record and drop users.** Its check: `users` is not tr-engine's (`NOT trEngineUsersSQL`: it doesn't exist, or it is another application's, which is left alone). It is also a DO block that returns at once unless `trEngineUsersSQL` holds. It first inserts into `data_fixups` (name `removed-user-accounts`, `ON CONFLICT DO NOTHING`) a JSON array of every user (`username, role, enabled, last_login`), then runs `DROP TABLE users CASCADE`. At startup, the engine logs a one-time summary from that row: "removed 3 user accounts: alice (admin), bob (editor), carol (viewer, disabled) — give each person or their client an API key".
 - `auth_settings` (`name text PRIMARY KEY, value jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now()`) and `audit_log` also get `IF NOT EXISTS` migrations, for databases created before this version.
 
 **Rollback is not supported** other than by restoring a backup. The migration guide's first step is a database backup, with the Docker command (`docker compose exec postgres pg_dump -U trengine trengine > pre-apikey.sql`).
@@ -696,6 +707,7 @@ Migrations are appended to `internal/database/migrations.go`. **`Migrate` evalua
 - a fresh database;
 - a database from before users and api_keys existed;
 - a current-version database with users (enabled and disabled; admin, editor and viewer), user-owned and service keys;
+- a database whose `users` table belongs to another application (never read or dropped);
 - running `Migrate` twice.
 
 ### 11.2 Legacy environment variables
@@ -718,7 +730,11 @@ The old variables are read **only** to migrate and to warn; they no longer confi
 8. **Uploads.** If calls from `UPLOAD_INSTANCE_ID` exist in the last 7 days and no active key has `upload` after the import, the engine logs a WARN: "HTTP uploads were in use but no key can upload now — create one with `tr-engine keys create --name 'uploads' --scopes upload` and configure it in trunk-recorder". It also lists migrated keys without `upload` that were used in the last 7 days.
 
 **Every start.** Each old variable that is still set produces one WARN line:
-- For imported ones: "AUTH_TOKEN is no longer used (imported as API key #3 'legacy AUTH_TOKEN' on 2026-09-26) — remove it from your configuration; see docs/migrating-auth.md". This message, and the retired token's "treated as anonymous", appear only when this process's value is the imported key or the retired token. Otherwise the WARN says the value was never imported (clients sending it get 401 `invalid_key`) and suggests `tr-engine keys import`.
+- For `AUTH_TOKEN` and `WRITE_TOKEN`, the WARN says what this process's value is now (the import's record is used only when it describes this value):
+  - the key the import recorded: "AUTH_TOKEN is no longer used (imported as API key #3 'legacy AUTH_TOKEN' on 2026-09-26) — remove it from your configuration; see docs/migrating-auth.md". When that key is revoked or expired, "; that key is revoked (expired), so clients sending it get 401 invalid_key" is added inside the parentheses;
+  - another stored key (for example one registered with `tr-engine keys import` after a rotation): "its value is API key #N", with the same note;
+  - the retired public token while it is still stored as retired: "treated as anonymous". After `access forget-retired-token`, the WARN says that requests carrying it get 401 `invalid_key`;
+  - a value that matches no stored key and no retired or forgotten public token: the value was never imported (clients sending it get 401 `invalid_key`), with a suggestion to register it with `tr-engine keys import`.
 - For the others: "ADMIN_PASSWORD is no longer used — tr-engine has no user accounts; clients use API keys. See docs/auth.md".
 - `CORS_ORIGINS`: "no longer needed: the API allows all origins and never uses cookies".
 

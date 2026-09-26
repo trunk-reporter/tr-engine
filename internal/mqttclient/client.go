@@ -143,7 +143,12 @@ func (c *Client) onMessage(_ mqtt.Client, msg mqtt.Message) {
 		Msg("mqtt message received")
 }
 
+// IsConnected reports whether the client is connected; false for a nil
+// client (MQTT not configured).
 func (c *Client) IsConnected() bool {
+	if c == nil {
+		return false
+	}
 	return c.connected.Load()
 }
 

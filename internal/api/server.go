@@ -117,8 +117,10 @@ func buildRouter(opts routerOptions) *chi.Mux {
 	r.Use(RequestID)
 	r.Use(CORS)
 	r.Use(middleware.GetHead)
-	r.Use(Recoverer)
+	// Recoverer inside Logger: the panic is logged with the request's logger
+	// and the access line records the 500.
 	r.Use(Logger(opts.Log))
+	r.Use(Recoverer)
 	r.Use(APIHeaders)
 	r.Use(Match(r, opts.Log))
 	r.Use(a.Resolve)
@@ -204,12 +206,18 @@ func buildRouter(opts routerOptions) *chi.Mux {
 		// Debug report (admin): sends server diagnostics to DEBUG_REPORT_URL.
 		// Always registered; the handler returns 503 when disabled via
 		// DEBUG_REPORT_DISABLE=true.
+		// A nil *mqttclient.Client (no MQTT_BROKER_URL) must be a nil
+		// MQTTStatus, not a non-nil interface holding a nil pointer.
+		var mqttStatus MQTTStatus
+		if opts.MQTT != nil {
+			mqttStatus = opts.MQTT
+		}
 		debugReport := NewDebugReportHandler(DebugReportOptions{
 			DB:            opts.DB,
 			Config:        cfg,
 			Live:          opts.Live,
 			AudioStreamer: opts.AudioStreamer,
-			MQTT:          opts.MQTT,
+			MQTT:          mqttStatus,
 			Log:           opts.Log,
 			Version:       opts.Version,
 			StartTime:     opts.StartTime,

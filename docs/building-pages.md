@@ -114,10 +114,14 @@ no logins. CORS allows any origin (no cookies), so the page can call the engine 
 1. Show a config bar with an API URL input (default: window.location.origin), an optional
    "API key" password field (keep the key in localStorage only if the user ticks
    "remember"), and a "Connect" button. Clean the pasted key first: drop invisible
-   characters (U+00AD, U+200B-U+200F, U+2060-U+2064, U+FEFF) and surrounding
-   whitespace and curly quotes, and refuse anything that isn't printable ASCII without
-   spaces with a clear message. fetch() throws on such header values, which looks like
-   a network failure.
+   characters (U+00AD, U+200B-U+200F, U+202A-U+202E, U+2060-U+2064, U+FEFF) and surrounding
+   whitespace and curly quotes. Then refuse, with a clear message, tabs, line breaks and
+   anything outside printable ASCII (U+0020-U+007E), and a space inside a key that
+   starts with tre_. fetch() throws on a header value with a line break or a character
+   above U+00FF, which looks like a network failure; other non-ASCII characters (é) are
+   sent as single bytes that never match a key; tabs and a space inside a tre_ key are
+   paste accidents. Send everything else to /whoami: an imported legacy key (an old
+   AUTH_TOKEN/WRITE_TOKEN) may contain inner spaces, and the engine accepts it.
 2. On connect, GET {apiUrl}/api/v1/whoami, with the Authorization header if a key was
    entered. 200 → show a green indicator plus whoami.scopes. 401 invalid_key → "key
    rejected". 404 → "this tr-engine is too old". If there is no key and

@@ -27,17 +27,18 @@ This guide explains the upgrade step by step. For the new model itself, read [au
 
 ## Before you start
 
-1. **Back up the database.** There is no downgrade path other than restoring this backup.
+1. **Stop the old engine and back up the database.** There is no downgrade path other than restoring this backup.
 
    ```bash
    # Docker Compose (bundled PostgreSQL)
+   docker compose stop tr-engine
    docker compose exec -T postgres pg_dump -U trengine trengine > pre-apikey.sql
 
-   # Bare metal / external PostgreSQL
+   # Bare metal / external PostgreSQL: stop the tr-engine service first
    pg_dump "$DATABASE_URL" > pre-apikey.sql
    ```
 
-   Use your own `POSTGRES_USER`/`POSTGRES_DB` if you changed them from `trengine`.
+   Use your own `POSTGRES_USER`/`POSTGRES_DB` if you changed them from `trengine`. Use `pg_dump`, not `tr-engine export`: an export carries only the radio data (systems, sites, talkgroups, units, calls, transcriptions), not the API keys, user accounts or settings you would need to go back.
 
 2. **Note your current `.env`** auth lines (`AUTH_ENABLED`, `AUTH_TOKEN`, `WRITE_TOKEN`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `JWT_SECRET`, `CORS_ORIGINS`). Don't change them yet: the new version needs to read them once.
 
@@ -91,7 +92,7 @@ removed 3 user accounts: alice (admin), bob (editor), carol (viewer, disabled) �
 
 With a single account (the old full-mode default, the `admin` user created from `ADMIN_PASSWORD`) it reads "removed 1 user account: admin (admin) — ...".
 
-Start the server first, before any `tr-engine keys` or `tr-engine access` command. Those commands also bring the schema up to date and name the pending migrations on stderr, but on a database from before API keys they refuse the irreversible part (`convert api_keys to app keys`, `record and drop users`) unless you add `--migrate`, because an older engine still running on that database would stop working and the conversion can't be undone. With `--migrate` they convert the database, but the one-time legacy import still waits for the first server start: until then `keys list` and `access show` print a note on stderr that the import is still to come, and what they show may change.
+Start the server first, before any `tr-engine keys`, `access`, `export` or `import` command. Those commands also bring the schema up to date and name the pending migrations on stderr, but on a database from before API keys none of them applies the irreversible part (`convert api_keys to app keys`, `record and drop users`) unless you add `--migrate`, because an older engine still running on that database would stop working and the conversion can't be undone. Without `--migrate`, `keys` and `access` refuse to run, while `export` and `import` apply only the other migrations and run, leaving the irreversible ones to the server's first start (with a note on stderr); `import --dry-run` never applies them, and `import --dry-run --migrate` is refused. With `--migrate` the commands convert the database, but the one-time legacy import still waits for the first server start: until then `keys list` and `access show` print a note on stderr that the import is still to come, and what they show may change.
 
 ### 4. Copy the bootstrap key, if one was printed
 
@@ -168,6 +169,7 @@ Each `keys create` prints only the new key. Put each key into its client:
 - **Upload plugins**: put the key in `apiKey`. See [Upload plugins](#upload-plugins).
 - **Scripts**: send `Authorization: Bearer <key>`. Replace any `?token=` in URLs.
 - **Prometheus**: see [auth.md](auth.md#prometheus).
+- **Legacy values in browsers**: an imported `AUTH_TOKEN`/`WRITE_TOKEN` with inner spaces (`purple monkey dishwasher 42`) works as a key, in tr-dashboard and the `web/` pages as with curl. Both clients refuse a pasted value with tabs, line breaks or non-ASCII characters: a line break or a character above U+00FF makes the browser's `fetch()` throw, a Latin-1 character such as `é` is sent as a single byte that never matches the imported (UTF-8) value, and tabs are refused as paste accidents, although browsers send them. A value with tabs or non-ASCII characters still works from curl and scripts, which send its bytes unchanged; give tr-dashboard and the `web/` pages a named key from `tr-engine keys create` instead.
 - **People who had user accounts**: an admin creates a key for each person's client (or, better, each client they run). Keys they created themselves under their account still work ([see below](#existing-api-keys-and-user-accounts)).
 
 When every client has its own key, revoke the legacy keys and the bootstrap key:
@@ -219,7 +221,12 @@ docker compose up -d tr-engine
 
 Until you do, every start logs one WARN per leftover variable, for example "AUTH_TOKEN is no longer used (imported as API key #3 'legacy AUTH_TOKEN' on 2026-09-26) — remove it from your configuration" or "ADMIN_PASSWORD is no longer used — tr-engine has no user accounts; clients use API keys".
 
-The "imported as API key #N" and "treated as anonymous" (retired public token) messages appear only when the value this process has for `AUTH_TOKEN`/`WRITE_TOKEN` is the one the import recorded. If you changed the value after the import (or this process reads another `.env`), tr-engine warns instead that the value was never imported, so clients sending it get `401 invalid_key`, and suggests registering it with `tr-engine keys import` ([step 9](#9-register-a-secret-the-import-missed-optional)) if it is still in use.
+The WARN for `AUTH_TOKEN`/`WRITE_TOKEN` says what the value this process has is now:
+
+- "imported as API key #N '...' on <date>" when it is the key the import recorded. If that key no longer works (you revoked it, or it expired, but left the variable set), the message adds "; that key is revoked (or expired), so clients sending it get 401 invalid_key".
+- "its value is API key #N" (with the same note) when it is another stored key, for example one you registered with `tr-engine keys import` after changing the value.
+- "treated as anonymous" only while the old full-mode public token is still stored as retired. After `tr-engine access forget-retired-token`, the WARN says instead that requests still carrying it get `401 invalid_key`.
+- "set to a value the one-time import on <date> did not import (it recorded a different one), so clients sending it get 401 invalid_key" only when the value matches no stored key and no retired or forgotten public token (you changed it after the import, or this process reads another `.env`). It suggests registering the value with `tr-engine keys import` ([step 9](#9-register-a-secret-the-import-missed-optional)) if it is still in use.
 
 ### 9. Register a secret the import missed (optional)
 
@@ -328,6 +335,7 @@ Do this:
 
 ```bash
 cd /docker/tr-engine
+docker compose stop tr-engine
 docker compose exec -T postgres pg_dump -U trengine trengine > pre-apikey.sql
 # pin both images in docker-compose.yml, copy the new web/ files (keep your own pages)
 docker compose pull tr-engine tr-dashboard && docker compose up -d tr-engine tr-dashboard

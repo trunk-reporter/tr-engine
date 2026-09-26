@@ -45,7 +45,11 @@ func (h *TalkgroupsHandler) resolveTalkgroup(w http.ResponseWriter, r *http.Requ
 	p := PrincipalFrom(r)
 	if cid.IsPlain {
 		matches, err := h.db.FindTalkgroupSystems(r.Context(), p, cid.EntityID)
-		if err != nil || len(matches) == 0 {
+		if err != nil {
+			WriteError(w, http.StatusInternalServerError, "failed to look up talkgroup")
+			return cid, false
+		}
+		if len(matches) == 0 {
 			WriteError(w, http.StatusNotFound, "talkgroup not found")
 			return cid, false
 		}

@@ -40,7 +40,7 @@ func (h *TicketsHandler) Mint(w http.ResponseWriter, r *http.Request) {
 	// The route is KeyRequired with scope listen; this only guards against
 	// the handler being reached some other way.
 	if p == nil || p.Kind != auth.KindKey || !p.Has(auth.ScopeListen) {
-		WriteErrorWithCode(w, http.StatusForbidden, ErrInsufficientScope, "tickets are minted by a key with the listen scope")
+		WriteErrorWithCode(w, http.StatusForbidden, ErrInsufficientScope, "this operation needs the listen scope")
 		return
 	}
 

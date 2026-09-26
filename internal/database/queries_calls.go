@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/snarg/tr-engine/internal/auth"
@@ -437,21 +438,29 @@ func (db *DB) ListCallGroups(ctx context.Context, p *auth.Principal, filter Call
 		return nil, 0, err
 	}
 
+	// call_count counts only the member calls p may see, like the member
+	// list of GetCallGroupByID.
+	memberRestrict, memberArgs, err := restrictSQL(p, "c.system_id", "c.tgid", len(args)+1)
+	if err != nil {
+		return nil, 0, err
+	}
+	dataArgs := slices.Concat(args, memberArgs, []any{filter.Limit, filter.Offset})
+
 	dataQuery := `
 		SELECT cg.id, cg.system_id, COALESCE(s.name, ''), COALESCE(s.sysid, ''),
 			pc.site_id, COALESCE(pc.site_short_name, ''),
 			cg.tgid, COALESCE(cg.tg_alpha_tag, ''), COALESCE(cg.tg_description, ''),
 			COALESCE(cg.tg_tag, ''), COALESCE(cg.tg_group, ''),
 			cg.start_time, cg.primary_call_id,
-			(SELECT count(*) FROM calls c WHERE c.call_group_id = cg.id),
+			(SELECT count(*) FROM calls c WHERE c.call_group_id = cg.id` + memberRestrict + `),
 			COALESCE(cg.transcription_text IS NOT NULL, false),
 			COALESCE(cg.transcription_status, 'none'),
 			cg.transcription_text
 		` + fromClause + whereClause + `
 		ORDER BY cg.start_time DESC
-		LIMIT ` + placeholder(len(args)+1) + ` OFFSET ` + placeholder(len(args)+2)
+		LIMIT ` + placeholder(len(dataArgs)-1) + ` OFFSET ` + placeholder(len(dataArgs))
 
-	rows, err := db.Pool.Query(ctx, dataQuery, append(args, filter.Limit, filter.Offset)...)
+	rows, err := db.Pool.Query(ctx, dataQuery, dataArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -487,6 +496,11 @@ func (db *DB) GetCallGroupByID(ctx context.Context, p *auth.Principal, id int) (
 	if err != nil {
 		return nil, nil, err
 	}
+	// call_count counts only the member calls p may see, like the list below.
+	countRestrict, countArgs, err := restrictSQL(p, "c.system_id", "c.tgid", 2+len(groupArgs))
+	if err != nil {
+		return nil, nil, err
+	}
 	callRestrict, callArgs, err := restrictSQL(p, "c.system_id", "c.tgid", 2)
 	if err != nil {
 		return nil, nil, err
@@ -498,7 +512,7 @@ func (db *DB) GetCallGroupByID(ctx context.Context, p *auth.Principal, id int) (
 			cg.tgid, COALESCE(cg.tg_alpha_tag, ''), COALESCE(cg.tg_description, ''),
 			COALESCE(cg.tg_tag, ''), COALESCE(cg.tg_group, ''),
 			cg.start_time, cg.primary_call_id,
-			(SELECT count(*) FROM calls c WHERE c.call_group_id = cg.id),
+			(SELECT count(*) FROM calls c WHERE c.call_group_id = cg.id`+countRestrict+`),
 			COALESCE(cg.transcription_text IS NOT NULL, false),
 			COALESCE(cg.transcription_status, 'none'),
 			cg.transcription_text
@@ -506,7 +520,7 @@ func (db *DB) GetCallGroupByID(ctx context.Context, p *auth.Principal, id int) (
 		JOIN systems s ON s.system_id = cg.system_id
 		LEFT JOIN calls pc ON pc.call_id = cg.primary_call_id AND pc.start_time >= cg.start_time - interval '10 seconds'
 		WHERE cg.id = $1`+groupRestrict+`
-	`, append([]any{id}, groupArgs...)...).Scan(
+	`, slices.Concat([]any{id}, groupArgs, countArgs)...).Scan(
 		&g.ID, &g.SystemID, &g.SystemName, &g.Sysid,
 		&g.SiteID, &g.SiteShortName,
 		&g.Tgid, &g.TgAlphaTag, &g.TgDescription, &g.TgTag, &g.TgGroup,

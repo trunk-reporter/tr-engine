@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -26,6 +27,28 @@ type TranscriptionRow struct {
 	DurationMs    int
 	ProviderMs    *int
 	Words         json.RawMessage // word-level timestamps with unit attribution
+}
+
+// ErrInvalidTranscriptionSource is returned by InsertTranscription for a
+// source that the transcriptions.source CHECK constraint doesn't accept.
+var ErrInvalidTranscriptionSource = errors.New("invalid transcription source")
+
+// transcriptionStatusForSource maps every source the transcriptions.source
+// CHECK accepts (auto, human, llm) to the transcription_status that a primary
+// transcription from it gives its call and call group, whose CHECK has no
+// source values: a human transcription is verified; an automatic or
+// LLM-generated one is machine output that nobody has reviewed.
+var transcriptionStatusForSource = map[string]string{
+	"auto":  "auto",
+	"human": "verified",
+	"llm":   "auto",
+}
+
+// ValidTranscriptionSource reports whether InsertTranscription accepts
+// source.
+func ValidTranscriptionSource(source string) bool {
+	_, ok := transcriptionStatusForSource[source]
+	return ok
 }
 
 // TranscriptionAPI is the transcription representation for API responses.
@@ -168,6 +191,11 @@ func listTranscriptionToAPI(r sqlcdb.ListTranscriptionsByCallRow) TranscriptionA
 // 3) Updates the calls table denormalized fields
 // 4) Updates the call_groups table transcription fields
 func (db *DB) InsertTranscription(ctx context.Context, row *TranscriptionRow) (int, error) {
+	status, ok := transcriptionStatusForSource[row.Source]
+	if !ok {
+		return 0, fmt.Errorf("%w: %q", ErrInvalidTranscriptionSource, row.Source)
+	}
+
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin tx: %w", err)
@@ -212,10 +240,6 @@ func (db *DB) InsertTranscription(ctx context.Context, row *TranscriptionRow) (i
 	}
 
 	if row.IsPrimary {
-		status := row.Source
-		if status == "human" {
-			status = "verified"
-		}
 		if err := qtx.UpdateCallTranscriptionDenorm(ctx, sqlcdb.UpdateCallTranscriptionDenormParams{
 			CallID:                 row.CallID,
 			StartTime:              pgtype.Timestamptz{Time: row.CallStartTime, Valid: true},
@@ -351,10 +375,13 @@ func (db *DB) SearchTranscriptions(ctx context.Context, p *auth.Principal, query
 		limit = 50
 	}
 
+	// text, language, model, provider, word_count and duration_ms are
+	// nullable; the per-call reads map NULL to the zero value and so does
+	// this one.
 	dataQuery := `
-		SELECT t.id, t.call_id, t.text, t.source, t.is_primary,
-			t.confidence, t.language, t.model, t.provider,
-			t.word_count, t.duration_ms, t.provider_ms, t.words, t.created_at,
+		SELECT t.id, t.call_id, COALESCE(t.text, ''), t.source, t.is_primary,
+			t.confidence, COALESCE(t.language, ''), COALESCE(t.model, ''), COALESCE(t.provider, ''),
+			COALESCE(t.word_count, 0), COALESCE(t.duration_ms, 0), t.provider_ms, t.words, t.created_at,
 			ts_rank(t.search_vector, plainto_tsquery('english', $1)) AS rank,
 			c.system_id, COALESCE(c.system_name, ''), c.tgid,
 			COALESCE(c.tg_alpha_tag, ''), c.start_time, c.duration

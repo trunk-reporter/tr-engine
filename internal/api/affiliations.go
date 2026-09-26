@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -73,11 +74,12 @@ func (h *AffiliationsHandler) ListAffiliations(w http.ResponseWriter, r *http.Re
 		filtered = append(filtered, a)
 	}
 
-	// Compute summary over full filtered set (before pagination)
-	tgCounts := make(map[int]int)
+	// Compute summary over full filtered set (before pagination), keyed
+	// "system_id:tgid" so equal tgids of different systems stay apart.
+	tgCounts := make(map[string]int)
 	for _, a := range filtered {
 		if a.Status == "affiliated" {
-			tgCounts[a.Tgid]++
+			tgCounts[strconv.Itoa(a.SystemID)+":"+strconv.Itoa(a.Tgid)]++
 		}
 	}
 

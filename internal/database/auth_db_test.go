@@ -1020,6 +1020,46 @@ func TestImportLegacyAuth(t *testing.T) {
 			},
 		},
 		{
+			// What the upload pipeline actually writes: calls without an
+			// instance_id, on a site created for UPLOAD_INSTANCE_ID.
+			name:    "uploads in use: calls on an upload site",
+			in:      LegacyAuthInput{UploadInstanceID: "http-upload"},
+			systems: true,
+			setup: func(t *testing.T, db *DB) {
+				mustExec(t, db, `SELECT create_monthly_partition('calls', (date_trunc('month', now()) - interval '1 month')::date)`)
+				mustExec(t, db, `INSERT INTO instances (instance_id) VALUES ('http-upload')`)
+				mustExec(t, db, `INSERT INTO sites (system_id, instance_id, short_name)
+					VALUES ((SELECT min(system_id) FROM systems), 'http-upload', 'butco')`)
+				mustExec(t, db, `INSERT INTO calls (system_id, site_id, tgid, start_time)
+					VALUES ((SELECT min(system_id) FROM systems), (SELECT min(site_id) FROM sites), 1, now() - interval '2 days')`)
+			},
+			check: func(t *testing.T, db *DB, res LegacyAuthResult) {
+				if !res.Detail.UploadsInUse || !res.Detail.NoUploadKey {
+					t.Errorf("upload report = %+v", res.Detail)
+				}
+			},
+		},
+		{
+			name:    "uploads not in use: old calls on an upload site, recent calls elsewhere",
+			in:      LegacyAuthInput{UploadInstanceID: "http-upload"},
+			systems: true,
+			setup: func(t *testing.T, db *DB) {
+				mustExec(t, db, `SELECT create_monthly_partition('calls', (date_trunc('month', now()) - interval '1 month')::date)`)
+				mustExec(t, db, `INSERT INTO instances (instance_id) VALUES ('http-upload'), ('tr-1')`)
+				mustExec(t, db, `INSERT INTO sites (system_id, instance_id, short_name) VALUES
+					((SELECT min(system_id) FROM systems), 'http-upload', 'butco'),
+					((SELECT min(system_id) FROM systems), 'tr-1', 'butco')`)
+				mustExec(t, db, `INSERT INTO calls (system_id, site_id, tgid, start_time) VALUES
+					((SELECT min(system_id) FROM systems), (SELECT site_id FROM sites WHERE instance_id = 'http-upload'), 1, now() - interval '8 days'),
+					((SELECT min(system_id) FROM systems), (SELECT site_id FROM sites WHERE instance_id = 'tr-1'), 1, now() - interval '1 hour')`)
+			},
+			check: func(t *testing.T, db *DB, res LegacyAuthResult) {
+				if res.Detail.UploadsInUse || res.Detail.NoUploadKey {
+					t.Errorf("upload report = %+v", res.Detail)
+				}
+			},
+		},
+		{
 			name:    "uploads in use with an imported upload key",
 			in:      LegacyAuthInput{WriteToken: strongWrite, UploadInstanceID: "http-upload"},
 			systems: true,

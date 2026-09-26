@@ -1,11 +1,11 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"regexp"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -99,23 +99,34 @@ func TestRoutePolicyInvariants(t *testing.T) {
 		if pol.Scope == auth.ScopeUpload && route != "POST /api/v1/call-upload" {
 			t.Errorf("%s: the upload scope grants call upload only", route)
 		}
-		// §16 step 3: only the listen routes §6.3 lists as Enforced may be
-		// (each switches together with its enforcement and integration
-		// test); every other route stays Deny. edit/admin/upload/public
-		// routes never enforce (restricted principals never hold those
-		// scopes).
-		if pol.Restricted != Deny && (!enforceableRoutes[route] || pol.Scope != auth.ScopeListen) {
-			t.Errorf("%s: Restricted = %s; §6.3 has it Deny", route, pol.Restricted)
+		// §6.3: exactly the listen routes it lists as Enforced are Enforced,
+		// the two stream routes included; every other route is Deny.
+		// edit/admin/upload/public routes never enforce (restricted
+		// principals never hold those scopes).
+		wantEnforced := enforceableRoutes[route]
+		if got := pol.Restricted == Enforced; got != wantEnforced {
+			t.Errorf("%s: Restricted = %s; §6.3 has it %s", route, pol.Restricted, map[bool]Mode{true: Enforced, false: Deny}[wantEnforced])
+		}
+		if pol.Restricted == Enforced && pol.Scope != auth.ScopeListen {
+			t.Errorf("%s: Enforced route with scope %q; only listen routes enforce restrictions", route, pol.Scope)
 		}
 		if pol.Scope == "" && (pol.KeyRequired || pol.Ticket || pol.FormKey) {
 			t.Errorf("%s: a public route has no other flags", route)
 		}
 	}
+	for route := range enforceableRoutes {
+		if _, ok := routePolicies[route]; !ok {
+			t.Errorf("§6.3 Enforced route %s is not in the policy table", route)
+		}
+	}
 	for route, want := range map[string]RoutePolicy{
-		"GET /metrics":         {Scope: auth.ScopeListen, KeyRequired: true},
-		"POST /api/v1/tickets": {Scope: auth.ScopeListen, KeyRequired: true},
-		"GET /api/v1/whoami":   {},
-		"GET /*":               {},
+		"GET /metrics":                 {Scope: auth.ScopeListen, KeyRequired: true},
+		"POST /api/v1/tickets":         {Scope: auth.ScopeListen, Restricted: Enforced, KeyRequired: true},
+		"GET /api/v1/calls/{id}/audio": {Scope: auth.ScopeListen, Restricted: Enforced, Ticket: true},
+		"GET /api/v1/events/stream":    {Scope: auth.ScopeListen, Restricted: Enforced, Ticket: true},
+		"GET /api/v1/audio/live":       {Scope: auth.ScopeListen, Restricted: Enforced, Ticket: true},
+		"GET /api/v1/whoami":           {},
+		"GET /*":                       {},
 	} {
 		if got := routePolicies[route]; got != want {
 			t.Errorf("%s = %+v, want %+v", route, got, want)
@@ -501,6 +512,9 @@ func TestAuthorizationGoldenCases(t *testing.T) {
 		{"POST", "/api/v1/query", bearer("edit-key"), 403, ErrInsufficientScope},
 		{"POST", "/api/v1/debug-report", nil, 401, ErrKeyRequired},
 		{"GET", "/api/v1/units", bearer("restricted-key"), 403, ErrRestrictedCredential},
+		{"GET", "/api/v1/events/stream", bearer("restricted-key"), 200, ""}, // Enforced by the stream
+		{"GET", "/api/v1/audio/live", bearer("restricted-key"), 200, ""},
+		{"GET", "/api/v1/audio/jitter", bearer("restricted-key"), 403, ErrRestrictedCredential},
 		{"GET", "/api/v1/calls", bearer("upload-key"), 403, ErrInsufficientScope},
 		{"GET", "/api/v1/whoami", bearer("tre_unknown"), 401, ErrInvalidKey},
 		{"GET", "/api/v1/health", bearer("tre_unknown"), 401, ErrInvalidKey},
@@ -513,6 +527,27 @@ func TestAuthorizationGoldenCases(t *testing.T) {
 		rec := do(shadow, tc.method, tc.path, tc.headers)
 		if rec.Code != tc.status || errorCode(rec) != tc.code {
 			t.Errorf("%s %s %v: got %d %q, want %d %q", tc.method, tc.path, tc.headers, rec.Code, errorCode(rec), tc.status, tc.code)
+		}
+	}
+
+	// An insufficient_scope message names the scope the way openapi.yaml's
+	// example does; clients (tr-dashboard) read the scope from it.
+	for _, tc := range []struct {
+		method, path string
+		headers      map[string]string
+		want         string
+	}{
+		{"PATCH", "/api/v1/talkgroups/1:2", bearer("listen-key"), "this operation needs the edit scope"},
+		{"POST", "/api/v1/query", bearer("edit-key"), "this operation needs the admin scope"},
+		{"GET", "/api/v1/calls", bearer("upload-key"), "this operation needs the listen scope"},
+		{"POST", "/api/v1/call-upload", bearer("listen-key"), "this operation needs the upload scope"},
+	} {
+		rec := do(shadow, tc.method, tc.path, tc.headers)
+		var body struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || errorCode(rec) != ErrInsufficientScope || body.Error != tc.want {
+			t.Errorf("%s %s: %d %s, want insufficient_scope %q", tc.method, tc.path, rec.Code, rec.Body.String(), tc.want)
 		}
 	}
 }
@@ -569,9 +604,7 @@ func TestSSEEventPolicy(t *testing.T) {
 
 // TestOpenAPIAgreesWithPolicyTable reads openapi.yaml's per-operation
 // x-scope / x-restricted / x-key-required and compares them with the table
-// (§6.4). While §16 step 3 is in progress the table may deny restricted
-// principals on an operation the spec already documents as enforced (the
-// fail-closed direction), never the reverse.
+// (§6.4), in both directions.
 func TestOpenAPIAgreesWithPolicyTable(t *testing.T) {
 	raw, err := os.ReadFile("../../openapi.yaml")
 	if err != nil {
@@ -589,7 +622,6 @@ func TestOpenAPIAgreesWithPolicyTable(t *testing.T) {
 		t.Fatalf("parse openapi.yaml: %v", err)
 	}
 	documented := make(map[string]bool)
-	var pending []string
 	for path, item := range doc.Paths {
 		full := apiPrefix + path
 		if path == "/metrics" {
@@ -629,8 +661,6 @@ func TestOpenAPIAgreesWithPolicyTable(t *testing.T) {
 				// Public: the auth layer never looks at restrictions, so
 				// either description is accurate.
 			case op.Restricted == pol.Restricted.String():
-			case op.Restricted == "enforced" && pol.Restricted == Deny:
-				pending = append(pending, route)
 			default:
 				t.Errorf("%s: x-restricted %q, policy table %q", route, op.Restricted, pol.Restricted)
 			}
@@ -641,10 +671,5 @@ func TestOpenAPIAgreesWithPolicyTable(t *testing.T) {
 		if (strings.HasPrefix(pattern, apiPrefix+"/") || pattern == "/metrics") && !documented[route] {
 			t.Errorf("%s has a policy but no operation in openapi.yaml", route)
 		}
-	}
-	sort.Strings(pending)
-	if len(pending) > 0 {
-		t.Logf("%d operations are documented as enforced but still Deny in the table (§16 step 3): %s",
-			len(pending), strings.Join(pending, ", "))
 	}
 }

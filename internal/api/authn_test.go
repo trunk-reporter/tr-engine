@@ -398,8 +398,9 @@ func TestTickets(t *testing.T) {
 		if rec := do(shadow, "GET", "/api/v1/events/stream?ticket="+mint(listen.ID, &auth.Restriction{Systems: []int{3}}, time.Minute), nil); errorCode(rec) != ErrInvalidTicket {
 			t.Errorf("merged system: %d %s, want invalid_ticket", rec.Code, rec.Body.String())
 		}
-		// Ticket routes are still Deny for restricted principals (§16 step 3).
-		if rec := do(shadow, "GET", "/api/v1/events/stream?ticket="+mint(restricted.ID, nil, time.Minute), nil); errorCode(rec) != ErrRestrictedCredential {
+		// Every ticket route is Enforced: a restricted key's ticket gets
+		// through, and the stream applies the restriction (§7.3, §7.4).
+		if rec := do(shadow, "GET", "/api/v1/events/stream?ticket="+mint(restricted.ID, nil, time.Minute), nil); rec.Code != http.StatusOK || rec.Header().Get("X-Test-Principal") != "ticket" {
 			t.Errorf("restricted key's ticket: %d %s", rec.Code, rec.Body.String())
 		}
 		p, _, aerr := a.resolveTicket(t.Context(), mint(restricted.ID, &auth.Restriction{AllowAll: true, ExcludeTalkgroups: []auth.TG{{SystemID: 1, Tgid: 5}}}, time.Minute), false)

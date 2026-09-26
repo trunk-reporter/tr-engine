@@ -2,9 +2,11 @@ package api
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/snarg/tr-engine/internal/audio"
+	"github.com/snarg/tr-engine/internal/auth"
 )
 
 // LiveDataSource provides real-time data from the ingest pipeline to the API layer.
@@ -22,12 +24,18 @@ type LiveDataSource interface {
 	// UnitAffiliations returns current talkgroup affiliation state for all tracked units.
 	UnitAffiliations() []UnitAffiliationData
 
-	// Subscribe returns a channel that receives SSE events matching the filter,
-	// and a cancel function to unsubscribe.
-	Subscribe(filter EventFilter) (<-chan SSEEvent, func())
-
-	// ReplaySince returns buffered events since the given event ID (for Last-Event-ID recovery).
-	ReplaySince(lastEventID string, filter EventFilter) []SSEEvent
+	// SubscribeSince registers an SSE subscriber (§7.3). Events reach it only
+	// if the principal may see them (SSEEventAllowed) and they match the
+	// client's filter. The principal is read for every event, so the stream
+	// re-check can swap it (§7.5); a nil principal gets nothing.
+	//
+	// With a non-empty lastEventID it also returns the buffered events after
+	// that ID that pass the same checks (all buffered events if the ID is no
+	// longer buffered). The replay is taken atomically with the
+	// registration: every event is either in the replay or on the channel,
+	// never both and never neither. cancel unsubscribes and closes the
+	// channel.
+	SubscribeSince(lastEventID string, filter EventFilter, principal *atomic.Pointer[auth.Principal]) (replay []SSEEvent, ch <-chan SSEEvent, cancel func())
 
 	// WatcherStatus returns the file watcher status, or nil if not active.
 	WatcherStatus() *WatcherStatusData
@@ -75,7 +83,8 @@ type CallUploader interface {
 	// ProcessUpload handles an HTTP-uploaded call. fields contains the parsed
 	// form field values, audioData is the raw audio bytes, audioFilename is the
 	// original filename from the upload. format is "rdio-scanner" or "openmhz".
-	// Returns the result or an error (containing "duplicate call" for 409s).
+	// Returns the result or an error (containing "duplicate call" for 409s,
+	// wrapping ErrInvalidUpload for 400s).
 	ProcessUpload(ctx context.Context, instanceID string, format string, fields map[string]string, audioData []byte, audioFilename string) (*UploadCallResult, error)
 }
 
@@ -277,7 +286,13 @@ type BackfillJobData struct {
 
 // AudioStreamer provides live audio streaming capabilities.
 type AudioStreamer interface {
-	SubscribeAudio(filter audio.AudioFilter) (<-chan audio.AudioFrame, func())
+	// SubscribeAudio registers a live-audio subscriber. Frames reach it only
+	// if the principal allows them (audio.PrincipalAllows) and they match the
+	// client's filter. The principal is read for every frame, so the stream
+	// re-check can swap it (§7.5); a nil principal gets nothing.
+	SubscribeAudio(filter audio.AudioFilter, principal *atomic.Pointer[auth.Principal]) (<-chan audio.AudioFrame, func())
+	// UpdateAudioFilter replaces the client's filter; it never changes the
+	// subscriber's principal (§7.4).
 	UpdateAudioFilter(ch <-chan audio.AudioFrame, filter audio.AudioFilter)
 	AudioStreamEnabled() bool
 	AudioStreamStatus() *AudioStreamStatusData
@@ -315,4 +330,7 @@ type SSEEvent struct {
 	UnitID    int    `json:"unit_id,omitempty"`
 	Emergency bool   `json:"-"` // used for server-side filtering only
 	Data      []byte `json:"-"` // pre-serialized JSON payload
+	// Seq is the event bus's publish sequence number (the part of ID after
+	// the dash), used to keep replayed and live events apart.
+	Seq uint64 `json:"-"`
 }

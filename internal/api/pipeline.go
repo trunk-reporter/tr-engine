@@ -131,12 +131,13 @@ func (a *authenticator) Resolve(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		gen := auth.Generation() // read first: streams re-check if it moved since (§7.5)
 		res, aerr := a.resolve(r, m.Policy)
 		if aerr != nil {
 			a.refuse(w, r, m, aerr)
 			return
 		}
-		next.ServeHTTP(w, withPrincipal(r, res.principal, res.key))
+		next.ServeHTTP(w, withPrincipal(withStreamResolver(r, a, gen), res.principal, res.key))
 	})
 }
 
@@ -178,7 +179,7 @@ func authorize(pol RoutePolicy, p *auth.Principal) *authError {
 			msg: "an API key is required: anonymous access is off"}
 	case !p.Has(pol.Scope):
 		return &authError{status: http.StatusForbidden, code: ErrInsufficientScope,
-			msg:          fmt.Sprintf("this credential lacks the %s scope this endpoint needs", pol.Scope),
+			msg:          fmt.Sprintf("this operation needs the %s scope", pol.Scope),
 			uploadReason: fmt.Sprintf("key #%d lacks upload", p.KeyID)}
 	case p.Restricted() && pol.Restricted == Deny:
 		return &authError{status: http.StatusForbidden, code: ErrRestrictedCredential,
@@ -349,7 +350,7 @@ func (a *authenticator) UploadAuth(next http.Handler) http.Handler {
 		p := keyPrincipal(k, auth.SanitizeActor(r.Header.Get("X-Actor")))
 		if !p.Has(auth.ScopeUpload) {
 			reject(&authError{status: http.StatusForbidden, code: ErrInsufficientScope,
-				msg: "this credential lacks the upload scope this endpoint needs", uploadReason: fmt.Sprintf("key #%d lacks upload", k.ID)})
+				msg: "this operation needs the upload scope", uploadReason: fmt.Sprintf("key #%d lacks upload", k.ID)})
 			return
 		}
 		next.ServeHTTP(w, withPrincipal(r, p, k))

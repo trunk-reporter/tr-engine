@@ -57,7 +57,7 @@ func TestRouterResolvesIdentity(t *testing.T) {
 	defer cancel()
 	go router.Run(ctx)
 
-	ch, unsub := bus.Subscribe(AudioFilter{})
+	ch, unsub := bus.Subscribe(AudioFilter{}, unrestricted())
 	defer unsub()
 
 	router.Input() <- makeChunk("butco", 1001, 500)
@@ -97,7 +97,7 @@ func TestRouterDropsUnknownSystem(t *testing.T) {
 	defer cancel()
 	go router.Run(ctx)
 
-	ch, unsub := bus.Subscribe(AudioFilter{})
+	ch, unsub := bus.Subscribe(AudioFilter{}, unrestricted())
 	defer unsub()
 
 	router.Input() <- makeChunk("unknown", 1001, 500)
@@ -124,7 +124,7 @@ func TestRouterDeduplicatesMultiSite(t *testing.T) {
 	defer cancel()
 	go router.Run(ctx)
 
-	ch, unsub := bus.Subscribe(AudioFilter{})
+	ch, unsub := bus.Subscribe(AudioFilter{}, unrestricted())
 	defer unsub()
 
 	// butco sends first — claims the stream for TG 1001
@@ -180,7 +180,7 @@ func TestRouterIdleStreamRelease(t *testing.T) {
 	defer cancel()
 	go router.Run(ctx)
 
-	ch, unsub := bus.Subscribe(AudioFilter{})
+	ch, unsub := bus.Subscribe(AudioFilter{}, unrestricted())
 	defer unsub()
 
 	// butco claims TG 1001
@@ -234,7 +234,7 @@ func TestRouterTracksJitter(t *testing.T) {
 	defer cancel()
 	go router.Run(ctx)
 
-	ch, unsub := bus.Subscribe(AudioFilter{})
+	ch, unsub := bus.Subscribe(AudioFilter{}, unrestricted())
 	defer unsub()
 
 	// Send 3 chunks with controlled timestamps
@@ -285,7 +285,7 @@ func TestRouterActiveStreams(t *testing.T) {
 		t.Errorf("ActiveStreamCount = %d before audio, want 0", n)
 	}
 
-	ch, unsub := bus.Subscribe(AudioFilter{})
+	ch, unsub := bus.Subscribe(AudioFilter{}, unrestricted())
 	defer unsub()
 
 	router.Input() <- makeChunk("butco", 1001, 500)
@@ -353,7 +353,7 @@ func TestRouterInstanceIDResolvesCorrectSystem(t *testing.T) {
 	defer cancel()
 	go router.Run(ctx)
 
-	ch, unsub := bus.Subscribe(AudioFilter{})
+	ch, unsub := bus.Subscribe(AudioFilter{}, unrestricted())
 	defer unsub()
 
 	// Send 10 chunks — all should resolve to system 2 (not randomly to 5)

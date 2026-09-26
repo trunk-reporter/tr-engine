@@ -302,9 +302,7 @@ func NewDebugReportHandler(opts DebugReportOptions) *DebugReportHandler {
 // Submit handles POST /api/v1/debug-report.
 func (h *DebugReportHandler) Submit(w http.ResponseWriter, r *http.Request) {
 	if h.disabled || h.forwardURL == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(`{"error":"debug reports disabled"}`))
+		WriteErrorWithCode(w, http.StatusServiceUnavailable, ErrServiceUnavail, "debug reports disabled")
 		return
 	}
 

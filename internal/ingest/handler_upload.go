@@ -33,10 +33,10 @@ func (p *Pipeline) ProcessUpload(ctx context.Context, instanceID string, format 
 	case "openmhz":
 		meta, err = ParseOpenMHzFields(fields)
 	default:
-		return nil, fmt.Errorf("unsupported upload format: %s", format)
+		return nil, fmt.Errorf("%w: unsupported upload format: %s", api.ErrInvalidUpload, format)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("parse %s fields: %w", format, err)
+		return nil, fmt.Errorf("%w: parse %s fields: %w", api.ErrInvalidUpload, format, err)
 	}
 
 	// OpenMHz doesn't always include short_name — use instanceID as fallback

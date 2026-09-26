@@ -6,12 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 	"github.com/snarg/tr-engine/internal/audio"
+	"github.com/snarg/tr-engine/internal/auth"
 )
 
 type mockAudioStreamer struct {
@@ -19,8 +21,8 @@ type mockAudioStreamer struct {
 	enabled bool
 }
 
-func (m *mockAudioStreamer) SubscribeAudio(filter audio.AudioFilter) (<-chan audio.AudioFrame, func()) {
-	return m.bus.Subscribe(filter)
+func (m *mockAudioStreamer) SubscribeAudio(filter audio.AudioFilter, principal *atomic.Pointer[auth.Principal]) (<-chan audio.AudioFrame, func()) {
+	return m.bus.Subscribe(filter, principal)
 }
 
 func (m *mockAudioStreamer) UpdateAudioFilter(ch <-chan audio.AudioFrame, filter audio.AudioFilter) {
@@ -37,11 +39,28 @@ func (m *mockAudioStreamer) AudioJitterStats() map[string]audio.StreamJitterSnap
 	return nil
 }
 
-// newTestAudioStreamServer creates a test HTTP server with the audio stream handler.
+// newTestAudioStreamServer creates a test HTTP server with the audio stream
+// handler, without the auth pipeline: every connection acts as an
+// unrestricted listen key.
 func newTestAudioStreamServer(streamer AudioStreamer, maxClients int) *httptest.Server {
+	return newTestAudioStreamServerAs(streamer, maxClients,
+		&auth.Principal{Kind: auth.KindKey, KeyID: 1, Scopes: auth.Scopes{auth.ScopeListen}})
+}
+
+// newTestAudioStreamServerAs is newTestAudioStreamServer with every
+// connection acting as p (nil: no principal, as without the pipeline).
+func newTestAudioStreamServerAs(streamer AudioStreamer, maxClients int, p *auth.Principal) *httptest.Server {
 	r := chi.NewRouter()
 	h := NewAudioStreamHandler(streamer, maxClients)
 	r.Route("/api/v1", func(r chi.Router) {
+		r.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if p != nil {
+					req = withPrincipal(req, p, nil)
+				}
+				next.ServeHTTP(w, req)
+			})
+		})
 		h.Routes(r)
 	})
 	return httptest.NewServer(r)

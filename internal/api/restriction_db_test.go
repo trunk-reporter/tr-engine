@@ -3,8 +3,10 @@ package api
 // Integration tests of restriction enforcement on the Restricted = Enforced
 // REST routes (§6.3, §7.1, §7.2): every route is called through the real
 // router (buildRouter) over a real, seeded PostgreSQL with restricted keys,
-// a restricted ticket, a restricted anonymous policy and unrestricted keys.
-// Skipped unless TEST_DATABASE_URL is set (see integrationDB).
+// a restricted anonymous policy and unrestricted keys, and through the real
+// handlers as the principals that tickets resolve to (a key's restriction
+// plus the ticket's narrowing). Skipped unless TEST_DATABASE_URL is set (see
+// integrationDB).
 
 import (
 	"context"
@@ -46,6 +48,7 @@ func (l *restrictionLive) EnqueueTranscription(callID int64) bool {
 type viewer struct {
 	name    string
 	key     string                 // "" = anonymous
+	handler http.Handler           // set: serves the viewer's requests instead of the router (see routerAs)
 	allows  func(sys, tg int) bool // (system, talkgroup) pairs it may see
 	visible func(sys int) bool     // systems whose metadata it may see
 }
@@ -62,16 +65,21 @@ func (c seededCall) pair() string { return tgPair(c.sys, c.tg) }
 func tgPair(sys, tg int) string { return fmt.Sprintf("%d:%d", sys, tg) }
 
 type restrictionFixture struct {
-	db      *database.DB
-	r       *chi.Mux
-	live    *restrictionLive
-	calls   []seededCall
-	groups  map[int]string // call group id → pair
-	admin   string         // admin key (unrestricted, edit implied)
-	adminID int
-	allow   string // listen key: systems [2], talkgroups ["1:100"]
-	allowID int
-	viewers []viewer
+	db        *database.DB
+	r         *chi.Mux
+	authn     *authenticator
+	live      *restrictionLive
+	calls     []seededCall
+	groups    map[int]string // call group id → pair
+	admin     string         // admin key (unrestricted, edit implied)
+	adminID   int
+	allow     string // listen key: systems [2], talkgroups ["1:100"]
+	allowID   int
+	exclude   string // listen key: allow_all, except 1:100 and 2:500
+	excludeID int
+	nothing   string // listen key whose stored restriction allows nothing
+	listenID  int    // unrestricted listen key
+	viewers   []viewer
 }
 
 // The seeded data: three systems, talkgroup 100 in all of them (plain-ID
@@ -186,7 +194,8 @@ func newRestrictionFixture(t *testing.T) *restrictionFixture {
 		t.Fatal(err)
 	}
 
-	opts := allFeaturesOptions(newAuthenticator(db, nil, 1e9, 1<<30, zerolog.Nop()))
+	f.authn = newAuthenticator(db, nil, 1e9, 1<<30, zerolog.Nop())
+	opts := allFeaturesOptions(f.authn)
 	opts.DB = db
 	opts.Live = live
 	cfg := *opts.Config
@@ -195,6 +204,8 @@ func newRestrictionFixture(t *testing.T) *restrictionFixture {
 	f.r = buildRouter(opts)
 	f.admin, f.adminID = admin.Plaintext, admin.ID
 	f.allow, f.allowID = allow.Plaintext, allow.ID
+	f.exclude, f.excludeID = exclude.Plaintext, exclude.ID
+	f.nothing, f.listenID = nothing.Plaintext, listen.ID
 
 	all := func(int, int) bool { return true }
 	everySystem := func(int) bool { return true }
@@ -214,19 +225,104 @@ func newRestrictionFixture(t *testing.T) *restrictionFixture {
 			allows:  func(sys, tg int) bool { return sys == 3 && tg == 700 },
 			visible: func(sys int) bool { return sys == 3 }},
 	}
+	// Ticket principals: the key's restriction plus the ticket's narrowing.
+	// The pipeline accepts tickets only on the ticket routes, so these call
+	// every route through the real handlers with the principal the real
+	// ticket resolution returns (routerAs). Keys can't hold a restriction
+	// that allows nothing; a ticket narrowing can, and so can an empty
+	// intersection of key and narrowing.
+	f.viewers = append(f.viewers,
+		viewer{name: "ticket of the unrestricted listen key", handler: f.routerAs(t, f.ticketPrincipal(t, listen.ID, nil)),
+			allows: all, visible: everySystem},
+		viewer{name: "ticket of the allow-list key narrowed to nothing", handler: f.routerAs(t, f.ticketPrincipal(t, allow.ID, &auth.Restriction{})),
+			allows:  func(int, int) bool { return false },
+			visible: func(int) bool { return false }},
+		viewer{name: "ticket of the allow-list key narrowed to system 3 (empty intersection)",
+			handler: f.routerAs(t, f.ticketPrincipal(t, allow.ID, &auth.Restriction{Systems: []int{3}})),
+			allows:  func(int, int) bool { return false },
+			visible: func(int) bool { return false }},
+		viewer{name: "ticket of the allow_all+exclude key narrowed to system 1",
+			handler: f.routerAs(t, f.ticketPrincipal(t, exclude.ID, &auth.Restriction{Systems: []int{1}})),
+			allows:  func(sys, tg int) bool { return sys == 1 && tg != 0 && tg != 100 },
+			visible: func(sys int) bool { return sys == 1 }},
+		viewer{name: "ticket of the admin key narrowed to 2:100, 3:100 and 3:700",
+			handler: f.routerAs(t, f.ticketPrincipal(t, admin.ID, &auth.Restriction{Talkgroups: []auth.TG{tg(2, 100), tg(3, 100), tg(3, 700)}})),
+			allows:  func(sys, tg int) bool { return (sys == 2 && tg == 100) || (sys == 3 && (tg == 100 || tg == 700)) },
+			visible: func(sys int) bool { return sys == 2 || sys == 3 }},
+	)
 	return f
+}
+
+// signTicket signs a ticket for keyID with the engine's ticket secret.
+func (f *restrictionFixture) signTicket(t *testing.T, keyID int, narrowing *auth.Restriction) string {
+	t.Helper()
+	secret, err := f.db.GetOrCreateTicketSecret(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk, err := auth.SignTicket(secret, auth.TicketPayload{KeyID: keyID, ExpiresAt: time.Now().Add(10 * time.Minute), Narrowing: narrowing})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tk
+}
+
+// ticketPrincipal is the principal a ticket for keyID with the given
+// narrowing resolves to, through the engine's own ticket verification.
+func (f *restrictionFixture) ticketPrincipal(t *testing.T, keyID int, narrowing *auth.Restriction) *auth.Principal {
+	t.Helper()
+	p, _, aerr := f.authn.resolveTicket(context.Background(), f.signTicket(t, keyID, narrowing), true)
+	if aerr != nil {
+		t.Fatalf("resolve ticket of key %d: %s", keyID, aerr.msg)
+	}
+	if p.Kind != auth.KindTicket || !p.Restricted() && narrowing != nil {
+		t.Fatalf("ticket of key %d resolved to %+v", keyID, p)
+	}
+	return p
+}
+
+// routerAs serves every route of f.r with its real handler (route-group
+// middleware included), with p as the principal of every request instead of
+// one the auth pipeline resolves.
+func (f *restrictionFixture) routerAs(t *testing.T, p *auth.Principal) http.Handler {
+	t.Helper()
+	mux := chi.NewRouter()
+	mux.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, withPrincipal(r, p, nil))
+		})
+	})
+	// chi.Walk yields each route's endpoint handler, which already wraps the
+	// route group's middleware; the root pipeline comes separately and is
+	// left out.
+	if err := chi.Walk(f.r, func(method, route string, h http.Handler, _ ...func(http.Handler) http.Handler) error {
+		mux.Method(method, route, h)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return mux
 }
 
 // get sends a GET through the router, with key as a Bearer credential when
 // set.
 func (f *restrictionFixture) get(key, path string) *httptest.ResponseRecorder {
+	return f.getAs(viewer{key: key}, path)
+}
+
+// getAs sends a GET as v: through v's handler when it has one, otherwise
+// through the router with v's key.
+func (f *restrictionFixture) getAs(v viewer, path string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodGet, path, nil)
 	req.RemoteAddr = "192.0.2.40:4000"
-	if key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
+	h := http.Handler(f.r)
+	if v.handler != nil {
+		h = v.handler
+	} else if v.key != "" {
+		req.Header.Set("Authorization", "Bearer "+v.key)
 	}
 	rec := httptest.NewRecorder()
-	f.r.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 	return rec
 }
 
@@ -238,6 +334,7 @@ type listRow struct {
 	SystemID     int     `json:"system_id"`
 	Tgid         int     `json:"tgid"`
 	PatchedTgids []int   `json:"patched_tgids"`
+	CallCount    int     `json:"call_count"`
 	Calls        []int64 `json:"-"`
 }
 
@@ -245,7 +342,7 @@ type listRow struct {
 // fails the test unless the answer is 200.
 func (f *restrictionFixture) list(t *testing.T, v viewer, path, field string) ([]listRow, int) {
 	t.Helper()
-	rec := f.get(v.key, path)
+	rec := f.getAs(v, path)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("%s: GET %s = %d %s", v.name, path, rec.Code, rec.Body.String())
 	}
@@ -351,10 +448,10 @@ func TestIntegrationRestrictedRoutes(t *testing.T) {
 				if v.visible(sys) {
 					wantCode = http.StatusOK
 				}
-				if rec := f.get(v.key, fmt.Sprintf("/api/v1/systems/%d", sys)); rec.Code != wantCode {
+				if rec := f.getAs(v, fmt.Sprintf("/api/v1/systems/%d", sys)); rec.Code != wantCode {
 					t.Errorf("%s: GET /systems/%d = %d, want %d", v.name, sys, rec.Code, wantCode)
 				}
-				if rec := f.get(v.key, fmt.Sprintf("/api/v1/sites/%d", 10+sys)); rec.Code != wantCode {
+				if rec := f.getAs(v, fmt.Sprintf("/api/v1/sites/%d", 10+sys)); rec.Code != wantCode {
 					t.Errorf("%s: GET /sites/%d = %d, want %d", v.name, 10+sys, rec.Code, wantCode)
 				}
 			}
@@ -381,7 +478,7 @@ func TestIntegrationRestrictedRoutes(t *testing.T) {
 					want = http.StatusOK
 				}
 				for _, id := range []string{tgPair(p[0], p[1]), fmt.Sprintf("%d-%d", p[0], p[1])} {
-					if rec := f.get(v.key, "/api/v1/talkgroups/"+id); rec.Code != want {
+					if rec := f.getAs(v, "/api/v1/talkgroups/"+id); rec.Code != want {
 						t.Errorf("%s: GET /talkgroups/%s = %d, want %d", v.name, id, rec.Code, want)
 					}
 				}
@@ -406,10 +503,19 @@ func TestIntegrationRestrictedRoutes(t *testing.T) {
 			{viewer: 3, id: "700", status: http.StatusOK, resolved: 3},
 			{viewer: 2, id: "700", status: http.StatusNotFound},
 			{viewer: 5, id: "700", status: http.StatusOK, resolved: 3},
+			// Ticket principals (key restriction ∩ narrowing).
+			{viewer: 6, id: "100", status: http.StatusConflict, matches: []int{1, 2, 3}},
+			{viewer: 10, id: "100", status: http.StatusConflict, matches: []int{2, 3}},
+			{viewer: 10, id: "700", status: http.StatusOK, resolved: 3},
+			{viewer: 10, id: "500", status: http.StatusNotFound},
+			{viewer: 9, id: "100", status: http.StatusNotFound},
+			{viewer: 9, id: "200", status: http.StatusOK, resolved: 1},
+			{viewer: 7, id: "100", status: http.StatusNotFound},
+			{viewer: 8, id: "500", status: http.StatusNotFound},
 		}
 		for _, c := range cases {
 			v := f.viewers[c.viewer]
-			rec := f.get(v.key, "/api/v1/talkgroups/"+c.id)
+			rec := f.getAs(v, "/api/v1/talkgroups/"+c.id)
 			if rec.Code != c.status {
 				t.Errorf("%s: GET /talkgroups/%s = %d %s, want %d", v.name, c.id, rec.Code, rec.Body.String(), c.status)
 				continue
@@ -445,7 +551,7 @@ func TestIntegrationRestrictedRoutes(t *testing.T) {
 			for _, p := range seedTalkgroups {
 				path := "/api/v1/talkgroups/" + tgPair(p[0], p[1]) + "/calls"
 				if !v.allows(p[0], p[1]) {
-					if rec := f.get(v.key, path); rec.Code != http.StatusNotFound {
+					if rec := f.getAs(v, path); rec.Code != http.StatusNotFound {
 						t.Errorf("%s: GET %s = %d, want 404", v.name, path, rec.Code)
 					}
 					continue
@@ -460,6 +566,7 @@ func TestIntegrationRestrictedRoutes(t *testing.T) {
 				if got := pairsOf(rows); !slices.Equal(got, expectPairs(v, want)) || total != len(want) {
 					t.Errorf("%s: GET %s = %v (total %d), want %d calls", v.name, path, got, total, len(want))
 				}
+				checkPatched(t, v, rows)
 			}
 		}
 		// Plain 100 for the allow_all+exclude key is ambiguous between 2 and 3;
@@ -514,7 +621,7 @@ func TestIntegrationRestrictedRoutes(t *testing.T) {
 				}
 				for _, route := range routes {
 					path := fmt.Sprintf("/api/v1/calls/%d%s", c.id, route)
-					rec := f.get(v.key, path)
+					rec := f.getAs(v, path)
 					if rec.Code != want {
 						t.Errorf("%s: GET %s (%s) = %d %s, want %d", v.name, path, c.pair(), rec.Code, rec.Body.String(), want)
 						continue
@@ -534,7 +641,7 @@ func TestIntegrationRestrictedRoutes(t *testing.T) {
 			}
 			for _, route := range routes {
 				path := "/api/v1/calls/999999" + route
-				if rec := f.get(v.key, path); rec.Code != http.StatusNotFound {
+				if rec := f.getAs(v, path); rec.Code != http.StatusNotFound {
 					t.Errorf("%s: GET %s (no such call) = %d, want 404", v.name, path, rec.Code)
 				}
 			}
@@ -555,58 +662,34 @@ func TestIntegrationRestrictedRoutes(t *testing.T) {
 	})
 
 	t.Run("call audio with tickets", func(t *testing.T) {
-		// Tickets of the unrestricted key come from POST /tickets. Those of
-		// the restricted key are signed here with the engine's secret, so this
-		// test doesn't depend on the tickets route's own restriction policy;
-		// either way the key's current restriction is applied at
+		// Tickets minted through POST /tickets (by unrestricted and
+		// restricted keys) and signed directly with the engine's secret.
+		// Either way the key's current restriction is applied at
 		// verification, intersected with the narrowing.
-		mint := func(narrowing string) string {
-			t.Helper()
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/tickets", strings.NewReader(narrowing))
-			req.RemoteAddr = "192.0.2.40:4000"
-			req.Header.Set("Authorization", "Bearer "+f.admin)
-			req.Header.Set("Content-Type", "application/json")
-			rec := httptest.NewRecorder()
-			f.r.ServeHTTP(rec, req)
-			var tk ticketResponse
-			if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &tk) != nil {
-				t.Fatalf("mint %s: %d %s", narrowing, rec.Code, rec.Body.String())
-			}
-			return tk.Ticket
-		}
-		secret, err := f.db.GetOrCreateTicketSecret(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		sign := func(keyID int, narrowing *auth.Restriction) string {
-			t.Helper()
-			tk, err := auth.SignTicket(secret, auth.TicketPayload{KeyID: keyID, ExpiresAt: time.Now().Add(10 * time.Minute), Narrowing: narrowing})
-			if err != nil {
-				t.Fatal(err)
-			}
-			return tk
-		}
+		sign := func(keyID int, narrowing *auth.Restriction) string { return f.signTicket(t, keyID, narrowing) }
 		tickets := []struct {
 			name   string
 			ticket string
 			allows func(sys, tg int) bool
 		}{
-			{"unrestricted key, no narrowing", mint(`{}`), func(int, int) bool { return true }},
-			{"unrestricted key narrowed to 3:700", mint(`{"restriction":{"talkgroups":["3:700"]}}`),
+			{"unrestricted key, no narrowing", f.mintTicket(t, f.admin, `{}`), func(int, int) bool { return true }},
+			{"unrestricted key narrowed to 3:700", f.mintTicket(t, f.admin, `{"restriction":{"talkgroups":["3:700"]}}`),
 				func(sys, tg int) bool { return sys == 3 && tg == 700 }},
-			{"unrestricted key narrowed to nothing", mint(`{"restriction":{}}`),
+			{"unrestricted key narrowed to nothing", f.mintTicket(t, f.admin, `{"restriction":{}}`),
 				func(int, int) bool { return false }},
 			{"unrestricted key narrowed to nothing (signed)", sign(f.adminID, &auth.Restriction{}),
 				func(int, int) bool { return false }},
-			{"allow-list key, no narrowing", sign(f.allowID, nil),
+			{"allow-list key, no narrowing", f.mintTicket(t, f.allow, ``),
 				func(sys, tg int) bool { return tg != 0 && (sys == 2 || (sys == 1 && tg == 100)) }},
-			{"allow-list key narrowed to system 1", sign(f.allowID, &auth.Restriction{Systems: []int{1}}),
+			{"allow-list key narrowed to system 1", f.mintTicket(t, f.allow, `{"restriction":{"systems":[1]}}`),
 				func(sys, tg int) bool { return sys == 1 && tg == 100 }},
 			{"allow-list key narrowed to system 3 (empty intersection)", sign(f.allowID, &auth.Restriction{Systems: []int{3}}),
 				func(int, int) bool { return false }},
 			{"allow-list key narrowed with an exclusion", sign(f.allowID, &auth.Restriction{AllowAll: true,
 				ExcludeTalkgroups: []auth.TG{{SystemID: 2, Tgid: 100}}}),
 				func(sys, tg int) bool { return (sys == 2 && tg != 0 && tg != 100) || (sys == 1 && tg == 100) }},
+			{"allow_all+exclude key narrowed to allow_all", f.mintTicket(t, f.exclude, `{"restriction":{"allow_all":true}}`),
+				func(sys, tg int) bool { return tg != 0 && !(sys == 1 && tg == 100) && !(sys == 2 && tg == 500) }},
 		}
 		for _, tk := range tickets {
 			for _, c := range f.calls {
@@ -629,11 +712,31 @@ func TestIntegrationRestrictedRoutes(t *testing.T) {
 			groupPairs = append(groupPairs, p)
 		}
 		f.checkList(t, "/api/v1/call-groups", "call_groups", groupPairs, "tgid=200")
+		// members counts the member calls of a group that v may see; the
+		// group of 1:100 also holds an inconsistent 1:200 call.
+		members := func(v viewer, group int) [][2]int {
+			var out [][2]int
+			for _, c := range f.calls {
+				if c.group == group && v.allows(c.sys, c.tg) {
+					out = append(out, [2]int{c.sys, c.tg})
+				}
+			}
+			return out
+		}
+		for _, v := range f.viewers {
+			rows, _ := f.list(t, v, "/api/v1/call-groups?limit=1000", "call_groups")
+			for _, g := range rows {
+				if want := len(members(v, g.ID)); g.CallCount != want {
+					t.Errorf("%s: GET /call-groups: group %d (%d:%d) call_count = %d, want %d",
+						v.name, g.ID, g.SystemID, g.Tgid, g.CallCount, want)
+				}
+			}
+		}
 		for _, v := range f.viewers {
 			for id, pair := range f.groups {
 				var sys, tg int
 				fmt.Sscanf(pair, "%d:%d", &sys, &tg)
-				rec := f.get(v.key, fmt.Sprintf("/api/v1/call-groups/%d", id))
+				rec := f.getAs(v, fmt.Sprintf("/api/v1/call-groups/%d", id))
 				if !v.allows(sys, tg) {
 					if rec.Code != http.StatusNotFound {
 						t.Errorf("%s: GET /call-groups/%d (%s) = %d, want 404", v.name, id, pair, rec.Code)
@@ -649,14 +752,12 @@ func TestIntegrationRestrictedRoutes(t *testing.T) {
 					Calls []listRow `json:"calls"`
 				}
 				json.Unmarshal(rec.Body.Bytes(), &body)
-				var want [][2]int
-				for _, c := range f.calls {
-					if c.group == id {
-						want = append(want, [2]int{c.sys, c.tg})
-					}
-				}
+				want := members(v, id)
 				if got := pairsOf(body.Calls); !slices.Equal(got, expectPairs(v, want)) {
 					t.Errorf("%s: GET /call-groups/%d member calls %v, want %v", v.name, id, got, expectPairs(v, want))
+				}
+				if body.Group.CallCount != len(want) {
+					t.Errorf("%s: GET /call-groups/%d call_count = %d, want %d", v.name, id, body.Group.CallCount, len(want))
 				}
 				checkPatched(t, v, body.Calls)
 			}
@@ -695,6 +796,100 @@ func TestIntegrationRestrictedRoutes(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestIntegrationTicketsForRestrictedKeys covers POST /tickets as a
+// Restricted = Enforced route (§3.5, §6.3): restricted keys mint tickets, a
+// ticket carries only the requested narrowing (never the key's restriction),
+// a narrowing can't widen the key's access, and the key's current
+// restriction is applied each time a ticket is verified.
+func TestIntegrationTicketsForRestrictedKeys(t *testing.T) {
+	f := newRestrictionFixture(t)
+	secret, err := f.db.GetOrCreateTicketSecret(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrowingOf := func(ticket string) *auth.Restriction {
+		t.Helper()
+		p, err := auth.VerifyTicket(secret, ticket, time.Now())
+		if err != nil {
+			t.Fatalf("verify %s: %v", ticket, err)
+		}
+		return p.Narrowing
+	}
+	// checkAudio fetches every seeded call's audio with the ticket and no
+	// other credential: 200 exactly for the calls allows lets through.
+	checkAudio := func(what, ticket string, allows func(sys, tg int) bool) {
+		t.Helper()
+		for _, c := range f.calls {
+			want := http.StatusNotFound
+			if allows(c.sys, c.tg) {
+				want = http.StatusOK
+			}
+			if rec := f.get("", fmt.Sprintf("/api/v1/calls/%d/audio?ticket=%s", c.id, ticket)); rec.Code != want {
+				t.Errorf("%s: audio of %s = %d, want %d", what, c.pair(), rec.Code, want)
+			}
+		}
+	}
+	allowList := func(sys, tg int) bool { return tg != 0 && (sys == 2 || (sys == 1 && tg == 100)) }
+	none := func(int, int) bool { return false }
+
+	// The payload holds only the requested narrowing.
+	plain := f.mintTicket(t, f.allow, ``)
+	if n := narrowingOf(plain); n != nil {
+		t.Errorf("ticket without a narrowing carries %+v", n)
+	}
+	narrowed := f.mintTicket(t, f.allow, `{"ttl_seconds":120,"restriction":{"systems":[3,3],"exclude_talkgroups":["3:100"]}}`)
+	want := &auth.Restriction{Systems: []int{3}, ExcludeTalkgroups: []auth.TG{{SystemID: 3, Tgid: 100}}}
+	if n := narrowingOf(narrowed); !n.Equal(want) {
+		t.Errorf("narrowed ticket carries %+v, want %+v", n, want)
+	}
+	wide := f.mintTicket(t, f.allow, `{"restriction":{"allow_all":true}}`)
+	nothingKey := f.mintTicket(t, f.nothing, ``)
+	excludeKey := f.mintTicket(t, f.exclude, `{"restriction":{"talkgroups":["1:100","1:200"]}}`)
+
+	checkAudio("allow-list key", plain, allowList)
+	checkAudio("allow-list key narrowed to system 3 (empty intersection)", narrowed, none)
+	checkAudio("allow-list key narrowed to allow_all (can't widen)", wide, allowList)
+	checkAudio("key whose restriction allows nothing", nothingKey, none)
+	checkAudio("allow_all+exclude key narrowed to 1:100 and 1:200", excludeKey,
+		func(sys, tg int) bool { return sys == 1 && tg == 200 })
+
+	// A key PATCH reaches outstanding tickets at once.
+	expectStatus(t, call(t, f.r, "PATCH", fmt.Sprintf("/api/v1/keys/%d", f.allowID), f.admin,
+		`{"restriction":{"systems":[3]}}`, nil), http.StatusOK, "", "re-restrict the allow-list key")
+	system3 := func(sys, tg int) bool { return sys == 3 && tg != 0 }
+	checkAudio("allow-list key after the PATCH", plain, system3)
+	checkAudio("allow-list key narrowed to system 3 after the PATCH", narrowed,
+		func(sys, tg int) bool { return sys == 3 && tg == 700 })
+	checkAudio("allow-list key narrowed to allow_all after the PATCH", wide, system3)
+
+	// Refusals: the route is KeyRequired, and narrowings are validated.
+	expectStatus(t, call(t, f.r, "POST", "/api/v1/tickets", "", nil, nil), http.StatusUnauthorized, ErrKeyRequired,
+		"restricted anonymous minting a ticket")
+	expectStatus(t, call(t, f.r, "POST", "/api/v1/tickets", f.allow, `{"restriction":{"talkgroups":["3:x"]}}`, nil),
+		http.StatusBadRequest, ErrInvalidBody, "invalid narrowing")
+	expectStatus(t, call(t, f.r, "POST", "/api/v1/tickets", f.allow, `{"restriction":{"allow_all":true,"systems":[1]}}`, nil),
+		http.StatusBadRequest, ErrInvalidBody, "allow_all with systems")
+}
+
+// mintTicket mints a ticket through POST /tickets with key and the given
+// body, and fails the test unless that works.
+func (f *restrictionFixture) mintTicket(t *testing.T, key, body string) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tickets", strings.NewReader(body))
+	req.RemoteAddr = "192.0.2.40:4000"
+	req.Header.Set("Authorization", "Bearer "+key)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	f.r.ServeHTTP(rec, req)
+	var tk ticketResponse
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &tk) != nil {
+		t.Fatalf("mint %q: %d %s", body, rec.Code, rec.Body.String())
+	}
+	return tk.Ticket
 }
 
 // checkPatched checks that every patched talkgroup v gets is one it may see,
@@ -749,18 +944,76 @@ func TestIntegrationEnforcedRouteFixes(t *testing.T) {
 
 	t.Run("correction with an invalid source is 400", func(t *testing.T) {
 		path := fmt.Sprintf("/api/v1/calls/%d/transcription", call.id)
-		rec := send(http.MethodPut, path, `{"text":"corrected","source":"robot"}`)
-		if rec.Code != http.StatusBadRequest || errorCode(rec) != string(ErrInvalidBody) {
-			t.Errorf("PUT source=robot = %d %s, want 400 invalid_body", rec.Code, rec.Body.String())
+		countVariants := func() int {
+			var body struct {
+				Total int `json:"total"`
+			}
+			json.Unmarshal(f.get(f.admin, path+"s").Body.Bytes(), &body)
+			return body.Total
 		}
-		for _, source := range []string{"", "human", "llm", "auto"} {
+		before := countVariants()
+		for _, source := range []string{"robot", "Human", "verified"} {
 			rec := send(http.MethodPut, path, `{"text":"corrected","source":"`+source+`"}`)
+			if rec.Code != http.StatusBadRequest || errorCode(rec) != string(ErrInvalidBody) {
+				t.Errorf("PUT source=%s = %d %s, want 400 invalid_body", source, rec.Code, rec.Body.String())
+			}
+		}
+		if n := countVariants(); n != before {
+			t.Errorf("rejected corrections were stored: %d transcriptions, had %d", n, before)
+		}
+		// Every source the openapi enum and the transcriptions.source CHECK
+		// accept is saved, and gives the call and its group a status their
+		// own CHECK accepts ("llm" used to be copied into it: 500).
+		for _, tc := range []struct{ source, stored, status string }{
+			{"", "human", "verified"},
+			{"human", "human", "verified"},
+			{"llm", "llm", "auto"},
+			{"auto", "auto", "auto"},
+		} {
+			rec := send(http.MethodPut, path, `{"text":"corrected by `+tc.stored+`","source":"`+tc.source+`"}`)
 			if rec.Code != http.StatusOK {
-				t.Errorf("PUT source=%q = %d %s", source, rec.Code, rec.Body.String())
+				t.Errorf("PUT source=%q = %d %s", tc.source, rec.Code, rec.Body.String())
+				continue
+			}
+			var primary struct {
+				Source string `json:"source"`
+				Text   string `json:"text"`
+			}
+			json.Unmarshal(f.get(f.admin, path).Body.Bytes(), &primary)
+			var c struct {
+				TranscriptionStatus string `json:"transcription_status"`
+			}
+			json.Unmarshal(f.get(f.admin, fmt.Sprintf("/api/v1/calls/%d", call.id)).Body.Bytes(), &c)
+			var g struct {
+				Group struct {
+					TranscriptionStatus string `json:"transcription_status"`
+				} `json:"call_group"`
+			}
+			json.Unmarshal(f.get(f.admin, fmt.Sprintf("/api/v1/call-groups/%d", call.group)).Body.Bytes(), &g)
+			if primary.Source != tc.stored || primary.Text != "corrected by "+tc.stored ||
+				c.TranscriptionStatus != tc.status || g.Group.TranscriptionStatus != tc.status {
+				t.Errorf("PUT source=%q: primary %+v, call status %q, group status %q; want source %q, status %q",
+					tc.source, primary, c.TranscriptionStatus, g.Group.TranscriptionStatus, tc.stored, tc.status)
 			}
 		}
 		if rec := send(http.MethodPut, "/api/v1/calls/999999/transcription", `{"text":"x"}`); rec.Code != http.StatusNotFound {
 			t.Errorf("PUT for a missing call = %d", rec.Code)
+		}
+	})
+
+	t.Run("transcription search tolerates NULL columns", func(t *testing.T) {
+		// Transcriptions written by older versions or by hand may have NULL
+		// text, language, model, provider, word_count and duration_ms; the
+		// per-call reads always coped, and search must too.
+		if _, err := f.db.Pool.Exec(context.Background(), `INSERT INTO transcriptions
+			(call_id, call_start_time, text, source, is_primary, language, model, provider, word_count, duration_ms)
+			SELECT call_id, start_time, 'nullcolumns engine', 'auto', false, NULL, NULL, NULL, NULL, NULL
+			FROM calls WHERE call_id = $1`, call.id); err != nil {
+			t.Fatal(err)
+		}
+		rec := f.get(f.admin, "/api/v1/transcriptions/search?q=nullcolumns&primary_only=false")
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"total":1`) {
+			t.Errorf("search = %d %s", rec.Code, rec.Body.String())
 		}
 	})
 

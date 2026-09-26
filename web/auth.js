@@ -190,6 +190,16 @@
     var key = apiKey;
     var p = fetchWhoami(key).then(function (r) {
       if (key !== apiKey) return whoamiPromise !== p ? whoamiPromise : null;  // superseded
+      if (r.status === 200 && r.body && key && r.body.credential !== 'key') {
+        // The engine ignored the stored value: it is the retired public
+        // AUTH_TOKEN, not an API key. Keeping it would suppress the key
+        // prompt and make every ticket mint fail, so forget it.
+        warnOnce('ignored-key', 'tr-engine: the stored value is not an API key (the engine ignores it; ' +
+          'probably the retired public AUTH_TOKEN), so it was forgotten');
+        storageRemove(STORAGE_KEY);
+        applyKeyChange('', r.body);
+        return whoamiData;
+      }
       if (r.status === 200 && r.body) {
         whoamiData = r.body;
         anonymous = r.body.anonymous || null;
@@ -899,6 +909,10 @@
       fetchWhoami(candidate).then(function (r) {
         save.disabled = false;
         save.textContent = 'Save key';
+        if (r.status === 200 && r.body && r.body.credential !== 'key') {
+          showErr('tr-engine ignored this value: it is the retired public AUTH_TOKEN, not an API key. Ask the operator for an API key.');
+          return;
+        }
         if (r.status === 200 && r.body) {
           var scopes = Array.isArray(r.body.scopes) ? r.body.scopes : [];
           var listens = scopes.some(function (s) { return s === 'listen' || s === 'edit' || s === 'admin'; });

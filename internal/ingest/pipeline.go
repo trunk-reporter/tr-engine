@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/snarg/tr-engine/internal/api"
 	"github.com/snarg/tr-engine/internal/audio"
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/database"
 	"github.com/snarg/tr-engine/internal/metrics"
 	"github.com/snarg/tr-engine/internal/storage"
@@ -576,14 +577,15 @@ func (p *Pipeline) TranscriptionQueueStats() *api.TranscriptionQueueStatsData {
 	return result
 }
 
-// SubscribeAudio subscribes to live audio frames matching the filter.
-func (p *Pipeline) SubscribeAudio(filter audio.AudioFilter) (<-chan audio.AudioFrame, func()) {
+// SubscribeAudio subscribes to the live audio frames principal may hear
+// that match the filter.
+func (p *Pipeline) SubscribeAudio(filter audio.AudioFilter, principal *atomic.Pointer[auth.Principal]) (<-chan audio.AudioFrame, func()) {
 	if p.audioBus == nil {
 		ch := make(chan audio.AudioFrame)
 		close(ch)
 		return ch, func() {}
 	}
-	return p.audioBus.Subscribe(filter)
+	return p.audioBus.Subscribe(filter, principal)
 }
 
 // UpdateAudioFilter changes the filter for an existing audio subscriber.
@@ -1760,9 +1762,10 @@ func (p *Pipeline) ActiveCalls() []api.ActiveCallData {
 	return calls
 }
 
-// LatestRecorders returns the most recent recorder state snapshot.
+// LatestRecorders returns the most recent recorder state snapshot, never nil
+// (GET /recorders answers [] rather than null).
 func (p *Pipeline) LatestRecorders() []api.RecorderStateData {
-	var recorders []api.RecorderStateData
+	recorders := []api.RecorderStateData{}
 	p.recorderCache.Range(func(key, value any) bool {
 		if r, ok := value.(api.RecorderStateData); ok {
 			recorders = append(recorders, r)
@@ -1772,14 +1775,10 @@ func (p *Pipeline) LatestRecorders() []api.RecorderStateData {
 	return recorders
 }
 
-// Subscribe registers a new SSE subscriber with the given filter.
-func (p *Pipeline) Subscribe(filter api.EventFilter) (<-chan api.SSEEvent, func()) {
-	return p.eventBus.Subscribe(filter)
-}
-
-// ReplaySince returns buffered events since the given event ID.
-func (p *Pipeline) ReplaySince(lastEventID string, filter api.EventFilter) []api.SSEEvent {
-	return p.eventBus.ReplaySince(lastEventID, filter)
+// SubscribeSince registers an SSE subscriber acting as principal, with the
+// buffered events after lastEventID it may see (EventBus.SubscribeSince).
+func (p *Pipeline) SubscribeSince(lastEventID string, filter api.EventFilter, principal *atomic.Pointer[auth.Principal]) ([]api.SSEEvent, <-chan api.SSEEvent, func()) {
+	return p.eventBus.SubscribeSince(lastEventID, filter, principal)
 }
 
 // RewriteSystemID updates the identity cache after a system merge,

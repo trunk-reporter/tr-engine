@@ -73,10 +73,6 @@ func (h *TranscriptionsHandler) ListCallTranscriptions(w http.ResponseWriter, r 
 	})
 }
 
-// transcriptionSources are the values the transcriptions.source CHECK
-// constraint accepts.
-var transcriptionSources = map[string]bool{"auto": true, "human": true, "llm": true}
-
 // SubmitCorrection accepts a human correction for a call's transcription.
 func (h *TranscriptionsHandler) SubmitCorrection(w http.ResponseWriter, r *http.Request) {
 	id, err := PathInt64(r, "id")
@@ -105,7 +101,9 @@ func (h *TranscriptionsHandler) SubmitCorrection(w http.ResponseWriter, r *http.
 	if source == "" {
 		source = "human"
 	}
-	if !transcriptionSources[source] {
+	// Checked before any database access: the transcriptions.source CHECK
+	// would otherwise turn a bad value into a 500.
+	if !database.ValidTranscriptionSource(source) {
 		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody, "source must be one of auto, human, llm")
 		return
 	}

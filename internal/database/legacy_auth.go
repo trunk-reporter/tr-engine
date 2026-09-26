@@ -458,10 +458,14 @@ func importLegacyAuth(ctx context.Context, tx pgx.Tx, in LegacyAuthInput) (Legac
 		d.SuggestAnonymousListen = true
 	}
 
-	// Step 8: were uploads in use, and can anything still upload?
+	// Step 8: were uploads in use, and can anything still upload? Uploaded
+	// calls don't carry calls.instance_id (the upload pipeline leaves it
+	// NULL); they belong to sites created for UPLOAD_INSTANCE_ID.
 	if in.UploadInstanceID != "" {
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM calls
-			WHERE instance_id = $1 AND start_time > now() - interval '7 days')`,
+			WHERE start_time > now() - interval '7 days'
+			  AND (instance_id = $1
+			       OR site_id IN (SELECT site_id FROM sites WHERE instance_id = $1)))`,
 			in.UploadInstanceID).Scan(&d.UploadsInUse); err != nil {
 			return d, fmt.Errorf("check recent uploads: %w", err)
 		}

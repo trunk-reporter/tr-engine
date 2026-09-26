@@ -355,7 +355,9 @@ func TestIntegrationAnonymousAccessAPI(t *testing.T) {
 	if b, _ := json.Marshal(who); strings.Contains(string(b), "5001") {
 		t.Errorf("whoami reveals the exclusions: %s", b)
 	}
-	expectStatus(t, call(t, r, "GET", "/api/v1/talkgroups", "", nil, nil), 403, ErrRestrictedCredential, "restricted anonymous on a Deny route")
+	expectStatus(t, call(t, r, "GET", "/api/v1/units", "", nil, nil), 403, ErrRestrictedCredential, "restricted anonymous on a Deny route")
+	expectStatus(t, call(t, r, "GET", "/api/v1/stats", "", nil, nil), 403, ErrRestrictedCredential, "restricted anonymous on a Deny route")
+	expectStatus(t, call(t, r, "GET", "/api/v1/talkgroups", "", nil, nil), 200, "", "restricted anonymous on an Enforced route")
 
 	// Health is trimmed for anonymous callers and full for the admin key.
 	var health map[string]any

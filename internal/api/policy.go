@@ -38,8 +38,8 @@ var (
 	listenRoute = RoutePolicy{Scope: auth.ScopeListen} // Restricted: Deny
 	editRoute   = RoutePolicy{Scope: auth.ScopeEdit}
 	adminRoute  = RoutePolicy{Scope: auth.ScopeAdmin}
-	// ticketRoute is a listen route that also honours ?ticket=.
-	ticketRoute = RoutePolicy{Scope: auth.ScopeListen, Ticket: true}
+	// ticketRoute is an enforced listen route that also honours ?ticket=.
+	ticketRoute = RoutePolicy{Scope: auth.ScopeListen, Restricted: Enforced, Ticket: true}
 	// enforcedRoute is a listen route whose handler applies restrictions.
 	enforcedRoute = RoutePolicy{Scope: auth.ScopeListen, Restricted: Enforced}
 )
@@ -52,9 +52,9 @@ var (
 // HEAD requests are served by the GET handler (middleware.GetHead) and use the
 // GET entry.
 //
-// Every listen route is Restricted: Deny until its handler enforces
-// restrictions (§16 step 3). A route family switches to Enforced in the same
-// change as its enforcement and integration test.
+// A listen route is Enforced only when its handler applies the principal's
+// restrictions (§6.3, §7); otherwise it is Deny, and restricted principals
+// get 403 restricted_credential.
 var routePolicies = map[string]RoutePolicy{
 	// Public: no credential needed; the anonymous policy doesn't matter.
 	"GET /api/v1/health":       publicRoute,
@@ -64,11 +64,15 @@ var routePolicies = map[string]RoutePolicy{
 	"GET /favicon.ico":         publicRoute,
 	"GET /*":                   publicRoute,
 
-	// listen; §6.3 lists all of these as Enforced. The enforcedRoute ones
-	// are: their handlers pass the principal to the query functions, which
-	// apply its restrictions (§7.2), and single resources outside them are
-	// 404 (restriction_db_test.go covers each). The others stay Deny until
-	// their handlers apply the principal's restrictions.
+	// listen, Restricted: Enforced (§6.3). The REST handlers pass the
+	// principal to the query functions, which apply its restrictions (§7.2),
+	// and single resources outside them are 404 (restriction_db_test.go
+	// covers each). POST /tickets signs only the requested narrowing; the
+	// key's current restriction is applied each time the ticket is verified.
+	// The SSE stream and the live-audio WebSocket keep the principal on
+	// their subscriber, check every event (SSEEventAllowed) and frame
+	// (audio.PrincipalAllows) against it, and re-check it while open (§7.3
+	// to §7.5; stream_db_test.go).
 	"GET /api/v1/systems":                   enforcedRoute,
 	"GET /api/v1/systems/{id}":              enforcedRoute,
 	"GET /api/v1/sites/{id}":                enforcedRoute,
@@ -90,7 +94,7 @@ var routePolicies = map[string]RoutePolicy{
 	"GET /api/v1/transcriptions/batch":      enforcedRoute,
 	"GET /api/v1/events/stream":             ticketRoute,
 	"GET /api/v1/audio/live":                ticketRoute,
-	"POST /api/v1/tickets":                  {Scope: auth.ScopeListen, KeyRequired: true},
+	"POST /api/v1/tickets":                  {Scope: auth.ScopeListen, Restricted: Enforced, KeyRequired: true},
 
 	// listen, Restricted: Deny (§6.3): no talkgroup dimension, or aggregates
 	// that leak other talkgroups' activity.

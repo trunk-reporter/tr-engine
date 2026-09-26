@@ -21,7 +21,7 @@ func TestEndToEndPCMFlow(t *testing.T) {
 	go router.Run(ctx)
 
 	// Subscribe to all audio
-	ch, cancelSub := bus.Subscribe(AudioFilter{})
+	ch, cancelSub := bus.Subscribe(AudioFilter{}, unrestricted())
 	defer cancelSub()
 
 	// Simulate 5 consecutive 20ms audio chunks (100ms of audio)

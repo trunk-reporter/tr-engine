@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -8,6 +9,10 @@ import (
 
 	"github.com/rs/zerolog"
 )
+
+// ErrInvalidUpload marks a CallUploader error caused by the upload itself
+// (missing or malformed form fields): the handler answers 400, not 500.
+var ErrInvalidUpload = errors.New("invalid upload")
 
 // UploadHandler handles HTTP call uploads compatible with rdio-scanner and OpenMHz.
 type UploadHandler struct {
@@ -31,6 +36,12 @@ func NewUploadHandler(uploader CallUploader, instanceID string, log zerolog.Logg
 // Auto-detects the format from form field names.
 func (h *UploadHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			// Same answer as the upload middleware gives form-key uploads.
+			WriteErrorWithCode(w, http.StatusRequestEntityTooLarge, ErrBadRequest, "request body too large")
+			return
+		}
 		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody, "invalid multipart form: "+err.Error())
 		return
 	}
@@ -92,6 +103,10 @@ func (h *UploadHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if strings.Contains(err.Error(), "duplicate call") {
 			WriteErrorWithCode(w, http.StatusConflict, ErrDuplicate, err.Error())
+			return
+		}
+		if errors.Is(err, ErrInvalidUpload) {
+			WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody, err.Error())
 			return
 		}
 		h.log.Error().Err(err).Str("format", format).Msg("upload processing failed")

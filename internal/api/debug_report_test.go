@@ -53,6 +53,7 @@ func TestSanitizeConfig(t *testing.T) {
 		LLMUrl: "http://llmuser:llmpass@llm.local:11434",
 
 		RetentionRawMessages: 168 * time.Hour,
+		RetentionAuditLog:    8760 * time.Hour,
 
 		UnitTagSuggestions:         true,
 		UnitTagSuggestionsMinCalls: 3,
@@ -172,6 +173,9 @@ func TestSanitizeConfig(t *testing.T) {
 	// Duration fields should be formatted as strings
 	if got := result["RetentionRawMessages"]; got != "168h0m0s" {
 		t.Errorf("RetentionRawMessages: got %q, want %q", got, "168h0m0s")
+	}
+	if got := result["RetentionAuditLog"]; got != "8760h0m0s" {
+		t.Errorf("RetentionAuditLog: got %q, want %q", got, "8760h0m0s")
 	}
 	if got := result["ReadTimeout"]; got != "5s" {
 		t.Errorf("ReadTimeout: got %q, want %q", got, "5s")
@@ -349,6 +353,11 @@ func TestDebugReportDisabledReturns503(t *testing.T) {
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected status 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// The usual error shape, with a code.
+	var resp ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || resp.Code != ErrServiceUnavail {
+		t.Errorf("body = %s, want code %q", rec.Body.String(), ErrServiceUnavail)
 	}
 }
 

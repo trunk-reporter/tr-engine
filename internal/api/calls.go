@@ -155,6 +155,9 @@ func (h *CallsHandler) GetCall(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusBadRequest, "invalid call ID")
 		return
 	}
+	if !requireCallAccess(w, r, h.db, id, "call not found") {
+		return
+	}
 
 	call, err := h.db.GetCallByID(r.Context(), PrincipalFrom(r), id)
 	if err != nil {

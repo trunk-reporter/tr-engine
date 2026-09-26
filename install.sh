@@ -90,7 +90,7 @@ services:
     image: ghcr.io/trunk-reporter/tr-engine:latest
     ports:
       # This machine only by default. To open it to your LAN, set
-      # HTTP_BIND_IP in .env (and ADMIN_PASSWORD) — see the install message.
+      # HTTP_BIND_IP in .env — see the install message.
       - "\${HTTP_BIND_IP:-127.0.0.1}:\${HTTP_PORT:-8080}:8080"
     env_file: .env
     environment:
@@ -125,6 +125,19 @@ cd tr-engine
 docker compose pull -q
 docker compose up -d
 
+# -- Admin API key --
+# On its first start with an empty database tr-engine prints an admin API key
+# once to its log. Wait for it so the user sees it here.
+echo "Waiting for tr-engine to start..."
+ADMIN_KEY=""
+i=0
+while [ "$i" -lt 60 ]; do
+  ADMIN_KEY=$(docker compose logs --no-log-prefix tr-engine 2>/dev/null | grep -o 'tre_[0-9a-f]\{64\}' | head -n 1)
+  [ -n "$ADMIN_KEY" ] && break
+  i=$((i + 1))
+  sleep 1
+done
+
 echo ""
 echo "========================================="
 echo "  tr-engine is running!"
@@ -133,14 +146,35 @@ echo "========================================="
 echo ""
 echo "Call recordings will appear as trunk-recorder captures them."
 echo ""
+if [ -n "$ADMIN_KEY" ]; then
+  echo "Your admin API key (store it now, e.g. in a password manager;"
+  echo "tr-engine will not show it again):"
+  echo ""
+  echo "  $ADMIN_KEY"
+  echo ""
+  echo "Paste it into the web UI when it asks for a key. Better: create a"
+  echo "separate key for everyday use and keep the admin key for management:"
+else
+  echo "tr-engine prints an admin API key on the first start of a new database."
+  echo "Find it with: docker compose logs tr-engine | grep -A3 'no admin API key'"
+  echo "If this database already had keys, create one with:"
+  echo "  docker compose exec -T tr-engine tr-engine keys create --name admin --scopes admin"
+  echo "Create a separate key for everyday use:"
+fi
+echo "  docker compose exec -T tr-engine tr-engine keys create --name 'my browser' --scopes edit"
+echo ""
+echo "Without a key, the web UI and API are closed. To let anyone who can"
+echo "reach tr-engine listen (read-only, no key needed):"
+echo "  docker compose exec -T tr-engine tr-engine access set --anonymous listen"
+echo "See https://github.com/trunk-reporter/tr-engine/blob/master/docs/auth.md"
+echo ""
 echo "tr-engine only listens on this machine (127.0.0.1) by default."
 echo "To open it to other machines on your network, add to tr-engine/.env:"
-echo "  ADMIN_PASSWORD=<choose a password>   # enables login (full auth mode)"
 echo "  HTTP_BIND_IP=${LAN_IP:-<this machine's LAN IP>}"
 echo "then run: docker compose up -d   (and open http://${HOST}:8080)"
 echo ""
 echo "Configuration:  tr-engine/.env"
-echo "  Edit this file to enable MQTT, authentication, transcription, etc."
+echo "  Edit this file to enable MQTT, transcription, etc."
 echo "  Then restart:  docker compose up -d"
 echo ""
 echo "Useful commands (run from the tr-engine/ directory):"

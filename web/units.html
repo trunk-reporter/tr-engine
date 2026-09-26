@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="auth.js?v=1"></script>
+<script src="auth.js?v=3"></script>
 <meta name="card-title" content="Unit Tracker">
 <meta name="card-description" content="Live unit status grid with state colors and activity">
 <meta name="card-order" content="3">
@@ -567,10 +567,7 @@ function setStatus(state, text) {
 }
 
 function esc(s) {
-  if (s == null) return '';
-  const d = document.createElement('div');
-  d.textContent = String(s);
-  return d.innerHTML;
+  return trAuth.escapeHTML(s);
 }
 
 function formatUnitId(unitId, alphaTag) {
@@ -1070,10 +1067,12 @@ function saveUnitTag(u, newTag) {
   })
     .then(r => {
       if (r.status === 401 || r.status === 403) {
-        saveStatus.textContent = 'Write token required';
+        // Editing needs a key with the edit scope. auth.js already prompted
+        // (stored key rejected) or explained (403); without a key, ask for one.
+        saveStatus.textContent = r.status === 401 ? 'API key required' : 'Key can\u2019t edit';
         saveStatus.className = 'unit-modal-save-status unit-modal-error';
         saveBtn.disabled = false;
-        showAuth();
+        if (r.status === 401 && !trAuth.getKey()) trAuth.showKeyPrompt();
         throw new Error('auth');
       }
       if (!r.ok) throw new Error('HTTP ' + r.status);

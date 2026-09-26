@@ -228,6 +228,9 @@ type MaintenanceConfigData struct {
 	RetentionStaleCalls                string `json:"retention_stale_calls"`
 	RetentionStaleCallsSource          string `json:"retention_stale_calls_source"`
 	RetentionStaleCallsLocked          bool   `json:"retention_stale_calls_locked"`
+	RetentionAuditLog                  string `json:"retention_audit_log"`
+	RetentionAuditLogSource            string `json:"retention_audit_log_source"`
+	RetentionAuditLogLocked            bool   `json:"retention_audit_log_locked"`
 	Schedule                           string `json:"schedule"`
 }
 

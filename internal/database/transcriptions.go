@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/database/sqlcdb"
 )
 
@@ -241,9 +242,37 @@ func (db *DB) InsertTranscription(ctx context.Context, row *TranscriptionRow) (i
 	return id, nil
 }
 
-// GetPrimaryTranscription returns the primary transcription for a call.
-func (db *DB) GetPrimaryTranscription(ctx context.Context, callID int64) (*TranscriptionAPI, error) {
-	row, err := db.Q.GetPrimaryTranscription(ctx, callID)
+// callTranscriptionColumns are the transcription columns of the per-call
+// reads, in the order the sqlc row types scan them.
+const callTranscriptionColumns = `t.id, t.call_id, t.text, t.source, t.is_primary,
+	t.confidence, t.language, t.model, t.provider,
+	t.word_count, t.duration_ms, t.provider_ms, t.words, t.created_at`
+
+// callTranscriptionsFrom joins each transcription to its call, whose system
+// and talkgroup the restriction clause checks.
+const callTranscriptionsFrom = ` FROM transcriptions t
+	JOIN calls c ON c.call_id = t.call_id AND c.start_time = t.call_start_time
+	WHERE t.call_id = $1`
+
+// GetPrimaryTranscription returns the primary transcription for a call p may
+// see. A call outside p's restriction has none (pgx.ErrNoRows). A nil p is
+// ErrNoPrincipal.
+func (db *DB) GetPrimaryTranscription(ctx context.Context, p *auth.Principal, callID int64) (*TranscriptionAPI, error) {
+	restrict, restrictArgs, err := restrictSQL(p, "c.system_id", "c.tgid", 2)
+	if err != nil {
+		return nil, err
+	}
+	var row sqlcdb.GetPrimaryTranscriptionRow
+	err = db.Pool.QueryRow(ctx,
+		`SELECT `+callTranscriptionColumns+callTranscriptionsFrom+` AND t.is_primary = true`+restrict+`
+		ORDER BY t.created_at DESC
+		LIMIT 1`,
+		append([]any{callID}, restrictArgs...)...,
+	).Scan(
+		&row.ID, &row.CallID, &row.Text, &row.Source, &row.IsPrimary,
+		&row.Confidence, &row.Language, &row.Model, &row.Provider,
+		&row.WordCount, &row.DurationMs, &row.ProviderMs, &row.Words, &row.CreatedAt,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -251,26 +280,49 @@ func (db *DB) GetPrimaryTranscription(ctx context.Context, callID int64) (*Trans
 	return &t, nil
 }
 
-// ListTranscriptionsByCall returns all transcription variants for a call.
-func (db *DB) ListTranscriptionsByCall(ctx context.Context, callID int64) ([]TranscriptionAPI, error) {
-	rows, err := db.Q.ListTranscriptionsByCall(ctx, callID)
+// ListTranscriptionsByCall returns all transcription variants for a call p
+// may see; none for a call outside p's restriction. A nil p is
+// ErrNoPrincipal.
+func (db *DB) ListTranscriptionsByCall(ctx context.Context, p *auth.Principal, callID int64) ([]TranscriptionAPI, error) {
+	restrict, restrictArgs, err := restrictSQL(p, "c.system_id", "c.tgid", 2)
 	if err != nil {
 		return nil, err
 	}
-	result := make([]TranscriptionAPI, len(rows))
-	for i, r := range rows {
-		result[i] = listTranscriptionToAPI(r)
+	rows, err := db.Pool.Query(ctx,
+		`SELECT `+callTranscriptionColumns+callTranscriptionsFrom+restrict+`
+		ORDER BY t.created_at DESC`,
+		append([]any{callID}, restrictArgs...)...,
+	)
+	if err != nil {
+		return nil, err
 	}
-	return result, nil
+	defer rows.Close()
+
+	result := []TranscriptionAPI{}
+	for rows.Next() {
+		var r sqlcdb.ListTranscriptionsByCallRow
+		if err := rows.Scan(
+			&r.ID, &r.CallID, &r.Text, &r.Source, &r.IsPrimary,
+			&r.Confidence, &r.Language, &r.Model, &r.Provider,
+			&r.WordCount, &r.DurationMs, &r.ProviderMs, &r.Words, &r.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		result = append(result, listTranscriptionToAPI(r))
+	}
+	return result, rows.Err()
 }
 
 // SearchTranscriptions performs full-text search across transcriptions with call context.
 // Defaults to primary transcriptions only; pass primary_only=false to include all variants.
-func (db *DB) SearchTranscriptions(ctx context.Context, query string, filter TranscriptionSearchFilter) ([]TranscriptionSearchHit, int, error) {
+// Results are limited to calls on talkgroups p may see: the restriction is
+// part of the WHERE shared by the count and the rows (§7.2). A nil p is
+// ErrNoPrincipal.
+func (db *DB) SearchTranscriptions(ctx context.Context, p *auth.Principal, query string, filter TranscriptionSearchFilter) ([]TranscriptionSearchHit, int, error) {
 	primaryOnly := filter.PrimaryOnly == nil || *filter.PrimaryOnly
 
 	const fromClause = `FROM transcriptions t JOIN calls c ON c.call_id = t.call_id AND c.start_time = t.call_start_time`
-	const whereClause = `
+	const filterClause = `
 		WHERE t.search_vector @@ plainto_tsquery('english', $1)
 		  AND ($2::boolean IS NOT TRUE OR t.is_primary = true)
 		  AND ($3::timestamptz IS NULL OR t.call_start_time >= $3)
@@ -280,6 +332,12 @@ func (db *DB) SearchTranscriptions(ctx context.Context, query string, filter Tra
 		  AND ($7::int[] IS NULL OR c.tgid = ANY($7))`
 	args := []any{query, primaryOnly, filter.StartTime, filter.EndTime,
 		pqIntArray(filter.SystemIDs), pqIntArray(filter.SiteIDs), pqIntArray(filter.Tgids)}
+	restrict, restrictArgs, err := restrictSQL(p, "c.system_id", "c.tgid", len(args)+1)
+	if err != nil {
+		return nil, 0, err
+	}
+	whereClause := filterClause + restrict
+	args = append(args, restrictArgs...)
 
 	// Count
 	var total int
@@ -302,7 +360,7 @@ func (db *DB) SearchTranscriptions(ctx context.Context, query string, filter Tra
 			COALESCE(c.tg_alpha_tag, ''), c.start_time, c.duration
 		` + fromClause + whereClause + `
 		ORDER BY rank DESC
-		LIMIT $8 OFFSET $9`
+		LIMIT ` + placeholder(len(args)+1) + ` OFFSET ` + placeholder(len(args)+2)
 
 	rows, err := db.Pool.Query(ctx, dataQuery, append(args, limit, filter.Offset)...)
 	if err != nil {
@@ -340,17 +398,24 @@ type BatchTranscriptionRow struct {
 
 // GetBatchTranscriptions returns primary transcriptions for multiple call IDs.
 // Only returns call_id, text, and words->'segments' — the minimal shape needed by frontends.
-func (db *DB) GetBatchTranscriptions(ctx context.Context, callIDs []int64) ([]BatchTranscriptionRow, error) {
+// Calls outside p's restriction are silently left out (§6.3). A nil p is
+// ErrNoPrincipal.
+func (db *DB) GetBatchTranscriptions(ctx context.Context, p *auth.Principal, callIDs []int64) ([]BatchTranscriptionRow, error) {
+	restrict, restrictArgs, err := restrictSQL(p, "c.system_id", "c.tgid", 2)
+	if err != nil {
+		return nil, err
+	}
 	if len(callIDs) == 0 {
 		return []BatchTranscriptionRow{}, nil
 	}
 
 	query := `
-		SELECT call_id, COALESCE(text, '') AS text, words->'segments' AS segments
-		FROM transcriptions
-		WHERE call_id = ANY($1) AND is_primary = true`
+		SELECT t.call_id, COALESCE(t.text, '') AS text, t.words->'segments' AS segments
+		FROM transcriptions t
+		JOIN calls c ON c.call_id = t.call_id AND c.start_time = t.call_start_time
+		WHERE t.call_id = ANY($1) AND t.is_primary = true` + restrict
 
-	rows, err := db.Pool.Query(ctx, query, callIDs)
+	rows, err := db.Pool.Query(ctx, query, append([]any{callIDs}, restrictArgs...)...)
 	if err != nil {
 		return nil, err
 	}

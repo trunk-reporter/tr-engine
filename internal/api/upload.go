@@ -51,10 +51,11 @@ func (h *UploadHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract flat form values
+	// Extract flat form values. The upload plugins' API key fields were
+	// consumed by the upload middleware and never reach the pipeline.
 	fields := make(map[string]string, len(r.MultipartForm.Value))
 	for k, v := range r.MultipartForm.Value {
-		if len(v) > 0 {
+		if len(v) > 0 && k != "key" && k != "api_key" {
 			fields[k] = v[0]
 		}
 	}

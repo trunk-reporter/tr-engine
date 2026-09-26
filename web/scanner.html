@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<script src="auth.js?v=1"></script>
+<script src="auth.js?v=3"></script>
 <title>Scanner — tr-engine</title>
 <meta name="card-title" content="Scanner">
 <meta name="card-description" content="Mobile-friendly radio scanner with auto-play and channel filtering">
@@ -1131,8 +1131,7 @@ let playerRaf = null;
 // ═══════════════════════════════════════════════════════════════
 
 function esc(s) {
-  if (!s) return '';
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return trAuth.escapeHTML(s);
 }
 
 function fmtTime(date) {
@@ -1414,15 +1413,18 @@ function playCall(callId, nick, channel, feedItem) {
   npPlayBtn.textContent = '\u23F3';
 
   audioEl.volume = settings.volume / 100;
-  const authToken = window.trAuth && window.trAuth.getToken();
+  // <audio> can't send headers: same-origin URLs get a ticket (never cross-origin ones)
   const audioSrc = `${API_BASE}/calls/${callId}/audio`;
-  audioEl.src = authToken ? audioSrc + '?token=' + encodeURIComponent(authToken) : audioSrc;
+  audioRetry = { callId, url: audioSrc, done: false };
+  audioEl.src = trAuth.mediaUrl(audioSrc);
   audioEl.load();
   audioEl.playbackRate = settings.playbackSpeed;
   audioEl.play().then(() => {
     npPlayBtn.textContent = '\u23F8';
     startProgressUpdate();
   }).catch(err => {
+    // A failed load is retried once by the error handler, with a fresh ticket
+    if (err.name === 'NotSupportedError' && !audioRetry.done && audioRetry.callId === callId) return;
     npPlayBtn.textContent = '\u25B6';
     npTime.textContent = err.name === 'NotAllowedError' ? 'tap to play' : 'no audio';
     // On autoplay failure, try advancing queue
@@ -1496,8 +1498,30 @@ audioEl.addEventListener('waiting', () => npProgress.classList.add('loading'));
 audioEl.addEventListener('canplay', () => npProgress.classList.remove('loading'));
 audioEl.addEventListener('playing', () => npProgress.classList.remove('loading'));
 
+// A missing or expired ticket fails the load: retry once with a fresh one.
+let audioRetry = { callId: null, url: '', done: true };
+
+function retryAudioOnce() {
+  if (audioRetry.done || audioRetry.callId == null || audioRetry.callId !== currentCallId) return false;
+  audioRetry.done = true;
+  const callId = audioRetry.callId;
+  const pos = audioEl.currentTime;
+  trAuth.ticketUrl(audioRetry.url, { fresh: true }).then(u => {
+    if (currentCallId !== callId) return;
+    audioEl.src = u;
+    if (pos) audioEl.currentTime = pos;
+    audioEl.playbackRate = settings.playbackSpeed;
+    audioEl.play().then(() => {
+      npPlayBtn.textContent = '\u23F8';
+      startProgressUpdate();
+    }).catch(() => {});  // a second failure fires 'error' again, handled below
+  });
+  return true;
+}
+
 // Error state — red X on play button
 audioEl.addEventListener('error', () => {
+  if (retryAudioOnce()) return;
   npProgress.classList.remove('loading');
   npPlayBtn.textContent = '\u2715';
   npPlayBtn.classList.add('error');

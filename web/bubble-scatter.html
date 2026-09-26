@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <script src="auth.js?v=1"></script>
+  <script src="auth.js?v=3"></script>
   <meta name="card-title" content="Bubble Scatter">
   <meta name="card-description" content="Talkgroup call volume vs emergency rate by size">
   <meta name="card-order" content="21">
@@ -81,14 +81,11 @@
     var chart, systems = {}, chartInstance;
     var systemColors = ['rgba(100,180,255,0.8)','rgba(255,140,70,0.8)','rgba(100,220,140,0.8)','rgba(220,130,255,0.8)','rgba(255,200,50,0.8)','rgba(150,200,220,0.8)','rgba(220,140,140,0.8)','rgba(140,220,140,0.8)'];
 
-    // Fetch API helper using auth.js patching
-    async function apiFetch(url, token) {
-      var headers = {};
-      if (token) headers['Authorization'] = 'Bearer ' + token;
-      var res = await fetch(url, { headers: headers });
+    // Fetch API helper; auth.js adds the stored API key and asks for one when needed
+    async function apiFetch(url) {
+      var res = await fetch(url);
       if (res.status === 401 || res.status === 403) {
-        // Let auth.js retry logic handle it
-        throw new Error('Auth needed');
+        throw new Error('Not allowed with this API key (HTTP ' + res.status + ')');
       }
       if (!res.ok) throw new Error('API ' + res.status + ': ' + res.statusText);
       return res.json();
@@ -107,11 +104,12 @@
           borderColor: 'rgba(255,255,255,0.1)',
           textStyle: { fontSize: 12, color: '#ddd' },
           formatter: function(p) {
+            var esc = trAuth.escapeHTML;
             var d = p.data;
-            if (!d) return p.name;
-            return '<b>' + (d.name || d.tgid) + '</b><br/>' +
-              (d.alpha_tag ? d.alpha_tag + '<br/>' : '') +
-              'Calls: ' + d.total_calls + ' · Emergency: ' + d.emergency_rate.toFixed(1) + '% (' + d.emergency_count + ')<br/>' +
+            if (!d) return esc(p.name);
+            return '<b>' + esc(d.name || d.tgid) + '</b><br/>' +
+              (d.alpha_tag ? esc(d.alpha_tag) + '<br/>' : '') +
+              'Calls: ' + esc(d.total_calls) + ' · Emergency: ' + d.emergency_rate.toFixed(1) + '% (' + esc(d.emergency_count) + ')<br/>' +
               'Avg Duration: ' + d.avg_duration_s.toFixed(0) + 's';
           }
         },

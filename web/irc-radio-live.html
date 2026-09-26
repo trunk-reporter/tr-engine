@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="auth.js?v=1"></script>
+<script src="auth.js?v=3"></script>
 <title>tr-engine IRC</title>
 <meta name="card-title" content="IRC Radio">
 <meta name="card-description" content="IRC-style live radio monitor with channels, nicks, and audio playback">
@@ -1541,7 +1541,7 @@ function showNickTooltip(nick, el) {
   const txCount = countTx(nick);
 
   let html = `<span class="tt-nick">${esc(nick)}</span><br>`;
-  html += `<span class="tt-label">Unit:</span> ${user.unitId}<br>`;
+  html += `<span class="tt-label">Unit:</span> ${esc(user.unitId)}<br>`;
   html += `<span class="tt-label">System:</span> ${esc(sysName)}<br>`;
   html += `<span class="tt-label">Status:</span> ${statusHtml}`;
   if (user.role === 'op') html += ` <span class="tt-label">(op)</span>`;
@@ -1549,7 +1549,7 @@ function showNickTooltip(nick, el) {
     html += `<br><span class="tt-label">TX in history:</span> ${txCount}`;
   }
   if (lastTx) {
-    html += `<br><span class="tt-label">Last TX:</span> ${ts(lastTx)}`;
+    html += `<br><span class="tt-label">Last TX:</span> ${esc(ts(lastTx))}`;
   }
 
   nickTooltip.innerHTML = html;
@@ -1757,7 +1757,7 @@ function saveUnitTag(user, newTag) {
     body: JSON.stringify({ alpha_tag: newTag, alpha_tag_source: 'manual' }),
   })
     .then(r => {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
+      if (!r.ok) { promptKeyForEdit(r); throw new Error('HTTP ' + r.status); }
       return r.json();
     })
     .then(() => {
@@ -2207,8 +2207,7 @@ function refreshMsgEl(m) {
 }
 
 function esc(s) {
-  if (!s) return '';
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return trAuth.escapeHTML(s);
 }
 
 function serverMsg(text) {
@@ -2640,7 +2639,7 @@ function saveChannelTag(newTag) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ alpha_tag: newTag, alpha_tag_source: 'manual' }),
   })
-    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(r => { if (!r.ok) { promptKeyForEdit(r); throw new Error('HTTP ' + r.status); } return r.json(); })
     .then(() => {
       const oldChanName = activeChannel;
       const key = tgKey(state.system_id, state.tgid);
@@ -2845,10 +2844,14 @@ async function lazyLoadChannel(chanName, systemId, tgid) {
     const oldest = ch.messages.length > 0 ? ch.messages[0].date : null;
     const endParam = oldest ? `&end_time=${oldest.toISOString()}` : '';
 
-    const [callData, eventData] = await Promise.all([
+    // Unit events are denied to restricted keys: calls still render without them
+    const [callRes, eventRes] = await Promise.allSettled([
       fetchJSON(`/calls?tgid=${tgid}&system_id=${systemId}&sort=-stop_time&deduplicate=true&limit=${HISTORY_PAGE_SIZE}${endParam}`),
       fetchJSON(`/unit-events?tgid=${tgid}&system_id=${systemId}&type=join,off&sort=-time&limit=${HISTORY_PAGE_SIZE}${endParam}`),
     ]);
+    if (callRes.status === 'rejected') throw callRes.reason;
+    const callData = callRes.value;
+    const eventData = eventRes.status === 'fulfilled' ? eventRes.value : { events: [] };
     const calls = callData.calls || [];
     const events = eventData.events || [];
 
@@ -3063,6 +3066,13 @@ async function loadStarredHistory() {
 // API FETCHING — Bootstrap channels & nicklists
 // ══════════════════════════════════════════════════════════════
 
+// Edits need a key with the edit scope. auth.js already prompts for a
+// rejected key and explains 403s; without any key, ask for one here (only
+// for this page's own engine: keys are never sent to an ?api= origin).
+function promptKeyForEdit(r) {
+  if (r.status === 401 && !trAuth.getKey() && trAuth.isSameOriginAPI(API_BASE + '/')) trAuth.showKeyPrompt();
+}
+
 async function fetchJSON(path) {
   const res = await fetch(API_BASE + path);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText} from ${path}`);
@@ -3256,10 +3266,14 @@ async function bootstrapRecentCalls() {
   try {
     const since = new Date(Date.now() - 30 * 60 * 1000).toISOString();
     const sysIds = [...new Set([...channels.values()].map(c => c.system_id).filter(Boolean))].join(',');
-    const [callData, eventData] = await Promise.all([
+    // Unit events are denied to restricted keys: calls still render without them
+    const [callRes, eventRes] = await Promise.allSettled([
       fetchJSON(`/calls?sort=-stop_time&deduplicate=true&limit=500&start_time=${since}`),
       sysIds ? fetchJSON(`/unit-events?system_id=${sysIds}&type=join,off&sort=-time&limit=500&start_time=${since}`) : { events: [] },
     ]);
+    if (callRes.status === 'rejected') throw callRes.reason;
+    const callData = callRes.value;
+    const eventData = eventRes.status === 'fulfilled' ? eventRes.value : { events: [] };
     const calls = callData.calls || [];
     const events = eventData.events || [];
 
@@ -4503,10 +4517,11 @@ function playCall(callId, nick, channel, msgEl, txPos, txDuration) {
   // Clear old segments
   playerProgress.querySelectorAll('.player-segment, .player-segment-divider').forEach(el => el.remove());
 
-  // Load audio — append token for <audio> element (bypasses patched fetch)
+  // Load audio — <audio> can't send headers, so same-origin URLs get a ticket
+  // (never cross-origin ones, e.g. with ?api=)
   const audioUrl = `${API_BASE}/calls/${callId}/audio`;
-  const authToken = window.trAuth && window.trAuth.getToken();
-  audioEl.src = authToken ? audioUrl + '?token=' + encodeURIComponent(authToken) : audioUrl;
+  audioRetry = { callId, url: audioUrl, done: false };
+  audioEl.src = trAuth.mediaUrl(audioUrl);
   audioEl.load();
 
   // Seek to transmission start once metadata loaded
@@ -4521,6 +4536,8 @@ function playCall(callId, nick, channel, msgEl, txPos, txDuration) {
     playerPlayBtn.textContent = '⏸';
     updatePlayerProgress();
   }).catch(err => {
+    // A failed load is retried once by the error handler, with a fresh ticket
+    if (err.name === 'NotSupportedError' && !audioRetry.done && audioRetry.callId === callId) return;
     playerPlayBtn.textContent = '▶';
     playerTimeEl.textContent = err.name === 'NotAllowedError' ? 'click to play' : 'no audio';
     console.warn('Playback error:', err.message);
@@ -4623,8 +4640,29 @@ audioEl.addEventListener('ended', () => {
   }
 });
 
+// A missing or expired ticket fails the load: retry once with a fresh one.
+let audioRetry = { callId: null, url: '', done: true };
+
+function retryAudioOnce() {
+  if (audioRetry.done || audioRetry.callId == null || audioRetry.callId !== currentCallId) return false;
+  audioRetry.done = true;
+  const callId = audioRetry.callId;
+  const pos = audioEl.currentTime;
+  trAuth.ticketUrl(audioRetry.url, { fresh: true }).then(u => {
+    if (currentCallId !== callId) return;
+    audioEl.src = u;
+    if (pos) audioEl.currentTime = pos;
+    audioEl.play().then(() => {
+      playerPlayBtn.textContent = '⏸';
+      updatePlayerProgress();
+    }).catch(() => {});  // a second failure fires 'error' again, handled below
+  });
+  return true;
+}
+
 // Audio error — skip failed audio so scanner doesn't stall
 audioEl.addEventListener('error', () => {
+  if (retryAudioOnce()) return;
   playerPlayBtn.textContent = '\u25B6';
   if (currentPlayingMsgEl) currentPlayingMsgEl.classList.remove('now-playing');
   currentPlayingMsgEl = null;
@@ -4791,6 +4829,5 @@ inputField.focus();
 <div class="vignette-overlay"></div>
 <div class="theme-label" id="themeLabel"></div>
 <script src="theme-engine.js?v=2"></script>
-<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"ac1721b3b563478ba51e2a90be05801a","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
 </body>
 </html>

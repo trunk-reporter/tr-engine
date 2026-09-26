@@ -47,8 +47,8 @@ debug-receiver
 debug-receiver-linux
 .env.local
 bin/
-tr-engine
-tr-engine-test
+/tr-engine
+/tr-engine-test
 
 # Mosquitto password file (generated locally, never commit)
 mosquitto/passwd

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="auth.js?v=1"></script>
+<script src="auth.js?v=3"></script>
 <meta name="card-title" content="Live Events">
 <meta name="card-description" content="Real-time SSE event stream with type filtering">
 <meta name="card-order" content="2">
@@ -202,14 +202,14 @@ function formatDetail(type, d) {
     case 'call_start':
     case 'call_update':
       return `<span class="val">${esc(d.tg_alpha_tag || 'TG ' + d.tgid)}</span>` +
-        ` <span class="dim">tgid=</span>${d.tgid}` +
+        ` <span class="dim">tgid=</span>${esc(d.tgid)}` +
         ` <span class="dim">freq=</span>${(d.freq / 1e6).toFixed(4)}` +
         (d.emergency ? ' <span class="emergency">EMERGENCY</span>' : '') +
         (d.encrypted ? ' <span class="dim">[encrypted]</span>' : '');
     case 'call_end':
       return `<span class="val">${esc(d.tg_alpha_tag || 'TG ' + d.tgid)}</span>` +
-        ` <span class="dim">tgid=</span>${d.tgid}` +
-        ` <span class="dim">dur=</span>${d.duration ? d.duration.toFixed(1) + 's' : '?'}` +
+        ` <span class="dim">tgid=</span>${esc(d.tgid)}` +
+        ` <span class="dim">dur=</span>${d.duration ? Number(d.duration).toFixed(1) + 's' : '?'}` +
         ` <span class="dim">freq=</span>${(d.freq / 1e6).toFixed(4)}` +
         (d.emergency ? ' <span class="emergency">EMERGENCY</span>' : '');
     case 'call_alert':
@@ -221,13 +221,13 @@ function formatDetail(type, d) {
         ` <span class="val">${esc(d.unit_alpha_tag || 'Unit ' + d.unit_id)}</span>` +
         (d.tgid ? ` <span class="dim">tg=</span>${esc(d.tg_alpha_tag || String(d.tgid))}` : '');
     case 'recorder_update':
-      return `<span class="dim">rec${d.rec_num}</span>` +
+      return `<span class="dim">rec${esc(d.rec_num)}</span>` +
         ` <span class="val">${esc(d.rec_state || '?')}</span>` +
         (d.freq ? ` <span class="dim">freq=</span>${(d.freq / 1e6).toFixed(4)}` : '') +
         (d.tg_alpha_tag ? ` <span class="dim">tg=</span>${esc(d.tg_alpha_tag)}` : '') +
-        (d.system_id ? ` <span class="dim">sys=</span>${d.system_id}` : '');
+        (d.system_id ? ` <span class="dim">sys=</span>${esc(d.system_id)}` : '');
     case 'rate_update':
-      return `<span class="dim">decode_rate=</span><span class="val">${d.decode_rate != null ? d.decode_rate : '?'}</span>` +
+      return `<span class="dim">decode_rate=</span><span class="val">${d.decode_rate != null ? esc(d.decode_rate) : '?'}</span>` +
         (d.control_channel ? ` <span class="dim">cc=</span>${(d.control_channel / 1e6).toFixed(4)}` : '');
     case 'trunking_message':
       return `<span class="dim">${esc(d.opcode_type || d.trunk_msg_type || '?')}</span>` +
@@ -240,10 +240,7 @@ function formatDetail(type, d) {
 }
 
 function esc(s) {
-  if (s == null) return '';
-  const div = document.createElement('div');
-  div.textContent = String(s);
-  return div.innerHTML;
+  return trAuth.escapeHTML(s);
 }
 
 function addEvent(type, data) {
@@ -268,8 +265,8 @@ function addEvent(type, data) {
   const time = formatTime(data.start_time || data.time || data.log_time) || now.toLocaleTimeString();
 
   row.innerHTML =
-    `<span class="event-time">${time}</span>` +
-    `<span class="event-type type-${displayType}">${displayType.replace(/_/g, ' ')}</span>` +
+    `<span class="event-time">${esc(time)}</span>` +
+    `<span class="event-type type-${esc(displayType)}">${esc(displayType.replace(/_/g, ' '))}</span>` +
     `<span class="event-detail">${formatDetail(displayType, data)}</span>`;
 
   eventsEl.insertBefore(row, eventsEl.firstChild);

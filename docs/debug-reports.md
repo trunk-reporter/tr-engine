@@ -5,8 +5,8 @@ How to set up the debug-receiver, what reports look like, and how to parse them.
 ## Architecture
 
 ```
-User's browser (debug-report.html)
-  → POST /api/v1/debug-report  {client-side JSON}
+User's browser (debug-report.html, with an admin API key)
+  → POST /api/v1/debug-report  {client-side JSON}   (needs the admin scope)
     → tr-engine enriches with server config, health, logs
     → tr-engine forwards combined JSON to DEBUG_REPORT_URL
       → debug-receiver saves .json.gz + notifies Discord
@@ -68,6 +68,8 @@ The debug-receiver rate-limits to **1 report per IP per minute**. Duplicate subm
 
 Sent by the debug-report.html page via tr-engine's `POST /api/v1/debug-report` endpoint. The browser sends client-side data; tr-engine enriches with server-side diagnostics before forwarding.
 
+Because it makes the server send its configuration to a third party, the endpoint needs an API key with the **`admin`** scope. Anonymous visitors and `listen`/`edit` keys get 401/403; the page asks for an admin key.
+
 **Top-level structure:**
 
 ```json
@@ -118,10 +120,12 @@ Sent by the debug-report.html page via tr-engine's `POST /api/v1/debug-report` e
 | `console_messages` | array | TR console warn/error messages from last hour |
 | `tr_config` | object | Raw trunk-recorder `config.json` (if TR_DIR set) |
 
-**Config redaction rules:**
-- Token/key/password fields → `"***"`
-- URLs (DatabaseURL, MQTTBrokerURL, WhisperURL, LLMUrl, S3.Endpoint) → credentials stripped, host/port preserved
+**Config redaction rules** (applied to tr-engine's config and to `tr_config`, at any depth):
+- Fields whose names contain `key`, `token`, `pass`, `secret`, `auth` or `credential` (case-insensitive) → `"***"`. This covers trunk-recorder's upload plugin `apiKey`s, Broadcastify keys and MQTT plugin passwords.
+- Every URL-valued string → user info and query string stripped, host/port/path preserved
 - Empty secret fields → `""` (not `"***"`)
+
+The report never contains API keys: tr-engine only stores their hashes, and access control is not part of its config.
 
 ### 2. Audio Diagnostic Report
 
@@ -259,10 +263,9 @@ Check the report's `transmissions[].audio.sampleRate` field — it's usually 800
 
 ### "Can't connect / 404 errors"
 
-1. Check `server.config.AuthEnabled` and `server.config.AuthToken` (redacted, but shows if set).
-2. Check `client.consoleErrors` for 401/403/404 responses.
-3. Check `server.config.CORSOrigins` — empty means allow all.
-4. Check `client.page.url` — are they hitting the right hostname?
+1. Check `client.consoleErrors` for 401/403/404 responses, and their error `code`: `key_required` (no key and anonymous access is off), `invalid_key` (revoked, expired or mistyped key, or a proxy injecting a header), `insufficient_scope`, `restricted_credential`. See [auth.md](auth.md#troubleshooting).
+2. Check `client.page.url` — are they hitting the right hostname?
+3. CORS is never the cause of an auth failure: tr-engine allows every origin.
 
 ### "General health check"
 
@@ -289,4 +292,4 @@ Users control debug reports with two env vars:
 | `DEBUG_REPORT_URL` | `https://case.luxprimatech.com/debug/report` | Where to forward reports |
 | `DEBUG_REPORT_DISABLE` | `false` | Set `true` to disable submissions entirely |
 
-The endpoint `POST /api/v1/debug-report` is always registered. When disabled, it returns 503.
+The endpoint `POST /api/v1/debug-report` is always registered and needs an `admin` key. When disabled, it returns 503.

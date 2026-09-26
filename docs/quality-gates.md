@@ -26,18 +26,20 @@ The final verification for shared backend work should still include `go test ./.
 
 `openapi.yaml` is the source of truth for the public REST, SSE, and live-audio contract. Any change that adds, removes, renames, or changes behavior for an endpoint, request, response, schema, auth requirement, SSE event, or audio route must include:
 
-- The corresponding `openapi.yaml` update in the same change.
+- The corresponding `openapi.yaml` update in the same change, including the operation's `security`, `x-scope`, `x-restricted` and (where it applies) `x-key-required`, which must match the route's entry in the policy table (`internal/api/policy.go`); a Go test checks the two agree.
 - Focused endpoint tests in `internal/api/*_test.go` for status code, auth behavior, error shape, and response body.
 - Regeneration or downstream verification for clients that consume the contract, especially `tr-dashboard`'s `npm run api:generate` when dashboard types are affected.
 - A diff check that the OpenAPI change matches the implementation and does not remove unrelated paths or schemas.
 
-If a local OpenAPI validator is available, run it and include the command in the verification block. Until a validator command is committed, the minimum contract gate is implementation tests plus review of the `openapi.yaml` diff.
+Run an OpenAPI validator and include the command in the verification block, for example `npx -y @redocly/cli lint openapi.yaml` (the spec should validate; the known warnings are the WebSocket operation's lack of a 2xx response, `/openapi.yaml`'s lack of a 4xx response, and the prose-only `SSEAuthSignal` schema). The minimum contract gate is implementation tests, the policy/OpenAPI agreement test, and review of the `openapi.yaml` diff.
 
 ## Backend Test Expectations
 
 Add or update tests for:
 
-- New or changed HTTP endpoints, middleware, auth branches, API key behavior, pagination, filtering, and error responses.
+- New or changed HTTP endpoints, middleware, pagination, filtering, and error responses.
+- Every new route gets a policy-table entry (the route/policy coverage test fails otherwise). An `Enforced` route needs a DB integration test showing that a restricted principal's rows **and totals** contain only allowed (system, tgid) pairs, including the empty-intersection case.
+- Auth changes: principal resolution, scopes, restrictions, tickets, the anonymous policy, rate limiting and caches, with the documented error codes (`key_required`, `invalid_key`, `invalid_ticket`, `insufficient_scope`, `restricted_credential`).
 - SSE event publishing, filtering, replay, reconnect assumptions, and event payload shape.
 - Live audio ingest, routing, deduplication, and encoding behavior, especially failures that should surface to clients.
 - Ingest handlers, identity resolution, deduplication, backfill behavior, and file or MQTT parsing.
@@ -49,7 +51,7 @@ Prefer focused package tests for the changed boundary, then run the broader suit
 
 Use the smallest checklist that covers the changed behavior. Include the checked items in the issue or PR.
 
-- Auth: verify open, token, and full JWT modes relevant to the change; failed auth must return the documented error shape.
+- Auth: verify the change with no key under anonymous access `off`, `listen` and restricted `listen`, and with `listen`, `edit`, `admin`, `upload`, restricted, revoked and expired keys and a ticket, as relevant; failed auth must return the documented error code and `WWW-Authenticate` header.
 - SSE: verify `/api/v1/events/stream` emits the changed event, honors filters, sends replay IDs, and behaves through the intended reverse proxy without buffering.
 - Live audio: verify `/audio/live` upgrade behavior, subscription messages, disabled-stream errors, and client-visible close/error behavior.
 - Reverse proxy: verify `/api/*`, `/audio/*`, `/health/*`, `/docs.html`, and `/openapi.yaml` route correctly in the deployment shape being changed.

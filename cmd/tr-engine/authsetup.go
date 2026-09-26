@@ -1,0 +1,172 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/rs/zerolog"
+	"github.com/snarg/tr-engine/internal/config"
+	"github.com/snarg/tr-engine/internal/database"
+)
+
+// setupAuth runs the access-control part of startup, after migrations
+// (§10.1, §11.2): the one-time import of the removed auth variables, the
+// warnings for those still set, the one-time summary of removed user
+// accounts, the ticket secret, the bootstrap admin key (printed to stderr
+// once per database) and the anonymous policy. An error is fatal.
+func setupAuth(ctx context.Context, db *database.DB, cfg *config.Config, freshDatabase, isDocker bool,
+	stderr io.Writer, log zerolog.Logger) error {
+	legacy := cfg.LegacyAuth
+	res, err := db.ImportLegacyAuth(ctx, database.LegacyAuthInput{
+		AuthEnabled:      legacy.AuthEnabled,
+		AuthToken:        legacy.AuthToken,
+		WriteToken:       legacy.WriteToken,
+		AdminPassword:    legacy.AdminPassword,
+		JWTSecret:        legacy.JWTSecret,
+		UploadInstanceID: cfg.UploadInstanceID,
+		FreshDatabase:    freshDatabase,
+	})
+	if err != nil {
+		return fmt.Errorf("legacy auth import failed (it is retried on the next start): %w", err)
+	}
+	if res.Ran {
+		logLegacyImport(res.Detail, log)
+	}
+	warnLegacyVariables(legacy, res, log)
+	for _, k := range res.WeakKeys {
+		log.Warn().Int("key_id", k.ID).Str("name", k.Name).Str("prefix", k.Prefix).
+			Msgf("legacy key #%d is weak (%d characters) — replace it", k.ID, k.Length)
+	}
+
+	if summary, err := db.RemovedUserAccountsSummary(ctx); err != nil {
+		log.Warn().Err(err).Msg("reading the removed user accounts failed")
+	} else if summary != "" {
+		log.Warn().Msg(summary)
+	}
+
+	if _, err := db.GetOrCreateTicketSecret(ctx); err != nil {
+		return fmt.Errorf("ticket secret: %w", err)
+	}
+
+	plaintext, key, _, err := db.ClaimBootstrapAdminKey(ctx)
+	if err != nil {
+		return fmt.Errorf("bootstrap admin key: %w", err)
+	}
+	if plaintext != "" {
+		printBootstrapBanner(stderr, plaintext, isDocker)
+		log.Warn().Int("key_id", key.ID).Str("prefix", key.Prefix).
+			Msg("no admin API key existed, so the bootstrap admin key was created and printed to stderr (shown once)")
+	} else if exists, err := db.ActiveAdminKeyExists(ctx); err != nil {
+		log.Warn().Err(err).Msg("checking for an active admin API key failed")
+	} else if !exists {
+		log.Error().Msg(`no active admin API key exists (all are revoked or expired) — create one on the host with: tr-engine keys create --name "admin" --scopes admin`)
+	}
+
+	anon, err := db.GetAnonymousAccess(ctx)
+	if err != nil {
+		return fmt.Errorf("anonymous access policy: %w", err)
+	}
+	ev := log.Info().Str("access", anon.Access).Bool("restricted", anon.Restriction != nil)
+	if r := anon.Restriction; r != nil {
+		ev = ev.Bool("allow_all", r.AllowAll).Int("systems", len(r.Systems)).
+			Int("talkgroups", len(r.Talkgroups)).Int("exclude_talkgroups", len(r.ExcludeTalkgroups))
+	}
+	ev.Msg("anonymous access policy (requests without an API key); change it with tr-engine access set")
+	return nil
+}
+
+// logLegacyImport logs what the one-time legacy import decided, on the start
+// that ran it.
+func logLegacyImport(d database.LegacyAuthDetail, log zerolog.Logger) {
+	log.Info().Str("old_mode", string(d.OldMode)).Str("fixup", database.LegacyAuthImportFixup).Msg(d.Summary())
+	for _, s := range d.Skipped {
+		switch s.Reason {
+		case database.SkipPublishedAsPublic:
+			log.Error().Msg("WRITE_TOKEN was published by /auth-init as the public read token; not imported — create a new admin key")
+		case database.SkipShellSubstitution:
+			log.Error().Str("variable", s.Variable).
+				Msgf(`%s contains "$(" (an unexpanded shell substitution copied from old docs); not imported — create a new key with tr-engine keys create`, s.Variable)
+		}
+	}
+	if d.SuggestAnonymousListen {
+		log.Info().Msg("anonymous access stays off; for public read access without a key run: tr-engine access set --anonymous listen")
+	}
+	if d.NoUploadKey {
+		log.Warn().Msg("HTTP uploads were in use but no key can upload now — create one with `tr-engine keys create --name 'uploads' --scopes upload` and configure it in trunk-recorder")
+	}
+	if len(d.RecentKeysWithoutUpload) > 0 {
+		refs := make([]string, len(d.RecentKeysWithoutUpload))
+		for i, k := range d.RecentKeysWithoutUpload {
+			refs[i] = fmt.Sprintf("#%d %q (%s)", k.ID, k.Name, k.Prefix)
+		}
+		log.Warn().Strs("keys", refs).
+			Msg("migrated keys without the upload scope were used in the last 7 days; if one of them uploads calls, give it upload (tr-engine keys update ID --scopes ...,upload)")
+	}
+}
+
+// warnLegacyVariables logs one WARN per removed auth variable that is still
+// set, on every start (§11.2).
+func warnLegacyVariables(legacy config.LegacyAuthEnv, res database.LegacyAuthResult, log zerolog.Logger) {
+	for _, v := range legacy.Set() {
+		log.Warn().Str("variable", v.Name).Msg(legacyVariableWarning(v.Name, res))
+	}
+}
+
+// legacyVariableWarning is the per-start message for a removed auth variable
+// that is still set.
+func legacyVariableWarning(name string, res database.LegacyAuthResult) string {
+	const remove = " — remove it from your configuration; see docs/migrating-auth.md"
+	switch name {
+	case "AUTH_TOKEN", "WRITE_TOKEN":
+		if k, ok := res.Detail.ImportedKey(name); ok {
+			return fmt.Sprintf("%s is no longer used (imported as API key #%d '%s' on %s)%s",
+				name, k.KeyID, k.Name, res.ImportedAt.UTC().Format("2006-01-02"), remove)
+		}
+		reason, _ := res.Detail.SkipReason(name)
+		switch reason {
+		case database.SkipPublicToken:
+			return name + " is no longer used (it was the public read token, so it was not imported; requests that still carry it are treated as anonymous)" + remove
+		case database.SkipPublishedAsPublic:
+			return name + " is no longer used (it equalled the public AUTH_TOKEN, so it was not imported)" + remove
+		case database.SkipShellSubstitution:
+			return name + ` is no longer used (it contained "$(", so it was not imported)` + remove
+		case database.SkipFreshDatabase:
+			return name + " is no longer used (not imported into a new database; clients use API keys)" + remove
+		case database.SkipAuthDisabled:
+			return name + " is no longer used (not imported: AUTH_ENABLED=false disabled it)" + remove
+		case database.SkipSameAsWriteToken:
+			return name + " is no longer used (it equalled WRITE_TOKEN, imported as that key)" + remove
+		}
+		return name + " is no longer used — clients use API keys; register a secret that is still in use with tr-engine keys import. See docs/auth.md"
+	case "ADMIN_PASSWORD", "ADMIN_USERNAME", "JWT_SECRET":
+		return name + " is no longer used — tr-engine has no user accounts; clients use API keys. See docs/auth.md"
+	case "AUTH_ENABLED":
+		return "AUTH_ENABLED is no longer used — access is controlled by API keys and the anonymous access policy (tr-engine access show). See docs/auth.md"
+	case "CORS_ORIGINS":
+		return "CORS_ORIGINS is no longer needed: the API allows all origins and never uses cookies"
+	}
+	return name + " is no longer used. See docs/auth.md"
+}
+
+// printBootstrapBanner prints the bootstrap admin key straight to stderr as
+// plain text (§10.1), bypassing the structured log so it is readable and log
+// shippers don't index it as a field.
+func printBootstrapBanner(w io.Writer, key string, isDocker bool) {
+	rule := strings.Repeat("=", 64)
+	var b strings.Builder
+	b.WriteString(rule + "\n")
+	b.WriteString(" tr-engine: no admin API key existed, so one was created:\n\n")
+	b.WriteString("   " + key + "\n\n")
+	b.WriteString(" Store it now — it will not be shown again. Paste it into a client\n")
+	b.WriteString(" (tr-dashboard, web/admin.html) or send it as\n")
+	b.WriteString(" \"Authorization: Bearer <key>\" to create more keys.\n\n")
+	b.WriteString(" Create or revoke keys later with:\n")
+	b.WriteString("   tr-engine keys --help\n")
+	if isDocker {
+		b.WriteString("   (in Docker: docker compose exec -T tr-engine tr-engine keys --help)\n")
+	}
+	b.WriteString(rule + "\n")
+	io.WriteString(w, b.String())
+}

@@ -1,8 +1,6 @@
 package config
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"fmt"
 	"os"
 	"time"
@@ -53,16 +51,12 @@ type Config struct {
 	WriteTimeout time.Duration `env:"HTTP_WRITE_TIMEOUT" envDefault:"30s"`
 	IdleTimeout  time.Duration `env:"HTTP_IDLE_TIMEOUT" envDefault:"120s"`
 
-	AuthEnabled        bool   `env:"AUTH_ENABLED" envDefault:"true"` // set to false to disable all API auth
-	AuthToken          string `env:"AUTH_TOKEN"`
-	AuthTokenGenerated bool   // true when auto-generated (not from env/config)
-	WriteToken         string `env:"WRITE_TOKEN"` // separate token for write operations; if not set, writes use AuthToken
+	// Access control is not configured here: API keys and the anonymous
+	// access policy live in the database (docs/auth.md). The removed auth
+	// variables are only read into LegacyAuth, for the one-time import and
+	// the warnings.
+	LegacyAuth LegacyAuthEnv
 
-	// User authentication (optional — disabled when ADMIN_PASSWORD is empty)
-	JWTSecret     string `env:"JWT_SECRET"`      // HMAC key for JWT signing; auto-generated if empty (sessions lost on restart)
-	AdminUsername string `env:"ADMIN_USERNAME" envDefault:"admin"` // default admin username seeded on first run
-	AdminPassword string `env:"ADMIN_PASSWORD"` // if set, seeds admin user on first run and enables JWT auth
-	JWTSecretIgnored bool // JWT_SECRET was set without ADMIN_PASSWORD and has been ignored
 	// Reverse proxies whose X-Forwarded-For / X-Real-IP headers are believed when
 	// working out a client's IP (used for per-IP rate limiting). Comma-separated
 	// IPs/CIDRs plus the keywords "loopback", "private" (RFC 1918 + IPv6 ULA) and
@@ -71,7 +65,6 @@ type Config struct {
 
 	RateLimitRPS   float64 `env:"RATE_LIMIT_RPS" envDefault:"20"`
 	RateLimitBurst int     `env:"RATE_LIMIT_BURST" envDefault:"40"`
-	CORSOrigins string `env:"CORS_ORIGINS"` // comma-separated allowed origins; empty = allow all (*)
 	LogLevel    string `env:"LOG_LEVEL" envDefault:"info"`
 
 	RawStore         bool   `env:"RAW_STORE" envDefault:"true"`
@@ -134,6 +127,7 @@ type Config struct {
 	RetentionTrunkingMessages time.Duration `env:"RETENTION_TRUNKING_MESSAGES" envDefault:"720h"` // 30d
 	RetentionCheckpoints     time.Duration `env:"RETENTION_CHECKPOINTS" envDefault:"168h"`       // 7d
 	RetentionStaleCalls      time.Duration `env:"RETENTION_STALE_CALLS" envDefault:"1h"`
+	RetentionAuditLog        time.Duration `env:"RETENTION_AUDIT_LOG" envDefault:"8760h"` // 1y
 
 	// Transcription worker pool
 	TranscribeWorkers     int     `env:"TRANSCRIBE_WORKERS" envDefault:"2"`
@@ -160,6 +154,45 @@ type Config struct {
 	// Debug report forwarding
 	DebugReportURL     string `env:"DEBUG_REPORT_URL" envDefault:"https://case.luxprimatech.com/debug/report"`
 	DebugReportDisable bool   `env:"DEBUG_REPORT_DISABLE" envDefault:"false"`
+}
+
+// LegacyAuthEnv holds the auth variables of versions before API keys, as
+// raw strings exactly as set ("" = unset). They configure nothing: the engine
+// reads them once to import still-valid secrets as API keys (§11.2) and to
+// warn, on every start, that they should be removed.
+type LegacyAuthEnv struct {
+	AuthEnabled   string `env:"AUTH_ENABLED"`
+	AuthToken     string `env:"AUTH_TOKEN"`
+	WriteToken    string `env:"WRITE_TOKEN"`
+	AdminUsername string `env:"ADMIN_USERNAME"`
+	AdminPassword string `env:"ADMIN_PASSWORD"`
+	JWTSecret     string `env:"JWT_SECRET"`
+	CORSOrigins   string `env:"CORS_ORIGINS"`
+}
+
+// LegacyAuthVariable is one removed auth variable that is set.
+type LegacyAuthVariable struct {
+	Name  string
+	Value string
+}
+
+// Set returns the removed auth variables that are set, in a fixed order.
+func (l LegacyAuthEnv) Set() []LegacyAuthVariable {
+	var out []LegacyAuthVariable
+	for _, v := range []LegacyAuthVariable{
+		{"AUTH_ENABLED", l.AuthEnabled},
+		{"AUTH_TOKEN", l.AuthToken},
+		{"WRITE_TOKEN", l.WriteToken},
+		{"ADMIN_USERNAME", l.AdminUsername},
+		{"ADMIN_PASSWORD", l.AdminPassword},
+		{"JWT_SECRET", l.JWTSecret},
+		{"CORS_ORIGINS", l.CORSOrigins},
+	} {
+		if v.Value != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // S3Config holds S3-compatible object storage settings for audio files.
@@ -227,9 +260,16 @@ func Load(overrides Overrides) (*Config, error) {
 		_ = godotenv.Load(envFile)
 	}
 
-	// Parse environment variables into config struct
+	// Parse environment variables into config struct. --database-url
+	// satisfies the required DATABASE_URL (the keys/access subcommands are
+	// often run with only the flag).
 	cfg := &Config{}
-	if err := env.Parse(cfg); err != nil {
+	var opts env.Options
+	if overrides.DatabaseURL != "" {
+		opts.Environment = env.ToMap(os.Environ())
+		opts.Environment["DATABASE_URL"] = overrides.DatabaseURL
+	}
+	if err := env.ParseWithOptions(cfg, opts); err != nil {
 		return nil, err
 	}
 
@@ -260,34 +300,6 @@ func Load(overrides Overrides) (*Config, error) {
 	}
 	if overrides.StreamListen != "" {
 		cfg.StreamListen = overrides.StreamListen
-	}
-
-	// Deprecated: AUTH_ENABLED=false disables all API auth. Clear every
-	// credential so the advertised auth mode (/auth-init) matches what the
-	// middleware enforces — previously ADMIN_PASSWORD survived, so auth-init
-	// reported "full" (login required) while the API was actually open.
-	if !cfg.AuthEnabled {
-		cfg.AuthToken = ""
-		cfg.WriteToken = ""
-		cfg.AdminPassword = ""
-		cfg.JWTSecret = ""
-	}
-
-	// JWT_SECRET only means something alongside ADMIN_PASSWORD. On its own it
-	// used to turn on JWT enforcement while /auth-init still reported "open",
-	// and it exposed the unauthenticated first-run /auth/setup endpoint.
-	if cfg.JWTSecret != "" && cfg.AdminPassword == "" {
-		cfg.JWTSecret = ""
-		cfg.JWTSecretIgnored = true
-	}
-
-	// Auto-generate JWT_SECRET if not configured. A random secret means all
-	// sessions are invalidated on restart — set JWT_SECRET in .env for persistence.
-	if cfg.JWTSecret == "" && cfg.AdminPassword != "" {
-		b := make([]byte, 32)
-		if _, err := rand.Read(b); err == nil {
-			cfg.JWTSecret = base64.URLEncoding.EncodeToString(b)
-		}
 	}
 
 	return cfg, nil

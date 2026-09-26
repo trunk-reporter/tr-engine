@@ -3,9 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="auth.js?v=2"></script>
+<script src="auth.js?v=3"></script>
 <meta name="card-title" content="Admin">
-<meta name="card-description" content="User management, API keys, and system settings">
+<meta name="card-description" content="API keys, anonymous access policy and audit log">
 <meta name="card-order" content="20">
 <title>Admin — tr-engine</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -53,8 +53,7 @@
     padding: 2px 8px; border-radius: 3px;
     text-transform: uppercase; letter-spacing: 0.5px;
   }
-  .mode-badge.legacy { background: color-mix(in srgb, var(--warning) 20%, transparent); color: var(--warning); border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent); }
-  .mode-badge.jwt { background: color-mix(in srgb, var(--success) 20%, transparent); color: var(--success); border: 1px solid color-mix(in srgb, var(--success) 40%, transparent); }
+  .mode-badge.ok { background: color-mix(in srgb, var(--success) 20%, transparent); color: var(--success); border: 1px solid color-mix(in srgb, var(--success) 40%, transparent); }
   .mode-badge.none { background: color-mix(in srgb, var(--text-muted) 20%, transparent); color: var(--text-muted); border: 1px solid var(--border); }
   .toolbar-right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
   .toolbar-user { font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); }
@@ -65,7 +64,7 @@
   }
   .btn-logout:hover { color: var(--danger); border-color: var(--danger); }
 
-  .content { position: relative; z-index: 1; max-width: 800px; margin: 0 auto; padding: 24px 20px 80px; }
+  .content { position: relative; z-index: 1; max-width: 960px; margin: 0 auto; padding: 24px 20px 80px; }
 
   .panel { display: none; }
   .panel.active { display: block; }
@@ -79,31 +78,36 @@
     font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.8px;
     color: var(--text-muted); margin-bottom: 14px;
     font-family: var(--font-mono);
+    display: flex; align-items: center; gap: 10px;
   }
+  .section-title .spacer { margin-left: auto; }
   .section-desc { font-size: 13px; color: var(--text-muted); line-height: 1.5; margin-bottom: 14px; }
+  .section-desc code, .info-box code { font-family: var(--font-mono); color: var(--accent); font-size: 12px; }
+  .sub-title { font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 8px; font-family: var(--font-mono); text-transform: uppercase; }
 
-  .status-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 13px; }
+  .status-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; font-size: 13px; flex-wrap: wrap; }
   .status-label { color: var(--text-muted); min-width: 120px; }
   .status-val { font-family: var(--font-mono); font-weight: 600; }
-  .status-val.active { color: var(--success); }
-  .status-val.inactive { color: var(--text-faint, var(--text-muted)); }
 
-  .form-row { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; margin-top: 12px; }
+  .form-row { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; margin-top: 12px; }
   .form-group { display: flex; flex-direction: column; gap: 4px; }
-  .form-group label { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.5px; }
-  .form-group input, .form-group select {
+  .form-group label, .field-label { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.5px; }
+  .form-group input, .form-group select, .form-group textarea, .connect-form input {
     padding: 7px 10px; font-size: 13px;
     background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
     color: var(--text); font-family: var(--font-body);
     outline: none; transition: border-color 0.2s;
   }
-  .form-group input:focus, .form-group select:focus { border-color: var(--accent); }
-  .form-group input::placeholder { color: var(--text-faint, var(--text-muted)); }
+  .form-group textarea { font-family: var(--font-mono); resize: vertical; min-height: 34px; }
+  .form-group input:focus, .form-group select:focus, .form-group textarea:focus, .connect-form input:focus { border-color: var(--accent); }
+  .form-group input::placeholder, .form-group textarea::placeholder { color: var(--text-faint, var(--text-muted)); }
+  .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); cursor: pointer; }
+  .check input { accent-color: var(--accent); }
 
   .btn {
     padding: 7px 14px; font-size: 12px; font-weight: 600; border-radius: 4px;
     cursor: pointer; border: none; font-family: var(--font-mono);
-    transition: all 0.2s; white-space: nowrap;
+    transition: all 0.2s; white-space: nowrap; text-decoration: none; display: inline-block;
   }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn-primary { background: var(--accent); color: #fff; }
@@ -114,27 +118,31 @@
   .btn-danger:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 15%, transparent); border-color: var(--danger); }
   .btn-sm { padding: 4px 10px; font-size: 11px; }
 
+  .table-wrap { overflow-x: auto; }
   .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
   .data-table th {
     text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase;
     letter-spacing: 0.5px; color: var(--text-muted); padding: 6px 8px;
-    border-bottom: 1px solid var(--border); font-family: var(--font-mono);
+    border-bottom: 1px solid var(--border); font-family: var(--font-mono); white-space: nowrap;
   }
   .data-table td { padding: 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent); vertical-align: middle; }
   .data-table tr:hover td { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+  .data-table td.mono, .data-table td code { font-family: var(--font-mono); font-size: 12px; }
+  .data-table td.wrap { word-break: break-all; }
+  .data-table tr.revoked td { opacity: 0.55; }
 
-  .role-badge {
-    display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 6px;
+  .scope-badge, .tag {
+    display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 6px; margin: 1px 2px 1px 0;
     border-radius: 3px; text-transform: uppercase; letter-spacing: 0.5px;
     font-family: var(--font-mono);
   }
-  .role-badge.admin { background: color-mix(in srgb, var(--danger) 20%, transparent); color: var(--danger); }
-  .role-badge.editor { background: color-mix(in srgb, var(--warning) 20%, transparent); color: var(--warning); }
-  .role-badge.viewer { background: color-mix(in srgb, var(--text-muted) 20%, transparent); color: var(--text-muted); }
-
-  .enabled-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
-  .enabled-dot.yes { background: var(--success); }
-  .enabled-dot.no { background: var(--danger); }
+  .scope-badge.admin { background: color-mix(in srgb, var(--danger) 20%, transparent); color: var(--danger); }
+  .scope-badge.edit { background: color-mix(in srgb, var(--warning) 20%, transparent); color: var(--warning); }
+  .scope-badge.listen { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success); }
+  .scope-badge.upload { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+  .tag { background: color-mix(in srgb, var(--text-muted) 20%, transparent); color: var(--text-muted); }
+  .status-active { color: var(--success); }
+  .status-expired, .status-revoked { color: var(--danger); }
 
   .action-link {
     font-size: 11px; font-family: var(--font-mono); cursor: pointer;
@@ -152,29 +160,18 @@
   .key-reveal .key-val { word-break: break-all; color: var(--accent); margin: 8px 0; user-select: all; }
   .key-reveal .key-warn { font-size: 11px; color: var(--warning); }
 
-  .danger-zone {
-    border-color: color-mix(in srgb, var(--danger) 30%, transparent);
-    background: color-mix(in srgb, var(--danger) 5%, transparent);
+  .warn-box {
+    font-size: 13px; line-height: 1.5; padding: 10px 12px; border-radius: 4px; margin-top: 10px;
+    color: var(--text);
+    background: color-mix(in srgb, var(--warning) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
   }
-  .danger-zone .section-title { color: var(--danger); }
+  .warn-box strong { color: var(--warning); }
 
-  .danger-toggle {
-    font-size: 12px; color: var(--text-muted); cursor: pointer;
-    background: none; border: none; font-family: var(--font-mono);
-    display: flex; align-items: center; gap: 6px; padding: 0; margin-bottom: 8px;
-  }
-  .danger-toggle:hover { color: var(--text); }
-  .danger-toggle .arrow { transition: transform 0.2s; display: inline-block; }
-  .danger-toggle .arrow.open { transform: rotate(90deg); }
-  .danger-body { display: none; }
-  .danger-body.open { display: block; }
-
-  .confirm-row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
-  .confirm-row input {
-    flex: 1; padding: 7px 10px; font-size: 13px;
-    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
-    color: var(--text); font-family: var(--font-mono); outline: none;
-  }
+  .restr { border: 1px dashed var(--border); border-radius: 4px; padding: 10px 12px; margin-top: 10px; }
+  .restr .modes { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 8px; }
+  .restr .lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+  .restr .hint { font-size: 11px; color: var(--text-muted); margin-top: 6px; line-height: 1.4; }
 
   .toast {
     position: fixed; bottom: 24px; right: 24px; z-index: 99999;
@@ -195,24 +192,19 @@
   }
   .modal-box {
     background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-    padding: 24px; max-width: 400px; width: 90%;
+    padding: 24px; max-width: 560px; width: 92%; max-height: 90vh; overflow-y: auto;
   }
-  .modal-box h3 { font-size: 15px; font-weight: 600; margin-bottom: 16px; }
+  .modal-box h3 { font-size: 15px; font-weight: 600; margin-bottom: 16px; word-break: break-word; }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
 
-  .welcome-hero { text-align: center; padding: 40px 20px 20px; }
-  .welcome-hero h1 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
-  .welcome-hero p { font-size: 14px; color: var(--text-muted); line-height: 1.5; max-width: 500px; margin: 0 auto; }
-  .setup-form { max-width: 340px; margin: 0 auto; }
-  .setup-form .form-group { margin-bottom: 10px; }
-  .setup-form .form-group input { width: 100%; }
-  .setup-form .btn { width: 100%; margin-top: 6px; }
-  .setup-or { text-align: center; color: var(--text-faint, var(--text-muted)); font-size: 12px; margin: 16px 0; }
+  .connect-form { max-width: 460px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
+  .connect-form input { width: 100%; font-family: var(--font-mono); }
 
   .error-msg { color: var(--danger); font-size: 12px; margin-top: 6px; display: none; }
 
   .info-box { font-size: 12px; color: var(--text-muted); line-height: 1.5; margin-top: 12px; padding: 10px; background: color-mix(in srgb, var(--accent) 5%, transparent); border-radius: 4px; border: 1px solid color-mix(in srgb, var(--accent) 15%, transparent); }
-  .info-box code { font-family: var(--font-mono); color: var(--accent); font-size: 11px; }
+
+  .pager { display: flex; gap: 8px; align-items: center; margin-top: 10px; font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); }
 </style>
 </head>
 <body>
@@ -220,199 +212,134 @@
 
 <div class="toolbar">
   <div class="logo">tr/<span>admin</span></div>
-  <span class="mode-badge none" id="mode-badge">---</span>
+  <span class="mode-badge none" id="mode-badge">no admin key</span>
   <div class="toolbar-right">
     <span class="toolbar-user" id="toolbar-user"></span>
-    <button class="btn-logout" id="btn-logout" style="display:none">logout</button>
+    <button class="btn-logout" id="btn-forget" style="display:none" title="Forget the admin key for this tab">forget admin key</button>
   </div>
 </div>
 
 <div class="content">
 
-  <!-- FIRST-RUN SETUP -->
-  <div class="panel" id="panel-setup">
-    <div class="welcome-hero">
-      <h1>Welcome to tr-engine</h1>
-      <p>No user accounts exist yet. Create an admin account to enable user-based authentication with roles and API keys.</p>
-    </div>
+  <!-- CONNECT -->
+  <div class="panel" id="panel-connect">
     <div class="section">
-      <div class="section-title">Create Admin Account</div>
-      <div class="setup-form">
-        <div class="form-group">
-          <label>Username</label>
-          <input type="text" id="setup-user" placeholder="admin" autocomplete="username">
-        </div>
-        <div class="form-group">
-          <label>Password</label>
-          <input type="password" id="setup-pass" placeholder="Min 8 characters" autocomplete="new-password">
-        </div>
-        <div class="form-group">
-          <label>Confirm Password</label>
-          <input type="password" id="setup-pass2" placeholder="Confirm password" autocomplete="new-password">
-        </div>
-        <div class="error-msg" id="setup-err"></div>
-        <button class="btn btn-primary" id="setup-btn">Create Admin</button>
-      </div>
-      <div class="setup-or">or continue with token-based auth</div>
-      <p class="section-desc" style="text-align:center;margin-bottom:0">
-        Token auth is already active. You can manage read/write tokens via your environment config without creating user accounts.
+      <div class="section-title">Connect with an admin key</div>
+      <p class="section-desc">
+        Paste an API key with the <code>admin</code> scope. This page keeps it in this tab's session storage only,
+        so it is forgotten when the tab closes, and sends it only to this engine.
+        Browse the other demo pages with a listen or edit key instead (<em>API key…</em> in the page menu).
       </p>
-    </div>
-  </div>
-
-  <!-- BASIC MODE -->
-  <div class="panel" id="panel-basic">
-    <div class="section">
-      <div class="section-title">Auth Status</div>
-      <div class="status-row">
-        <span class="status-label">Auth Mode</span>
-        <span class="status-val" id="basic-mode-val">Token-Based</span>
-      </div>
-      <div class="status-row">
-        <span class="status-label">Read Token</span>
-        <span class="status-val active" id="basic-read-status">Active</span>
-      </div>
-      <div class="status-row">
-        <span class="status-label">Write Token</span>
-        <span class="status-val" id="basic-write-status">---</span>
+      <div class="connect-form">
+        <input type="password" id="connect-key" placeholder="tre_…" autocomplete="off" spellcheck="false" aria-label="Admin API key">
+        <button class="btn btn-primary" id="connect-btn">Connect</button>
+        <div class="error-msg" id="connect-err"></div>
       </div>
       <div class="info-box">
-        Token auth is configured in your <code>.env</code> file or <code>docker-compose.yml</code>. Set <code>AUTH_TOKEN</code> for token mode, or set <code>ADMIN_PASSWORD</code> to enable user login and API keys. <code>WRITE_TOKEN</code> is deprecated but still accepted for legacy write access. Restart tr-engine after changes.
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="section-title">Upgrade to User Authentication</div>
-      <p class="section-desc">
-        Create an admin account to enable user-based auth with roles (viewer, editor, admin), login/logout, and API keys. Token auth will continue to work alongside user auth.
-      </p>
-      <div class="setup-form">
-        <div class="form-group">
-          <label>Username</label>
-          <input type="text" id="basic-setup-user" placeholder="admin" autocomplete="username">
-        </div>
-        <div class="form-group">
-          <label>Password</label>
-          <input type="password" id="basic-setup-pass" placeholder="Min 8 characters" autocomplete="new-password">
-        </div>
-        <div class="form-group">
-          <label>Confirm Password</label>
-          <input type="password" id="basic-setup-pass2" placeholder="Confirm password" autocomplete="new-password">
-        </div>
-        <div class="error-msg" id="basic-setup-err"></div>
-        <button class="btn btn-primary" id="basic-setup-btn">Create Admin &amp; Enable User Auth</button>
+        No admin key? On first start tr-engine prints one to its log (stderr). You can always create one on the host:<br>
+        <code>tr-engine keys create --name "admin" --scopes admin</code><br>
+        In Docker: <code>docker compose exec -T tr-engine tr-engine keys create --name "admin" --scopes admin</code>
       </div>
     </div>
   </div>
 
-  <!-- USER MODE (admin) -->
-  <div class="panel" id="panel-users">
+  <!-- ADMIN -->
+  <div class="panel" id="panel-admin">
 
-    <div class="section">
-      <div class="section-title">Users</div>
-      <table class="data-table" id="users-table">
-        <thead>
-          <tr>
-            <th>Username</th>
-            <th>Role</th>
-            <th>Status</th>
-            <th>Last Login</th>
-            <th>Created</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody id="users-body"></tbody>
-      </table>
-      <div class="empty-state" id="users-empty" style="display:none">No users found</div>
-
-      <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:14px">
-        <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:8px;font-family:var(--font-mono)">ADD USER</div>
-        <div class="form-row">
-          <div class="form-group">
-            <label>Username</label>
-            <input type="text" id="new-user-name" placeholder="username" autocomplete="off" style="width:160px">
-          </div>
-          <div class="form-group">
-            <label>Password</label>
-            <input type="password" id="new-user-pass" placeholder="min 8 chars" autocomplete="new-password" style="width:160px">
-          </div>
-          <div class="form-group">
-            <label>Role</label>
-            <select id="new-user-role" style="width:100px">
-              <option value="viewer">viewer</option>
-              <option value="editor">editor</option>
-              <option value="admin">admin</option>
-            </select>
-          </div>
-          <button class="btn btn-primary btn-sm" id="add-user-btn">Add</button>
-        </div>
-        <div class="error-msg" id="create-user-err"></div>
+    <div class="section" id="bootstrap-warning" style="display:none">
+      <div class="warn-box">
+        <strong>The bootstrap admin key is still active.</strong>
+        It was printed to the engine's log on first start. Create a named admin key for yourself,
+        connect with it, then revoke the key named <code>bootstrap admin</code>.
       </div>
     </div>
 
     <div class="section">
-      <div class="section-title">API Keys</div>
-      <table class="data-table" id="keys-table">
-        <thead>
-          <tr>
-            <th>Label</th>
-            <th>Prefix</th>
-            <th>Role</th>
-            <th>Owner</th>
-            <th>Last Used</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody id="keys-body"></tbody>
-      </table>
+      <div class="section-title">This admin key</div>
+      <div class="status-row"><span class="status-label">Name</span><span class="status-val" id="me-name">—</span></div>
+      <div class="status-row"><span class="status-label">Prefix</span><span class="status-val" id="me-prefix">—</span></div>
+      <div class="status-row"><span class="status-label">Scopes</span><span class="status-val" id="me-scopes">—</span></div>
+      <div class="status-row"><span class="status-label">Engine</span><span class="status-val" id="me-version">—</span></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">
+        API keys
+        <label class="check spacer" style="text-transform:none;letter-spacing:0;font-weight:400"><input type="checkbox" id="show-revoked"> show revoked</label>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="keys-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Prefix</th>
+              <th>Scopes</th>
+              <th>Restriction</th>
+              <th>Expires</th>
+              <th>Last used</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="keys-body"></tbody>
+        </table>
+      </div>
       <div class="empty-state" id="keys-empty" style="display:none">No API keys</div>
+      <div class="error-msg" id="keys-err"></div>
       <div id="key-reveal-container"></div>
 
       <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:14px">
-        <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:8px;font-family:var(--font-mono)">CREATE KEY</div>
+        <div class="sub-title">Create key</div>
+        <div id="create-key-form"></div>
         <div class="form-row">
-          <div class="form-group">
-            <label>Label</label>
-            <input type="text" id="new-key-label" placeholder="my-integration" autocomplete="off" style="width:200px">
-          </div>
-          <div class="form-group">
-            <label>Role</label>
-            <select id="new-key-role" style="width:100px">
-              <option value="viewer">viewer</option>
-              <option value="editor">editor</option>
-              <option value="admin">admin</option>
-            </select>
-          </div>
-          <div class="form-group">
-            <label>Type</label>
-            <select id="new-key-type" style="width:130px">
-              <option value="user">User Key</option>
-              <option value="service">Service Account</option>
-            </select>
-          </div>
-          <button class="btn btn-primary btn-sm" id="create-key-btn">Create</button>
+          <button class="btn btn-primary btn-sm" id="create-key-btn">Create key</button>
         </div>
         <div class="error-msg" id="create-key-err"></div>
       </div>
     </div>
 
-    <div class="section danger-zone">
-      <div class="section-title">Danger Zone</div>
-      <button class="danger-toggle" id="danger-toggle-btn">
-        <span class="arrow" id="danger-arrow">&#9654;</span> Downgrade to Token-Based Auth
-      </button>
-      <div class="danger-body" id="danger-body">
-        <p class="section-desc">
-          This will permanently delete all user accounts and API keys. tr-engine will revert to token-based authentication. This cannot be undone.
-        </p>
-        <p class="section-desc" style="margin-bottom:8px">
-          Type <code>delete all users</code> to confirm:
-        </p>
-        <div class="confirm-row">
-          <input type="text" id="downgrade-confirm" placeholder="delete all users">
-          <button class="btn btn-danger btn-sm" id="downgrade-btn" disabled>Delete All Users</button>
-        </div>
-        <div class="error-msg" id="downgrade-err"></div>
+    <div class="section">
+      <div class="section-title">Anonymous access</div>
+      <p class="section-desc">
+        What a request without a key may do. <code>off</code> answers it with 401; <code>listen</code> lets it read
+        radio data and stream events and audio, optionally restricted to some systems or talkgroups.
+        Anonymous callers can never edit, administer or upload.
+      </p>
+      <div id="anon-form"></div>
+      <div class="form-row">
+        <button class="btn btn-primary btn-sm" id="anon-save-btn">Save policy</button>
+        <span class="toolbar-user" id="anon-updated"></span>
+      </div>
+      <div class="error-msg" id="anon-err"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">
+        Audit log
+        <button class="btn btn-secondary btn-sm spacer" id="audit-refresh">refresh</button>
+      </div>
+      <p class="section-desc">Every change made with an API key (non-GET requests), newest first.</p>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Key</th>
+              <th>Actor</th>
+              <th>Request</th>
+              <th>Status</th>
+              <th>Request ID</th>
+            </tr>
+          </thead>
+          <tbody id="audit-body"></tbody>
+        </table>
+      </div>
+      <div class="empty-state" id="audit-empty" style="display:none">No audit entries</div>
+      <div class="error-msg" id="audit-err"></div>
+      <div class="pager">
+        <button class="btn btn-secondary btn-sm" id="audit-prev">newer</button>
+        <button class="btn btn-secondary btn-sm" id="audit-next">older</button>
+        <span id="audit-range"></span>
       </div>
     </div>
 
@@ -427,31 +354,8 @@
         <span class="status-val" id="storage-tables">–</span>
       </div>
       <div style="margin-top:10px">
-        <a href="/storage.html" class="btn btn-sm">Manage Storage</a>
+        <a href="storage.html" class="btn btn-secondary btn-sm">Manage Storage</a>
       </div>
-    </div>
-  </div>
-
-  <!-- INSUFFICIENT PERMISSIONS -->
-  <div class="panel" id="panel-noaccess">
-    <div class="section" style="text-align:center;padding:40px 20px">
-      <div style="font-size:28px;margin-bottom:12px;opacity:0.5">&#x1f512;</div>
-      <div style="font-size:16px;font-weight:600;margin-bottom:8px">Admin Access Required</div>
-      <p class="section-desc" style="margin-bottom:0">
-        You are logged in as <strong id="noaccess-user">---</strong> (<span id="noaccess-role">---</span>).
-        Contact an administrator to access this page.
-      </p>
-    </div>
-  </div>
-
-  <!-- NO JWT CONFIG -->
-  <div class="panel" id="panel-nojwt">
-    <div class="section" style="text-align:center;padding:40px 20px">
-      <div style="font-size:28px;margin-bottom:12px;opacity:0.5">&#x2699;</div>
-      <div style="font-size:16px;font-weight:600;margin-bottom:8px">User Auth Not Configured</div>
-      <p class="section-desc" style="margin-bottom:0">
-        The server does not have a JWT secret configured. User management requires <code>JWT_SECRET</code> in your environment config. Restart tr-engine after adding it.
-      </p>
     </div>
   </div>
 
@@ -463,30 +367,51 @@
 (function() {
   'use strict';
 
-  var currentUser = null;
-  var allUsers = [];
+  var API = '/api/v1';
+  var SESSION_KEY = 'tr-engine-admin-key';   // shared with storage.html; this tab only
+  var AUDIT_PAGE = 50;
+
+  var adminKey = '';
+  var me = null;            // whoami for the admin key
   var allKeys = [];
+  var knownSystems = [];    // [{system_id, name}]
+  var auditOffset = 0;
+  var auditTotal = 0;
+  var createForm = null;
+  var anonForm = null;
+
+  // ── Session storage (guarded: storage can be blocked) ──
+
+  function sessionGet() {
+    try { return sessionStorage.getItem(SESSION_KEY) || ''; } catch (e) { return ''; }
+  }
+  function sessionSet(v) {
+    try { sessionStorage.setItem(SESSION_KEY, v); } catch (e) { /* kept in memory only */ }
+  }
+  function sessionClear() {
+    try { sessionStorage.removeItem(SESSION_KEY); } catch (e) { /* ignore */ }
+  }
 
   // ── Helpers ──
 
   function toast(msg, type) {
-    var el = document.getElementById('toast');
-    el.textContent = msg;
-    el.className = 'toast ' + (type || 'success');
-    requestAnimationFrame(function() { el.classList.add('show'); });
-    setTimeout(function() { el.classList.remove('show'); }, 3000);
+    var t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast ' + (type || 'success');
+    requestAnimationFrame(function() { t.classList.add('show'); });
+    setTimeout(function() { t.classList.remove('show'); }, 3000);
   }
 
   function showErr(id, msg) {
-    var el = document.getElementById(id);
-    el.textContent = msg;
-    el.style.display = 'block';
+    var e = document.getElementById(id);
+    e.textContent = msg;
+    e.style.display = 'block';
   }
 
   function clearErr(id) {
-    var el = document.getElementById(id);
-    el.textContent = '';
-    el.style.display = 'none';
+    var e = document.getElementById(id);
+    e.textContent = '';
+    e.style.display = 'none';
   }
 
   function showPanel(id) {
@@ -496,23 +421,28 @@
   }
 
   function setBadge(cls, label) {
-    var el = document.getElementById('mode-badge');
-    el.className = 'mode-badge ' + cls;
-    el.textContent = label;
+    var b = document.getElementById('mode-badge');
+    b.className = 'mode-badge ' + cls;
+    b.textContent = label;
   }
 
   function fmtDate(s) {
-    if (!s) return '\u2014';
+    if (!s) return '—';
     var d = new Date(s);
-    if (isNaN(d)) return '\u2014';
+    if (isNaN(d)) return '—';
     var now = new Date();
     var diff = now - d;
-    if (diff < 60000) return 'just now';
-    if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
-    if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
+    if (diff >= 0 && diff < 60000) return 'just now';
+    if (diff >= 0 && diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+    if (diff >= 0 && diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
     var opts = { month: 'short', day: 'numeric' };
     if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
     return d.toLocaleDateString('en-US', opts);
+  }
+
+  function fmtTime(s) {
+    var d = new Date(s);
+    return isNaN(d) ? String(s || '—') : d.toLocaleString();
   }
 
   function el(tag, attrs, children) {
@@ -527,7 +457,7 @@
       });
     }
     if (children) {
-      children.forEach(function(c) { if (c) e.appendChild(c); });
+      children.forEach(function(c) { if (c) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
     }
     return e;
   }
@@ -536,277 +466,429 @@
     while (node.firstChild) node.removeChild(node.firstChild);
   }
 
-  // ── API ──
+  function apiError(resp, fallback) {
+    if (!resp) return fallback;
+    var msg = resp.error || fallback;
+    if (resp.detail && typeof resp.detail === 'string') msg += ' (' + resp.detail + ')';
+    return msg;
+  }
+
+  // ── API: the admin key is always sent explicitly, so auth.js leaves the
+  //    request alone (no stored key, no prompts). ──
 
   function api(method, path, body) {
-    var opts = { method: method, headers: {} };
-    if (body) {
-      opts.headers['Content-Type'] = 'application/json';
+    var headers = { 'Authorization': 'Bearer ' + adminKey };
+    var opts = { method: method, headers: headers, cache: 'no-store' };
+    if (body !== undefined) {
+      headers['Content-Type'] = 'application/json';
       opts.body = JSON.stringify(body);
     }
-    return fetch('/api/v1' + path, opts).then(function(resp) {
+    return fetch(API + path, opts).then(function(resp) {
       if (resp.status === 204) return { _status: 204, _ok: true };
-      return resp.json().then(function(data) {
+      return resp.json().catch(function() { return {}; }).then(function(data) {
+        if (!data || typeof data !== 'object' || Array.isArray(data)) data = { _data: data };
         data._status = resp.status;
         data._ok = resp.ok;
+        if (resp.status === 401) keyRejected(data);
         return data;
       });
+    }, function() {
+      return { _status: 0, _ok: false, error: 'Network error' };
     });
   }
 
-  // ── Mode detection ──
-
-  async function detectMode() {
-    var authMode = window.trAuth ? trAuth.getMode() : 'none';
-
-    try {
-      var setupResp = await api('GET', '/auth/setup');
-      var needsSetup = setupResp.needs_setup;
-
-      if (authMode === 'jwt') {
-        try {
-          var me = await api('GET', '/auth/me');
-          if (me._ok) {
-            currentUser = me;
-            document.getElementById('toolbar-user').textContent = me.username + ' (' + me.role + ')';
-            document.getElementById('btn-logout').style.display = '';
-            setBadge('jwt', 'User Auth');
-
-            if (me.role === 'admin') {
-              showPanel('panel-users');
-              loadUsers();
-              loadKeys();
-              loadStorageSummary();
-            } else {
-              document.getElementById('noaccess-user').textContent = me.username;
-              document.getElementById('noaccess-role').textContent = me.role;
-              showPanel('panel-noaccess');
-            }
-            return;
-          }
-        } catch (e) { /* fall through */ }
-      }
-
-      if (needsSetup) {
-        setBadge(authMode === 'legacy' ? 'legacy' : 'none', authMode === 'legacy' ? 'Token Auth' : 'No Auth');
-        showPanel('panel-setup');
-      } else {
-        setBadge(authMode === 'legacy' ? 'legacy' : 'none', authMode === 'legacy' ? 'Token Auth' : 'No Auth');
-        setupBasicPanel();
-        showPanel('panel-basic');
-      }
-    } catch (e) {
-      // /auth/setup not available — JWT not configured
-      if (authMode === 'legacy' || authMode === 'none') {
-        setBadge(authMode === 'legacy' ? 'legacy' : 'none', authMode === 'legacy' ? 'Token Auth' : 'No Auth');
-        showPanel('panel-nojwt');
-      }
-    }
+  function whoamiWith(key) {
+    return fetch(API + '/whoami', { headers: { 'Authorization': 'Bearer ' + key }, cache: 'no-store' })
+      .then(function(resp) {
+        return resp.json().catch(function() { return {}; }).then(function(data) {
+          return { status: resp.status, body: data || {} };
+        });
+      }, function() { return { status: 0, body: {} }; });
   }
 
-  function setupBasicPanel() {
-    var readActive = !!(window.trAuth && trAuth.getToken());
-    var writeActive = !!(window.trAuth && trAuth.hasWriteAccess());
-    var readEl = document.getElementById('basic-read-status');
-    var writeEl = document.getElementById('basic-write-status');
-    readEl.textContent = readActive ? 'Active' : 'Not Set';
-    readEl.className = 'status-val ' + (readActive ? 'active' : 'inactive');
-    writeEl.textContent = writeActive ? 'Active' : 'Not Set';
-    writeEl.className = 'status-val ' + (writeActive ? 'active' : 'inactive');
+  // ── Connect / forget ──
+
+  function keyRejected(data) {
+    if (!adminKey) return;
+    forget();
+    showErr('connect-err', 'The admin key was rejected' + (data && data.error ? ': ' + data.error : '.'));
   }
 
-  // ── Setup handlers ──
+  function forget() {
+    adminKey = '';
+    me = null;
+    sessionClear();
+    setBadge('none', 'no admin key');
+    document.getElementById('toolbar-user').textContent = '';
+    document.getElementById('btn-forget').style.display = 'none';
+    showPanel('panel-connect');
+  }
 
-  async function handleSetup(userEl, passEl, pass2El, errId, btn, origText) {
-    clearErr(errId);
-    var user = document.getElementById(userEl).value.trim();
-    var pass = document.getElementById(passEl).value;
-    var pass2 = document.getElementById(pass2El).value;
-    if (!user) return showErr(errId, 'Username is required');
-    if (pass.length < 8) return showErr(errId, 'Password must be at least 8 characters');
-    if (pass !== pass2) return showErr(errId, 'Passwords do not match');
-
-    var btnEl = document.getElementById(btn);
-    btnEl.disabled = true; btnEl.textContent = 'Creating...';
-
-    try {
-      var resp = await api('POST', '/auth/setup', { username: user, password: pass });
-      if (resp._ok) {
-        var loginResp = await api('POST', '/auth/login', { username: user, password: pass });
-        if (loginResp.access_token) {
-          localStorage.setItem('tr-engine-jwt', loginResp.access_token);
-        }
-        toast('Admin account created');
-        setTimeout(function() { location.reload(); }, 500);
-      } else {
-        showErr(errId, resp.error || 'Setup failed');
-        btnEl.disabled = false; btnEl.textContent = origText;
+  async function connect(key, fromSession) {
+    clearErr('connect-err');
+    key = String(key || '').trim();
+    if (!key) { showErr('connect-err', 'Paste an admin key first.'); return; }
+    var btn = document.getElementById('connect-btn');
+    btn.disabled = true; btn.textContent = 'Checking…';
+    var r = await whoamiWith(key);
+    btn.disabled = false; btn.textContent = 'Connect';
+    if (r.status === 200) {
+      var scopes = Array.isArray(r.body.scopes) ? r.body.scopes : [];
+      if (scopes.indexOf('admin') < 0) {
+        if (fromSession) sessionClear();
+        showErr('connect-err', 'This key has the scopes ' + (scopes.join(', ') || 'none') + '. The admin page needs a key with the admin scope.');
+        showPanel('panel-connect');
+        return;
       }
-    } catch (e) {
-      showErr(errId, 'Network error');
-      btnEl.disabled = false; btnEl.textContent = origText;
-    }
-  }
-
-  // ── Users CRUD ──
-
-  async function loadUsers() {
-    var resp = await api('GET', '/users');
-    if (!resp._ok) return;
-    allUsers = resp.users || [];
-    renderUsers();
-  }
-
-  function renderUsers() {
-    var tbody = document.getElementById('users-body');
-    var empty = document.getElementById('users-empty');
-    clearChildren(tbody);
-
-    if (!allUsers.length) {
-      empty.style.display = '';
+      adminKey = key;
+      me = r.body;
+      sessionSet(key);
+      document.getElementById('connect-key').value = '';
+      enterAdmin();
       return;
     }
-    empty.style.display = 'none';
-
-    allUsers.forEach(function(u) {
-      var isSelf = currentUser && u.id === currentUser.id;
-      var tr = el('tr', null, [
-        el('td', null, [
-          el('span', { text: u.username }),
-          isSelf ? el('span', { text: ' (you)', css: 'color:var(--text-faint);font-size:11px' }) : null
-        ]),
-        el('td', null, [el('span', { cls: 'role-badge ' + u.role, text: u.role })]),
-        el('td', null, [
-          el('span', { cls: 'enabled-dot ' + (u.enabled !== false ? 'yes' : 'no') }),
-          el('span', { text: ' ' + (u.enabled !== false ? 'Active' : 'Disabled') })
-        ]),
-        el('td', { text: fmtDate(u.last_login) }),
-        el('td', { text: fmtDate(u.created_at) }),
-        el('td', { css: 'text-align:right;white-space:nowrap' }, [
-          el('button', { cls: 'action-link', text: 'edit', onclick: function() { editUser(u); } }),
-          isSelf ? null : el('button', { cls: 'action-link danger', text: 'delete', css: 'margin-left:8px', onclick: function() { deleteUser(u); } })
-        ])
-      ]);
-      tbody.appendChild(tr);
-    });
+    if (fromSession) sessionClear();
+    showPanel('panel-connect');
+    if (r.status === 401) showErr('connect-err', 'Key rejected' + (r.body.error ? ': ' + r.body.error : '.'));
+    else if (r.status === 404) showErr('connect-err', 'This tr-engine does not support API keys (no /api/v1/whoami). Upgrade tr-engine.');
+    else if (r.status === 0) showErr('connect-err', 'Could not reach tr-engine.');
+    else showErr('connect-err', 'Could not check the key (HTTP ' + r.status + ').');
   }
 
-  async function createUser() {
-    clearErr('create-user-err');
-    var name = document.getElementById('new-user-name').value.trim();
-    var pass = document.getElementById('new-user-pass').value;
-    var role = document.getElementById('new-user-role').value;
-    if (!name) return showErr('create-user-err', 'Username required');
-    if (pass.length < 8) return showErr('create-user-err', 'Password must be at least 8 characters');
+  function enterAdmin() {
+    var k = me.key || {};
+    setBadge('ok', 'admin');
+    document.getElementById('toolbar-user').textContent = (k.name || 'admin key') + ' (' + (k.prefix || '?') + ')';
+    document.getElementById('btn-forget').style.display = '';
+    document.getElementById('me-name').textContent = k.name || '—';
+    document.getElementById('me-prefix').textContent = k.prefix || '—';
+    document.getElementById('me-scopes').textContent = (me.scopes || []).join(', ') || '—';
+    document.getElementById('me-version').textContent = me.version || '—';
+    showPanel('panel-admin');
+    loadSystems().then(function() {
+      buildCreateForm();
+      loadAnonymous();
+    });
+    loadKeys();
+    auditOffset = 0;
+    loadAudit();
+    loadStorageSummary();
+  }
 
-    var resp = await api('POST', '/users', { username: name, password: pass, role: role });
-    if (resp._ok) {
-      document.getElementById('new-user-name').value = '';
-      document.getElementById('new-user-pass').value = '';
-      toast('User ' + name + ' created');
-      loadUsers();
-    } else {
-      showErr('create-user-err', resp.error || 'Failed to create user');
+  // ── Systems (for restriction hints) ──
+
+  async function loadSystems() {
+    var resp = await api('GET', '/systems');
+    knownSystems = resp._ok && Array.isArray(resp.systems) ? resp.systems : [];
+  }
+
+  // ── Restriction editor ──
+  //
+  // Only restriction: null means unrestricted. "only" with empty lists
+  // allows nothing, which keys and the anonymous policy both reject.
+
+  var editorSeq = 0;
+
+  function parseSystems(text) {
+    var out = [];
+    var parts = String(text || '').split(/[\s,]+/).filter(Boolean);
+    for (var i = 0; i < parts.length; i++) {
+      if (!/^\d+$/.test(parts[i]) || Number(parts[i]) <= 0) throw new Error('"' + parts[i] + '" is not a system ID (a positive number)');
+      var n = Number(parts[i]);
+      if (out.indexOf(n) < 0) out.push(n);
     }
+    return out.sort(function(a, b) { return a - b; });
   }
 
-  function editUser(user) {
-    var isSelf = currentUser && user.id === currentUser.id;
+  function parseTalkgroups(text, what) {
+    var out = [];
+    var parts = String(text || '').split(/[\s,]+/).filter(Boolean);
+    for (var i = 0; i < parts.length; i++) {
+      var m = /^(\d+):(\d+)$/.exec(parts[i]);
+      if (!m || Number(m[1]) <= 0 || Number(m[2]) <= 0) throw new Error(what + ': "' + parts[i] + '" is not system_id:tgid');
+      var v = Number(m[1]) + ':' + Number(m[2]);
+      if (out.indexOf(v) < 0) out.push(v);
+    }
+    return out.sort();
+  }
 
-    var overlay = el('div', { cls: 'modal-overlay' });
-    var box = el('div', { cls: 'modal-box' });
+  function restrictionSummary(r) {
+    if (r == null) return 'unrestricted';
+    var parts = [];
+    if (r.allow_all) parts.push('all talkgroups');
+    var sys = r.systems || [], tgs = r.talkgroups || [], ex = r.exclude_talkgroups || [];
+    if (sys.length) parts.push('systems ' + sys.join(', '));
+    if (tgs.length) parts.push(tgs.length <= 3 ? 'talkgroups ' + tgs.join(', ') : tgs.length + ' talkgroups');
+    if (!parts.length) parts.push('nothing');
+    var s = parts.join(' + ');
+    if (ex.length) s += ', except ' + (ex.length <= 3 ? ex.join(', ') : ex.length + ' talkgroups');
+    return s;
+  }
 
-    var title = el('h3', { text: 'Edit User: ' + user.username });
-
-    var roleGroup = el('div', { cls: 'form-group' }, [el('label', { text: 'Role' })]);
-    var roleSelect = el('select');
-    ['viewer', 'editor', 'admin'].forEach(function(r) {
-      var opt = el('option', { value: r, text: r });
-      if (r === user.role) opt.selected = true;
-      roleSelect.appendChild(opt);
+  // opts: {noneLabel, nothingError}
+  function restrictionEditor(opts) {
+    var name = 'restr-' + (++editorSeq);
+    var root = el('div', { cls: 'restr' });
+    root.appendChild(el('div', { cls: 'field-label', text: 'Restriction' }));
+    var modesBox = el('div', { cls: 'modes' });
+    var radios = {};
+    [['none', opts.noneLabel || 'Unrestricted: every system and talkgroup'],
+     ['all', 'All talkgroups, except the excluded ones'],
+     ['only', 'Only these systems and talkgroups (minus the excluded ones)']].forEach(function(m) {
+      var input = el('input', { type: 'radio', name: name, value: m[0] });
+      radios[m[0]] = input;
+      input.addEventListener('change', sync);
+      modesBox.appendChild(el('label', { cls: 'check' }, [input, m[1]]));
     });
-    roleSelect.style.cssText = 'width:100%;padding:7px 10px;font-size:13px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-body)';
-    if (isSelf) roleSelect.disabled = true;
-    roleGroup.appendChild(roleSelect);
+    root.appendChild(modesBox);
 
-    var passGroup = el('div', { cls: 'form-group', css: 'margin-top:10px' }, [el('label', { text: 'New Password (leave blank to keep)' })]);
-    var passInput = el('input', { type: 'password', placeholder: 'unchanged', autocomplete: 'new-password' });
-    passInput.style.cssText = 'width:100%;padding:7px 10px;font-size:13px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-body)';
-    passGroup.appendChild(passInput);
+    var sysInput = el('input', { type: 'text', placeholder: 'e.g. 1, 3', autocomplete: 'off' });
+    var tgInput = el('textarea', { rows: '2', placeholder: 'e.g. 1:9178, 2:9179' });
+    var exInput = el('textarea', { rows: '2', placeholder: 'e.g. 1:5001' });
+    var sysGroup = el('div', { cls: 'form-group' }, [el('label', { text: 'Systems' }), sysInput]);
+    var tgGroup = el('div', { cls: 'form-group' }, [el('label', { text: 'Talkgroups (system_id:tgid)' }), tgInput]);
+    var exGroup = el('div', { cls: 'form-group' }, [el('label', { text: 'Exclude talkgroups' }), exInput]);
+    var lists = el('div', { cls: 'lists' }, [sysGroup, tgGroup, exGroup]);
+    root.appendChild(lists);
 
-    var enabledGroup = el('div', { cls: 'form-group', css: 'margin-top:10px' }, [el('label', { text: 'Status' })]);
-    var enabledSelect = el('select');
-    var optActive = el('option', { value: 'true', text: 'Active' });
-    var optDisabled = el('option', { value: 'false', text: 'Disabled' });
-    if (user.enabled !== false) optActive.selected = true; else optDisabled.selected = true;
-    enabledSelect.appendChild(optActive);
-    enabledSelect.appendChild(optDisabled);
-    enabledSelect.style.cssText = 'width:100%;padding:7px 10px;font-size:13px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-body)';
-    if (isSelf) enabledSelect.disabled = true;
-    enabledGroup.appendChild(enabledSelect);
+    var hint = el('div', { cls: 'hint' });
+    if (knownSystems.length) {
+      hint.textContent = 'Known systems: ' + knownSystems.map(function(s) {
+        return s.system_id + ' = ' + (s.name || s.short_name || 'system ' + s.system_id);
+      }).join('; ') + '. IDs that don’t exist yet are allowed.';
+    } else {
+      hint.textContent = 'IDs that don’t exist yet are allowed.';
+    }
+    root.appendChild(hint);
 
-    var errEl = el('div', { cls: 'error-msg' });
+    function mode() {
+      for (var k in radios) if (radios[k].checked) return k;
+      return 'none';
+    }
 
-    var cancelBtn = el('button', { cls: 'btn btn-secondary', text: 'Cancel', onclick: function() { overlay.remove(); } });
-    var saveBtn = el('button', { cls: 'btn btn-primary', text: 'Save', onclick: async function() {
-      errEl.style.display = 'none';
-      var patch = {};
-      var newRole = roleSelect.value;
-      var newPass = passInput.value;
-      var newEnabled = enabledSelect.value === 'true';
-      if (newRole !== user.role) patch.role = newRole;
-      if (newPass) patch.password = newPass;
-      if (newEnabled !== (user.enabled !== false)) patch.enabled = newEnabled;
-      if (!Object.keys(patch).length) { overlay.remove(); return; }
+    function sync() {
+      var m = mode();
+      lists.style.display = m === 'none' ? 'none' : '';
+      hint.style.display = m === 'none' ? 'none' : '';
+      sysGroup.style.display = m === 'only' ? '' : 'none';
+      tgGroup.style.display = m === 'only' ? '' : 'none';
+    }
 
-      var resp = await api('PATCH', '/users/' + user.id, patch);
-      if (resp._ok) {
-        toast('User updated');
-        overlay.remove();
-        loadUsers();
-      } else {
-        errEl.textContent = resp.error || 'Update failed';
-        errEl.style.display = 'block';
+    function set(r) {
+      sysInput.value = r && r.systems ? r.systems.join(', ') : '';
+      tgInput.value = r && r.talkgroups ? r.talkgroups.join(', ') : '';
+      exInput.value = r && r.exclude_talkgroups ? r.exclude_talkgroups.join(', ') : '';
+      radios[r == null ? 'none' : (r.allow_all ? 'all' : 'only')].checked = true;
+      sync();
+    }
+
+    // Returns the Restriction object, or null for unrestricted. Throws on invalid input.
+    function get() {
+      var m = mode();
+      if (m === 'none') return null;
+      var exclude = parseTalkgroups(exInput.value, 'Exclude talkgroups');
+      if (m === 'all') return { allow_all: true, systems: [], talkgroups: [], exclude_talkgroups: exclude };
+      var systems = parseSystems(sysInput.value);
+      var talkgroups = parseTalkgroups(tgInput.value, 'Talkgroups');
+      if (!systems.length && !talkgroups.length) throw new Error(opts.nothingError);
+      return { allow_all: false, systems: systems, talkgroups: talkgroups, exclude_talkgroups: exclude };
+    }
+
+    function setVisible(v) { root.style.display = v ? '' : 'none'; }
+
+    set(null);
+    return { root: root, get: get, set: set, setVisible: setVisible };
+  }
+
+  // ── Key form (create + edit share it) ──
+
+  var ACCESS_LABELS = {
+    listen: 'listen — read radio data, stream events and audio',
+    edit: 'edit — listen + change tags and transcriptions',
+    admin: 'admin — everything, including keys and settings',
+    none: 'upload only'
+  };
+
+  function scopesFrom(access, upload) {
+    var s = access === 'none' ? [] : [access];
+    if (upload || access === 'none') s.push('upload');
+    return s;
+  }
+
+  function accessOf(scopes) {
+    scopes = scopes || [];
+    if (scopes.indexOf('admin') >= 0) return 'admin';
+    if (scopes.indexOf('edit') >= 0) return 'edit';
+    if (scopes.indexOf('listen') >= 0) return 'listen';
+    return 'none';
+  }
+
+  function isoDaysFromNow(days) {
+    return new Date(Date.now() + days * 86400000).toISOString();
+  }
+
+  // opts: {edit: key|null}
+  function keyForm(opts) {
+    var editing = opts && opts.edit;
+    var root = el('div');
+
+    var nameInput = el('input', { type: 'text', placeholder: 'e.g. tr-dashboard at home', autocomplete: 'off', maxlength: '100', css: 'width:240px' });
+    var purpose = el('select', { css: 'width:260px' });
+    [['server', 'A server or script I run (the key stays private)'],
+     ['app', 'A single-user app or this browser (tr-dashboard, demo pages)'],
+     ['upload', 'A trunk-recorder upload plugin'],
+     ['public', 'A web page that other people load']].forEach(function(o) {
+      purpose.appendChild(el('option', { value: o[0], text: o[1] }));
+    });
+    purpose.value = 'app';
+
+    var accessSel = el('select', { css: 'width:280px' });
+    ['listen', 'edit', 'admin', 'none'].forEach(function(a) {
+      accessSel.appendChild(el('option', { value: a, text: ACCESS_LABELS[a] }));
+    });
+    var uploadBox = el('input', { type: 'checkbox' });
+    var uploadLabel = el('label', { cls: 'check' }, [uploadBox, 'also allow call upload']);
+
+    var expSel = el('select', { css: 'width:150px' });
+    var expOptions = editing
+      ? [['keep', 'unchanged'], ['never', 'never'], ['30', 'in 30 days'], ['90', 'in 90 days'], ['365', 'in 1 year'], ['date', 'on a date…']]
+      : [['never', 'never'], ['30', 'in 30 days'], ['90', 'in 90 days'], ['365', 'in 1 year'], ['date', 'on a date…']];
+    expOptions.forEach(function(o) { expSel.appendChild(el('option', { value: o[0], text: o[1] })); });
+    var expDate = el('input', { type: 'date', css: 'display:none' });
+    var rateInput = el('input', { type: 'number', min: '0', step: 'any', placeholder: 'none', css: 'width:110px' });
+
+    var publicWarn = el('div', { cls: 'warn-box', css: 'display:none' });
+    publicWarn.appendChild(el('strong', { text: 'Keys used in web pages that other people load are public. ' }));
+    publicWarn.appendChild(document.createTextNode('Every visitor gets this key’s access. For public listening use the anonymous access policy below instead, or put the key on a server and hand visitors tickets. If you must embed a key, make it a listen key restricted to what may be public.'));
+
+    var restr = restrictionEditor({ nothingError: 'The restriction allows nothing. Add a system or talkgroup, or choose all talkgroups.' });
+
+    var row1 = el('div', { cls: 'form-row' }, [
+      el('div', { cls: 'form-group' }, [el('label', { text: 'Name' }), nameInput]),
+      editing ? null : el('div', { cls: 'form-group' }, [el('label', { text: 'Used by' }), purpose])
+    ]);
+    var row2 = el('div', { cls: 'form-row' }, [
+      el('div', { cls: 'form-group' }, [el('label', { text: 'Access' }), accessSel]),
+      el('div', { cls: 'form-group' }, [el('label', { text: ' ' }), uploadLabel])
+    ]);
+    var row3 = el('div', { cls: 'form-row' }, [
+      el('div', { cls: 'form-group' }, [el('label', { text: 'Expires' }), expSel]),
+      el('div', { cls: 'form-group' }, [el('label', { text: ' ' }), expDate]),
+      el('div', { cls: 'form-group' }, [el('label', { text: 'Rate limit (req/s)' }), rateInput])
+    ]);
+    root.appendChild(row1);
+    root.appendChild(row2);
+    root.appendChild(row3);
+    root.appendChild(restr.root);
+    root.appendChild(publicWarn);
+
+    function sync() {
+      var access = accessSel.value;
+      uploadLabel.style.display = access === 'none' ? 'none' : '';
+      var scopes = scopesFrom(access, uploadBox.checked);
+      // Only a key whose scopes are exactly ["listen"] can be restricted.
+      restr.setVisible(scopes.length === 1 && scopes[0] === 'listen');
+      expDate.style.display = expSel.value === 'date' ? '' : 'none';
+      publicWarn.style.display = (!editing && purpose.value === 'public') ? '' : 'none';
+    }
+    purpose.addEventListener('change', function() {
+      if (purpose.value === 'upload') { accessSel.value = 'none'; uploadBox.checked = false; }
+      else if (purpose.value === 'public') { accessSel.value = 'listen'; uploadBox.checked = false; }
+      sync();
+    });
+    accessSel.addEventListener('change', sync);
+    uploadBox.addEventListener('change', sync);
+    expSel.addEventListener('change', sync);
+
+    if (editing) {
+      nameInput.value = editing.name || '';
+      accessSel.value = accessOf(editing.scopes);
+      uploadBox.checked = (editing.scopes || []).indexOf('upload') >= 0 && accessOf(editing.scopes) !== 'none';
+      expSel.value = 'keep';
+      rateInput.value = editing.rate_limit_rps != null ? String(editing.rate_limit_rps) : '';
+      restr.set(editing.restriction == null ? null : editing.restriction);
+    } else {
+      accessSel.value = 'listen';
+    }
+    sync();
+
+    // Returns {name, scopes, restriction, expires_at?, rate_limit_rps}; throws on invalid input.
+    // expires_at is undefined for "unchanged".
+    function values() {
+      var name = nameInput.value.trim();
+      if (!name) throw new Error('Name is required.');
+      if (name.length > 100) throw new Error('Name is longer than 100 characters.');
+      var scopes = scopesFrom(accessSel.value, uploadBox.checked);
+      var restrictable = scopes.length === 1 && scopes[0] === 'listen';
+      var restriction = restrictable ? restr.get() : null;
+      var expires;
+      var e = expSel.value;
+      if (e === 'never') expires = null;
+      else if (e === 'keep') expires = undefined;
+      else if (e === 'date') {
+        if (!expDate.value) throw new Error('Pick an expiry date.');
+        var d = new Date(expDate.value + 'T00:00:00Z');
+        if (isNaN(d) || d.getTime() <= Date.now()) throw new Error('The expiry date must be in the future.');
+        expires = d.toISOString();
+      } else expires = isoDaysFromNow(Number(e));
+      var rate = null;
+      if (rateInput.value.trim() !== '') {
+        rate = Number(rateInput.value);
+        if (!isFinite(rate) || rate <= 0) throw new Error('The rate limit must be a number above 0, or empty for none.');
       }
-    }});
-
-    var actions = el('div', { cls: 'modal-actions' }, [cancelBtn, saveBtn]);
-    box.appendChild(title);
-    box.appendChild(roleGroup);
-    box.appendChild(passGroup);
-    box.appendChild(enabledGroup);
-    box.appendChild(errEl);
-    box.appendChild(actions);
-    overlay.appendChild(box);
-    document.body.appendChild(overlay);
-
-    overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
-  }
-
-  async function deleteUser(user) {
-    if (!confirm('Delete user "' + user.username + '"? This cannot be undone.')) return;
-    var resp = await api('DELETE', '/users/' + user.id);
-    if (resp._ok) {
-      toast('User deleted');
-      loadUsers();
-    } else {
-      toast(resp.error || 'Delete failed', 'error');
+      return { name: name, scopes: scopes, restriction: restriction, expires_at: expires, rate_limit_rps: rate };
     }
+
+    function reset() {
+      nameInput.value = '';
+      accessSel.value = 'listen';
+      uploadBox.checked = false;
+      expSel.value = 'never';
+      expDate.value = '';
+      rateInput.value = '';
+      purpose.value = 'app';
+      restr.set(null);
+      sync();
+    }
+
+    return { root: root, values: values, reset: reset, purpose: function() { return purpose.value; } };
   }
 
-  // ── API Keys CRUD ──
+  function buildCreateForm() {
+    var holder = document.getElementById('create-key-form');
+    clearChildren(holder);
+    createForm = keyForm(null);
+    holder.appendChild(createForm.root);
+  }
+
+  // ── Keys ──
 
   async function loadKeys() {
-    var resp = await api('GET', '/auth/keys/all');
-    if (!resp._ok) return;
-    allKeys = Array.isArray(resp) ? resp : (resp.keys || []);
+    clearErr('keys-err');
+    var incl = document.getElementById('show-revoked').checked;
+    var resp = await api('GET', '/keys' + (incl ? '?include_revoked=true' : ''));
+    if (!resp._ok) {
+      if (resp._status !== 401) showErr('keys-err', apiError(resp, 'Could not load keys'));
+      return;
+    }
+    allKeys = Array.isArray(resp.keys) ? resp.keys : [];
     renderKeys();
+  }
+
+  function scopeBadges(scopes) {
+    var span = el('span');
+    (scopes || []).forEach(function(s) {
+      span.appendChild(el('span', { cls: 'scope-badge ' + (['admin', 'edit', 'listen', 'upload'].indexOf(s) >= 0 ? s : ''), text: s }));
+    });
+    return span;
   }
 
   function renderKeys() {
     var tbody = document.getElementById('keys-body');
     var empty = document.getElementById('keys-empty');
     clearChildren(tbody);
+    var bootstrapActive = allKeys.some(function(k) { return k.name === 'bootstrap admin' && k.status === 'active'; });
+    document.getElementById('bootstrap-warning').style.display = bootstrapActive ? '' : 'none';
 
     if (!allKeys.length) {
       empty.style.display = '';
@@ -814,151 +896,280 @@
     }
     empty.style.display = 'none';
 
+    var myId = me && me.key ? me.key.id : null;
     allKeys.forEach(function(k) {
-      var owner = k.is_service_account ? 'service' : (k.username || 'user #' + (k.user_id || '?'));
-      var tr = el('tr', null, [
-        el('td', { text: k.label || '\u2014' }),
-        el('td', null, [el('code', { text: (k.key_prefix || '\u2014') + '...' })]),
-        el('td', null, [el('span', { cls: 'role-badge ' + k.role, text: k.role })]),
-        el('td', { text: owner }),
-        el('td', { text: fmtDate(k.last_used_at) }),
-        el('td', { css: 'text-align:right' }, [
-          el('button', { cls: 'action-link danger', text: 'revoke', onclick: function() { revokeKey(k); } })
-        ])
+      var restrictable = (k.scopes || []).length === 1 && k.scopes[0] === 'listen';
+      var nameCell = el('td', null, [
+        el('span', { text: k.name || '—' }),
+        k.id === myId ? el('span', { text: ' (this key)', css: 'color:var(--text-faint, var(--text-muted));font-size:11px' }) : null,
+        k.legacy ? el('span', { cls: 'tag', text: 'legacy', css: 'margin-left:6px' }) : null
+      ]);
+      var statusCls = 'status-' + (k.status || 'active');
+      var actions = el('td', { css: 'text-align:right;white-space:nowrap' });
+      if (k.status !== 'revoked') {
+        actions.appendChild(el('button', { cls: 'action-link', text: 'edit', onclick: function() { editKey(k); } }));
+        actions.appendChild(el('button', { cls: 'action-link danger', text: 'revoke', css: 'margin-left:8px', onclick: function() { revokeKey(k); } }));
+      }
+      var tr = el('tr', { cls: k.status === 'revoked' ? 'revoked' : '' }, [
+        nameCell,
+        el('td', null, [el('code', { text: k.prefix || '—' })]),
+        el('td', null, [scopeBadges(k.scopes)]),
+        el('td', { text: restrictable || k.restriction != null ? restrictionSummary(k.restriction) : '—' }),
+        el('td', { text: k.expires_at ? fmtDate(k.expires_at) : 'never', title: k.expires_at ? fmtTime(k.expires_at) : '' }),
+        el('td', { text: fmtDate(k.last_used_at), title: k.last_used_at ? fmtTime(k.last_used_at) : '' }),
+        el('td', { cls: statusCls, text: k.status || 'active' }),
+        actions
       ]);
       tbody.appendChild(tr);
     });
   }
 
+  function revealKey(created, purpose) {
+    var container = document.getElementById('key-reveal-container');
+    clearChildren(container);
+    var plaintext = created.key || '';
+    var valEl = el('div', { cls: 'key-val', text: plaintext });
+    var copyBtn = el('button', { cls: 'btn btn-primary btn-sm', text: 'Copy' });
+    copyBtn.addEventListener('click', function() {
+      var done = function() { copyBtn.textContent = 'Copied'; setTimeout(function() { copyBtn.textContent = 'Copy'; }, 1500); };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(plaintext).then(done, function() { selectText(valEl); });
+      } else {
+        selectText(valEl);
+      }
+    });
+    var warn = el('div', { cls: 'warn-box' }, [
+      el('strong', { text: 'Keys used in web pages that other people load are public. ' }),
+      purpose === 'public'
+        ? 'You said this key is for such a page: everyone who loads it gets this key’s access.'
+        : 'Keep this key in a server, a script’s config or your own browser; don’t embed it in a page others load.'
+    ]);
+    var reveal = el('div', { cls: 'key-reveal' }, [
+      el('div', { text: 'New API key “' + (created.name || '') + '”', css: 'font-weight:600;font-size:12px;margin-bottom:4px' }),
+      valEl,
+      el('div', { cls: 'key-warn', text: 'Copy this key now — it will not be shown again.' }),
+      warn,
+      el('div', { css: 'display:flex;gap:8px;margin-top:10px' }, [
+        copyBtn,
+        el('button', { cls: 'btn btn-secondary btn-sm', text: 'Dismiss', onclick: function() { reveal.remove(); } })
+      ])
+    ]);
+    container.appendChild(reveal);
+  }
+
+  function selectText(node) {
+    var range = document.createRange();
+    range.selectNodeContents(node);
+    var sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+
   async function createKey() {
     clearErr('create-key-err');
-    var label = document.getElementById('new-key-label').value.trim();
-    var role = document.getElementById('new-key-role').value;
-    var type = document.getElementById('new-key-type').value;
-    if (!label) return showErr('create-key-err', 'Label required');
-
-    var endpoint = type === 'service' ? '/auth/keys/service' : '/auth/keys';
-    var resp = await api('POST', endpoint, { label: label, role: role });
+    var v;
+    try { v = createForm.values(); } catch (e) { return showErr('create-key-err', e.message); }
+    var body = { name: v.name, scopes: v.scopes };
+    if (v.restriction != null) body.restriction = v.restriction;
+    if (v.expires_at) body.expires_at = v.expires_at;
+    if (v.rate_limit_rps != null) body.rate_limit_rps = v.rate_limit_rps;
+    var btn = document.getElementById('create-key-btn');
+    btn.disabled = true;
+    var resp = await api('POST', '/keys', body);
+    btn.disabled = false;
     if (resp._ok) {
-      document.getElementById('new-key-label').value = '';
-      var rawKey = resp.raw_key || resp.key || '';
-
-      var container = document.getElementById('key-reveal-container');
-      clearChildren(container);
-      var reveal = el('div', { cls: 'key-reveal' }, [
-        el('div', { text: 'New API Key Created', css: 'font-weight:600;font-size:12px;margin-bottom:4px' }),
-        el('div', { cls: 'key-val', text: rawKey }),
-        el('div', { cls: 'key-warn', text: 'Copy this key now \u2014 it will not be shown again.' }),
-        el('button', { cls: 'btn btn-secondary btn-sm', text: 'Dismiss', css: 'margin-top:8px', onclick: function() { reveal.remove(); } })
-      ]);
-      container.appendChild(reveal);
-
+      revealKey(resp, createForm.purpose());
+      createForm.reset();
       toast('API key created');
       loadKeys();
     } else {
-      showErr('create-key-err', resp.error || 'Failed to create key');
+      showErr('create-key-err', apiError(resp, 'Could not create the key'));
+    }
+  }
+
+  function sameList(a, b) {
+    a = (a || []).slice().sort(); b = (b || []).slice().sort();
+    return a.length === b.length && a.every(function(x, i) { return x === b[i]; });
+  }
+
+  function editKey(key) {
+    var overlay = el('div', { cls: 'modal-overlay' });
+    var box = el('div', { cls: 'modal-box', role: 'dialog', 'aria-modal': 'true' });
+    var form = keyForm({ edit: key });
+    var errEl = el('div', { cls: 'error-msg' });
+    function close() { overlay.remove(); }
+
+    var cancelBtn = el('button', { cls: 'btn btn-secondary', text: 'Cancel', onclick: close });
+    var saveBtn = el('button', { cls: 'btn btn-primary', text: 'Save' });
+    saveBtn.addEventListener('click', async function() {
+      errEl.style.display = 'none';
+      var v;
+      try { v = form.values(); } catch (e) { errEl.textContent = e.message; errEl.style.display = 'block'; return; }
+      var patch = {};
+      if (v.name !== key.name) patch.name = v.name;
+      if (!sameList(v.scopes, key.scopes)) patch.scopes = v.scopes;
+      var restrictable = v.scopes.length === 1 && v.scopes[0] === 'listen';
+      if (restrictable) {
+        if (JSON.stringify(v.restriction) !== JSON.stringify(normalizeRestriction(key.restriction))) patch.restriction = v.restriction;
+      } else if (key.restriction != null) {
+        patch.restriction = null;   // scopes other than ["listen"] can't keep a restriction
+      }
+      if (v.expires_at !== undefined && v.expires_at !== key.expires_at) patch.expires_at = v.expires_at;
+      if ((v.rate_limit_rps == null ? null : v.rate_limit_rps) !== (key.rate_limit_rps == null ? null : key.rate_limit_rps)) patch.rate_limit_rps = v.rate_limit_rps;
+      if (!Object.keys(patch).length) { close(); return; }
+      saveBtn.disabled = true;
+      var resp = await api('PATCH', '/keys/' + encodeURIComponent(key.id), patch);
+      saveBtn.disabled = false;
+      if (resp._ok) {
+        toast('Key updated');
+        close();
+        if (me && me.key && me.key.id === key.id) refreshMe();
+        loadKeys();
+      } else {
+        errEl.textContent = apiError(resp, 'Update failed');
+        errEl.style.display = 'block';
+      }
+    });
+
+    box.appendChild(el('h3', { text: 'Edit key: ' + (key.name || '') + ' (' + (key.prefix || '') + ')' }));
+    box.appendChild(form.root);
+    box.appendChild(errEl);
+    box.appendChild(el('div', { cls: 'modal-actions' }, [cancelBtn, saveBtn]));
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) close(); });
+    overlay.addEventListener('keydown', function(e) { if (e.key === 'Escape') close(); });
+  }
+
+  function normalizeRestriction(r) {
+    if (r == null) return null;
+    return {
+      allow_all: !!r.allow_all,
+      systems: (r.systems || []).slice().sort(function(a, b) { return a - b; }),
+      talkgroups: (r.talkgroups || []).slice().sort(),
+      exclude_talkgroups: (r.exclude_talkgroups || []).slice().sort()
+    };
+  }
+
+  async function refreshMe() {
+    var r = await whoamiWith(adminKey);
+    if (r.status === 200) {
+      me = r.body;
+      if ((me.scopes || []).indexOf('admin') < 0) {
+        forget();
+        showErr('connect-err', 'This key no longer has the admin scope.');
+        return;
+      }
+      enterAdmin();
+    } else if (r.status === 401) {
+      keyRejected(r.body);
     }
   }
 
   async function revokeKey(key) {
-    if (!confirm('Revoke API key "' + (key.label || '') + '"? This cannot be undone.')) return;
-    var resp = await api('DELETE', '/auth/keys/' + key.id + '/any');
+    var mine = me && me.key && me.key.id === key.id;
+    var msg = 'Revoke API key "' + (key.name || '') + '" (' + (key.prefix || '') + ')? Clients using it stop working at once. This cannot be undone.';
+    if (mine) msg += '\n\nThis is the key this page is using; you will need another admin key afterwards.';
+    if (!confirm(msg)) return;
+    var resp = await api('DELETE', '/keys/' + encodeURIComponent(key.id));
     if (resp._ok) {
       toast('Key revoked');
-      clearChildren(document.getElementById('key-reveal-container'));
+      if (mine) { forget(); return; }
       loadKeys();
     } else {
-      toast(resp.error || 'Revoke failed', 'error');
+      toast(apiError(resp, 'Revoke failed'), 'error');
     }
   }
 
-  // ── Downgrade ──
+  // ── Anonymous access ──
 
-  async function doDowngrade() {
-    clearErr('downgrade-err');
-    var btn = document.getElementById('downgrade-btn');
-    btn.disabled = true; btn.textContent = 'Deleting...';
+  async function loadAnonymous() {
+    clearErr('anon-err');
+    var holder = document.getElementById('anon-form');
+    clearChildren(holder);
+    var resp = await api('GET', '/anonymous-access');
+    if (!resp._ok) {
+      if (resp._status !== 401) showErr('anon-err', apiError(resp, 'Could not load the anonymous access policy'));
+      return;
+    }
+    var accessName = 'anon-access';
+    var off = el('input', { type: 'radio', name: accessName, value: 'off' });
+    var listen = el('input', { type: 'radio', name: accessName, value: 'listen' });
+    (resp.access === 'listen' ? listen : off).checked = true;
+    holder.appendChild(el('div', { css: 'display:flex;gap:18px;flex-wrap:wrap' }, [
+      el('label', { cls: 'check' }, [off, 'off — a key is required']),
+      el('label', { cls: 'check' }, [listen, 'listen — anyone may read and listen'])
+    ]));
+    anonForm = restrictionEditor({
+      noneLabel: 'Unrestricted: every system and talkgroup',
+      nothingError: 'A restriction that allows nothing can’t be saved; use access: off instead.'
+    });
+    anonForm.set(resp.restriction == null ? null : resp.restriction);
+    holder.appendChild(anonForm.root);
+    holder.appendChild(el('div', { cls: 'hint', css: 'font-size:11px;color:var(--text-muted);margin-top:6px', text: 'The restriction is kept while access is off, so it can be prepared in advance.' }));
+    anonForm.access = function() { return listen.checked ? 'listen' : 'off'; };
+    document.getElementById('anon-updated').textContent = resp.updated_at ? 'last changed ' + fmtTime(resp.updated_at) : '';
+  }
 
-    try {
-      var resp = await api('DELETE', '/users/all');
-      if (resp._ok) {
-        localStorage.removeItem('tr-engine-jwt');
-        toast('All users deleted \u2014 reverting to token auth');
-        setTimeout(function() { location.reload(); }, 1000);
-      } else {
-        showErr('downgrade-err', resp.error || 'Delete failed');
-        btn.disabled = false; btn.textContent = 'Delete All Users';
-      }
-    } catch (e) {
-      showErr('downgrade-err', 'Network error during downgrade');
-      btn.disabled = false; btn.textContent = 'Delete All Users';
+  async function saveAnonymous() {
+    clearErr('anon-err');
+    if (!anonForm) return;
+    var restriction;
+    try { restriction = anonForm.get(); } catch (e) { return showErr('anon-err', e.message); }
+    var btn = document.getElementById('anon-save-btn');
+    btn.disabled = true;
+    var resp = await api('PUT', '/anonymous-access', { access: anonForm.access(), restriction: restriction });
+    btn.disabled = false;
+    if (resp._ok) {
+      toast('Anonymous access saved');
+      document.getElementById('anon-updated').textContent = resp.updated_at ? 'last changed ' + fmtTime(resp.updated_at) : '';
+    } else {
+      showErr('anon-err', apiError(resp, 'Could not save the policy'));
     }
   }
 
-  // ── Event bindings ──
+  // ── Audit log (rendered as text only) ──
 
-  document.getElementById('btn-logout').addEventListener('click', function() {
-    if (window.trAuth) trAuth.logout();
-  });
+  async function loadAudit() {
+    clearErr('audit-err');
+    var resp = await api('GET', '/admin/audit-log?limit=' + AUDIT_PAGE + '&offset=' + auditOffset);
+    var tbody = document.getElementById('audit-body');
+    clearChildren(tbody);
+    if (!resp._ok) {
+      if (resp._status !== 401) showErr('audit-err', apiError(resp, 'Could not load the audit log'));
+      return;
+    }
+    var entries = Array.isArray(resp.entries) ? resp.entries : [];
+    auditTotal = typeof resp.total === 'number' ? resp.total : entries.length;
+    document.getElementById('audit-empty').style.display = entries.length ? 'none' : '';
+    entries.forEach(function(a) {
+      var status = Number(a.status) || 0;
+      tbody.appendChild(el('tr', null, [
+        el('td', { cls: 'mono', text: fmtTime(a.time) }),
+        el('td', { text: (a.key_name || '') + (a.key_id != null ? ' #' + a.key_id : '') }),
+        el('td', { cls: 'wrap', text: a.actor || '—' }),
+        el('td', { cls: 'mono wrap', text: (a.method || '') + ' ' + (a.path || '') }),
+        el('td', { cls: 'mono', text: String(a.status == null ? '' : a.status), css: status >= 400 ? 'color:var(--danger)' : '' }),
+        el('td', { cls: 'mono wrap', text: a.request_id || '' })
+      ]));
+    });
+    var from = entries.length ? auditOffset + 1 : 0;
+    document.getElementById('audit-range').textContent = from + '–' + (auditOffset + entries.length) + ' of ' + auditTotal;
+    document.getElementById('audit-prev').disabled = auditOffset === 0;
+    document.getElementById('audit-next').disabled = auditOffset + entries.length >= auditTotal;
+  }
 
-  document.getElementById('setup-btn').addEventListener('click', function() {
-    handleSetup('setup-user', 'setup-pass', 'setup-pass2', 'setup-err', 'setup-btn', 'Create Admin');
-  });
-
-  document.getElementById('basic-setup-btn').addEventListener('click', function() {
-    handleSetup('basic-setup-user', 'basic-setup-pass', 'basic-setup-pass2', 'basic-setup-err', 'basic-setup-btn', 'Create Admin & Enable User Auth');
-  });
-
-  document.getElementById('add-user-btn').addEventListener('click', createUser);
-  document.getElementById('create-key-btn').addEventListener('click', createKey);
-
-  document.getElementById('danger-toggle-btn').addEventListener('click', function() {
-    document.getElementById('danger-body').classList.toggle('open');
-    document.getElementById('danger-arrow').classList.toggle('open');
-  });
-
-  document.getElementById('downgrade-confirm').addEventListener('input', function() {
-    document.getElementById('downgrade-btn').disabled = this.value.trim().toLowerCase() !== 'delete all users';
-  });
-
-  document.getElementById('downgrade-btn').addEventListener('click', doDowngrade);
-
-  // Enter key on forms
-  document.getElementById('setup-pass2').addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') document.getElementById('setup-btn').click();
-  });
-  document.getElementById('basic-setup-pass2').addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') document.getElementById('basic-setup-btn').click();
-  });
-  document.getElementById('new-user-pass').addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') document.getElementById('add-user-btn').click();
-  });
-  document.getElementById('new-key-label').addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') document.getElementById('create-key-btn').click();
-  });
-
-  // ── Storage Summary ──
+  // ── Storage summary ──
 
   async function loadStorageSummary() {
-    try {
-      var resp = await api('GET', '/admin/storage/stats');
-      if (!resp._ok) return;
-      var el = document.getElementById('section-storage');
-      el.style.display = '';
-      document.getElementById('storage-total').textContent = fmtBytes(resp.total_db_bytes || 0);
-
-      var tables = (resp.tables || []).slice(0, 3);
-      if (tables.length === 0) {
-        document.getElementById('storage-tables').textContent = 'none';
-        return;
-      }
-      var names = tables.map(function(t) {
-        return t.name + ' (' + fmtBytes(t.total_bytes) + ')';
-      });
-      document.getElementById('storage-tables').textContent = names.join(', ');
-    } catch(e) {
-      // storage not available — widget stays hidden
-    }
+    var resp = await api('GET', '/admin/storage/stats');
+    if (!resp._ok) return;
+    document.getElementById('section-storage').style.display = '';
+    document.getElementById('storage-total').textContent = fmtBytes(resp.total_db_bytes || 0);
+    var tables = (resp.tables || []).slice(0, 3);
+    document.getElementById('storage-tables').textContent = tables.length
+      ? tables.map(function(t) { return t.name + ' (' + fmtBytes(t.total_bytes) + ')'; }).join(', ')
+      : 'none';
   }
 
   function fmtBytes(b) {
@@ -968,8 +1179,30 @@
     return (b / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
   }
 
+  // ── Event bindings ──
+
+  document.getElementById('connect-btn').addEventListener('click', function() {
+    connect(document.getElementById('connect-key').value, false);
+  });
+  document.getElementById('connect-key').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') connect(this.value, false);
+  });
+  document.getElementById('btn-forget').addEventListener('click', forget);
+  document.getElementById('create-key-btn').addEventListener('click', createKey);
+  document.getElementById('show-revoked').addEventListener('change', loadKeys);
+  document.getElementById('anon-save-btn').addEventListener('click', saveAnonymous);
+  document.getElementById('audit-refresh').addEventListener('click', function() { auditOffset = 0; loadAudit(); });
+  document.getElementById('audit-prev').addEventListener('click', function() {
+    auditOffset = Math.max(0, auditOffset - AUDIT_PAGE); loadAudit();
+  });
+  document.getElementById('audit-next').addEventListener('click', function() {
+    auditOffset += AUDIT_PAGE; loadAudit();
+  });
+
   // ── Init ──
-  detectMode();
+  var saved = sessionGet();
+  if (saved) connect(saved, true);
+  else showPanel('panel-connect');
 })();
 </script>
 <script src="theme-engine.js?v=2"></script>

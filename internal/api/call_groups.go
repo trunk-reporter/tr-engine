@@ -43,7 +43,7 @@ func (h *CallGroupsHandler) ListCallGroups(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	groups, total, err := h.db.ListCallGroups(r.Context(), filter)
+	groups, total, err := h.db.ListCallGroups(r.Context(), PrincipalFrom(r), filter)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "failed to list call groups")
 		return
@@ -56,7 +56,8 @@ func (h *CallGroupsHandler) ListCallGroups(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// GetCallGroup returns a call group with all its individual recordings.
+// GetCallGroup returns a call group with all its individual recordings. A
+// group outside the caller's restriction is 404, like a missing one.
 func (h *CallGroupsHandler) GetCallGroup(w http.ResponseWriter, r *http.Request) {
 	id, err := PathInt(r, "id")
 	if err != nil {
@@ -64,9 +65,9 @@ func (h *CallGroupsHandler) GetCallGroup(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	group, calls, err := h.db.GetCallGroupByID(r.Context(), id)
+	group, calls, err := h.db.GetCallGroupByID(r.Context(), PrincipalFrom(r), id)
 	if err != nil {
-		WriteError(w, http.StatusNotFound, "call group not found")
+		writeLookupError(w, err, "call group not found", "failed to get call group")
 		return
 	}
 	if h.trAudioDir != "" {

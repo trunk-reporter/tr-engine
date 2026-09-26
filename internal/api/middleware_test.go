@@ -1,20 +1,13 @@
 package api
 
 import (
-	"bytes"
-	"context"
-	"encoding/base64"
 	"encoding/json"
-	"fmt"
-	"mime/multipart"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
+	"strings"
 	"testing"
 	"time"
-
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/snarg/tr-engine/internal/database"
 )
 
 // okHandler is a trivial handler that writes 200 OK.
@@ -33,729 +26,110 @@ func TestRequestID(t *testing.T) {
 		}
 	})
 
-	t.Run("preserves_provided_id", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("X-Request-ID", "my-custom-id")
-		RequestID(okHandler).ServeHTTP(rec, req)
-		id := rec.Header().Get("X-Request-ID")
-		if id != "my-custom-id" {
-			t.Errorf("expected preserved ID %q, got %q", "my-custom-id", id)
+	t.Run("preserves_valid_id", func(t *testing.T) {
+		for _, id := range []string{"my-custom-id", "a.b_C-9", strings.Repeat("x", 64)} {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/", nil)
+			req.Header.Set("X-Request-ID", id)
+			RequestID(okHandler).ServeHTTP(rec, req)
+			if got := rec.Header().Get("X-Request-ID"); got != id {
+				t.Errorf("expected preserved ID %q, got %q", id, got)
+			}
+		}
+	})
+
+	t.Run("replaces_invalid_id", func(t *testing.T) {
+		for _, id := range []string{strings.Repeat("x", 65), "has space", "semi;colon", "new\nline", "<script>", "ümlaut"} {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/", nil)
+			req.Header.Set("X-Request-ID", id)
+			var seen string
+			RequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seen = r.Header.Get("X-Request-ID")
+			})).ServeHTTP(rec, req)
+			got := rec.Header().Get("X-Request-ID")
+			if got == id || len(got) != 16 {
+				t.Errorf("%q: got %q, want a generated 16-char ID", id, got)
+			}
+			if seen != got {
+				t.Errorf("%q: handler saw %q, response says %q", id, seen, got)
+			}
 		}
 	})
 }
 
-func TestCORSWithOrigins(t *testing.T) {
-	t.Run("empty_origins_allows_all", func(t *testing.T) {
+func TestCORS(t *testing.T) {
+	t.Run("every_response_allows_all_origins_without_credentials", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		CORSWithOrigins(nil)(okHandler).ServeHTTP(rec, req)
-		if rec.Header().Get("Access-Control-Allow-Origin") != "*" {
-			t.Error("missing Access-Control-Allow-Origin: *")
+		req := httptest.NewRequest("GET", "/api/v1/calls", nil)
+		req.Header.Set("Origin", "https://evil.example")
+		CORS(okHandler).ServeHTTP(rec, req)
+		h := rec.Header()
+		if h.Get("Access-Control-Allow-Origin") != "*" {
+			t.Errorf("Allow-Origin = %q, want *", h.Get("Access-Control-Allow-Origin"))
+		}
+		if h.Get("Access-Control-Allow-Credentials") != "" {
+			t.Error("Access-Control-Allow-Credentials must never be sent")
+		}
+		if h.Get("Access-Control-Expose-Headers") != "X-Request-ID, Retry-After, WWW-Authenticate" {
+			t.Errorf("Expose-Headers = %q", h.Get("Access-Control-Expose-Headers"))
 		}
 		if rec.Code != http.StatusOK {
 			t.Errorf("expected 200, got %d", rec.Code)
 		}
 	})
 
-	t.Run("allowed_origin", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Origin", "https://example.com")
-		CORSWithOrigins([]string{"https://example.com"})(okHandler).ServeHTTP(rec, req)
-		if rec.Header().Get("Access-Control-Allow-Origin") != "https://example.com" {
-			t.Error("expected origin echo")
-		}
-		if rec.Header().Get("Vary") != "Origin" {
-			t.Error("expected Vary: Origin")
-		}
-	})
-
-	t.Run("disallowed_origin_no_cors_headers", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Origin", "https://evil.com")
-		CORSWithOrigins([]string{"https://example.com"})(okHandler).ServeHTTP(rec, req)
-		if rec.Header().Get("Access-Control-Allow-Origin") != "" {
-			t.Error("should not set CORS header for disallowed origin")
-		}
-		if rec.Code != http.StatusOK {
-			t.Errorf("request should still be served, got %d", rec.Code)
-		}
-	})
-
-	t.Run("disallowed_origin_options_returns_403", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("OPTIONS", "/", nil)
-		req.Header.Set("Origin", "https://evil.com")
-		CORSWithOrigins([]string{"https://example.com"})(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusForbidden {
-			t.Errorf("expected 403, got %d", rec.Code)
-		}
-	})
-
-	t.Run("options_preflight_returns_204", func(t *testing.T) {
+	t.Run("options_answered_before_anything_else", func(t *testing.T) {
 		called := false
-		inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			called = true
-		})
+		inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true })
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("OPTIONS", "/", nil)
-		CORSWithOrigins(nil)(inner).ServeHTTP(rec, req)
+		req := httptest.NewRequest("OPTIONS", "/api/v1/keys", nil)
+		req.Header.Set("Origin", "https://any.example")
+		req.Header.Set("Access-Control-Request-Method", "DELETE")
+		CORS(inner).ServeHTTP(rec, req)
 		if rec.Code != http.StatusNoContent {
 			t.Errorf("expected 204, got %d", rec.Code)
 		}
 		if called {
-			t.Error("inner handler should not be called on OPTIONS preflight")
+			t.Error("inner handler should not be called on OPTIONS")
 		}
-	})
-}
-
-func TestRateLimiter(t *testing.T) {
-	t.Run("allows_normal_traffic", func(t *testing.T) {
-		handler := RateLimiter(100, 100, nil)(okHandler)
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.RemoteAddr = "1.2.3.4:1234"
-		handler.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", rec.Code)
-		}
-	})
-
-	t.Run("blocks_excess_traffic", func(t *testing.T) {
-		// 1 req/s, burst of 2 — third request should be blocked
-		handler := RateLimiter(1, 2, nil)(okHandler)
-		for i := 0; i < 2; i++ {
-			rec := httptest.NewRecorder()
-			req := httptest.NewRequest("GET", "/", nil)
-			req.RemoteAddr = "5.6.7.8:1234"
-			handler.ServeHTTP(rec, req)
-			if rec.Code != http.StatusOK {
-				t.Errorf("request %d: expected 200, got %d", i, rec.Code)
+		h := rec.Header()
+		for name, want := range map[string]string{
+			"Access-Control-Allow-Origin":  "*",
+			"Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+			"Access-Control-Allow-Headers": "Authorization, Content-Type, Last-Event-ID, X-Actor, X-Request-ID",
+			"Access-Control-Max-Age":       "600",
+		} {
+			if got := h.Get(name); got != want {
+				t.Errorf("%s = %q, want %q", name, got, want)
 			}
 		}
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.RemoteAddr = "5.6.7.8:1234"
-		handler.ServeHTTP(rec, req)
-		if rec.Code != http.StatusTooManyRequests {
-			t.Errorf("expected 429, got %d", rec.Code)
-		}
-		if rec.Header().Get("Retry-After") != "1" {
-			t.Error("expected Retry-After header")
-		}
-	})
-
-	t.Run("different_ips_independent", func(t *testing.T) {
-		handler := RateLimiter(1, 1, nil)(okHandler)
-		// Exhaust IP A
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.RemoteAddr = "10.0.0.1:1234"
-		handler.ServeHTTP(rec, req)
-
-		rec2 := httptest.NewRecorder()
-		req2 := httptest.NewRequest("GET", "/", nil)
-		req2.RemoteAddr = "10.0.0.1:1234"
-		handler.ServeHTTP(rec2, req2)
-		if rec2.Code != http.StatusTooManyRequests {
-			t.Errorf("IP A second request: expected 429, got %d", rec2.Code)
-		}
-
-		// IP B should still work
-		rec3 := httptest.NewRecorder()
-		req3 := httptest.NewRequest("GET", "/", nil)
-		req3.RemoteAddr = "10.0.0.2:1234"
-		handler.ServeHTTP(rec3, req3)
-		if rec3.Code != http.StatusOK {
-			t.Errorf("IP B first request: expected 200, got %d", rec3.Code)
+		if h.Get("Access-Control-Allow-Credentials") != "" {
+			t.Error("Access-Control-Allow-Credentials must never be sent")
 		}
 	})
 }
 
-func TestBearerAuth(t *testing.T) {
-	t.Run("empty_token_passes_all", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		BearerAuth("")(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", rec.Code)
-		}
-	})
-
-	t.Run("valid_bearer_header", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Authorization", "Bearer secret123")
-		BearerAuth("secret123")(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", rec.Code)
-		}
-	})
-
-	t.Run("invalid_bearer_header", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Authorization", "Bearer wrong")
-		BearerAuth("secret123")(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401, got %d", rec.Code)
-		}
-	})
-
-	t.Run("missing_auth", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		BearerAuth("secret123")(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401, got %d", rec.Code)
-		}
-	})
-
-	t.Run("query_param_fallback", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/?token=secret123", nil)
-		BearerAuth("secret123")(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", rec.Code)
-		}
-	})
-
-	t.Run("invalid_query_param", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/?token=wrong", nil)
-		BearerAuth("secret123")(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401, got %d", rec.Code)
-		}
-	})
-
-	t.Run("non_bearer_prefix", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Authorization", "Basic c2VjcmV0")
-		BearerAuth("secret123")(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401, got %d", rec.Code)
-		}
-	})
-}
-
-func TestUploadAuth(t *testing.T) {
-	token := "test-secret-token"
-
-	t.Run("bearer_header", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/api/v1/call-upload", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		UploadAuth(token)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("status = %d, want 200", rec.Code)
-		}
-	})
-
-	t.Run("query_param_token", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/api/v1/call-upload?token="+token, nil)
-		UploadAuth(token)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("status = %d, want 200", rec.Code)
-		}
-	})
-
-	t.Run("no_auth", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/api/v1/call-upload", nil)
-		UploadAuth(token)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("status = %d, want 401", rec.Code)
-		}
-	})
-
-	t.Run("wrong_bearer", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/api/v1/call-upload", nil)
-		req.Header.Set("Authorization", "Bearer wrong-token")
-		UploadAuth(token)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("status = %d, want 401", rec.Code)
-		}
-	})
-
-	t.Run("form_field_key", func(t *testing.T) {
-		body := &bytes.Buffer{}
-		writer := multipart.NewWriter(body)
-		writer.WriteField("key", token)
-		writer.WriteField("talkgroup", "9044")
-		writer.Close()
-
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/api/v1/call-upload", body)
-		req.Header.Set("Content-Type", writer.FormDataContentType())
-		UploadAuth(token)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("status = %d, want 200 (rdio-scanner key field)", rec.Code)
-		}
-	})
-
-	t.Run("form_field_api_key", func(t *testing.T) {
-		body := &bytes.Buffer{}
-		writer := multipart.NewWriter(body)
-		writer.WriteField("api_key", token)
-		writer.WriteField("talkgroup_num", "9044")
-		writer.Close()
-
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/api/v1/call-upload", body)
-		req.Header.Set("Content-Type", writer.FormDataContentType())
-		UploadAuth(token)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("status = %d, want 200 (OpenMHz api_key field)", rec.Code)
-		}
-	})
-
-	t.Run("wrong_form_field_key", func(t *testing.T) {
-		body := &bytes.Buffer{}
-		writer := multipart.NewWriter(body)
-		writer.WriteField("key", "wrong-token")
-		writer.Close()
-
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/api/v1/call-upload", body)
-		req.Header.Set("Content-Type", writer.FormDataContentType())
-		UploadAuth(token)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("status = %d, want 401", rec.Code)
-		}
-	})
-
-	t.Run("empty_token_passes_all", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/api/v1/call-upload", nil)
-		UploadAuth("")(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("status = %d, want 200", rec.Code)
-		}
-	})
-}
-
-
-// ── JWTOrTokenAuth ────────────────────────────────────────────────────────
-
-// mockAPIKeyDB implements apiKeyResolver for testing.
-type mockAPIKeyDB struct {
-	key *database.APIKey
-	err error
-}
-
-func (m *mockAPIKeyDB) ResolveAPIKey(_ context.Context, _ string) (*database.APIKey, error) {
-	return m.key, m.err
-}
-
-func (m *mockAPIKeyDB) TouchAPIKey(_ context.Context, _ int) error { return nil }
-
-// makeSignedJWT creates a signed HS256 JWT for testing.
-func makeSignedJWT(t *testing.T, secret []byte, userID int, username, role string, expiry time.Duration) string {
-	t.Helper()
-	now := time.Now()
-	claims := Claims{
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   strconv.Itoa(userID),
-			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(expiry)),
-		},
-		Username: username,
-		Role:     role,
-	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	s, err := tok.SignedString(secret)
-	if err != nil {
-		t.Fatalf("sign JWT: %v", err)
-	}
-	return s
-}
-
-func TestJWTOrTokenAuth(t *testing.T) {
-	secret := []byte("test-secret-key")
-	writeToken := "write-tok"
-	authToken := "read-tok"
-
-	// captureRole records the role set in context by the middleware.
-	captureRole := func(got *string, gotUserID *int) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			*got = ContextRole(r)
-			*gotUserID = ContextUserID(r)
-			w.WriteHeader(http.StatusOK)
-		})
-	}
-
-	t.Run("no_auth_configured_passes_through", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		JWTOrTokenAuth(nil, "", "")(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", rec.Code)
-		}
-	})
-
-	t.Run("missing_token_with_auth_configured_returns_401", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		JWTOrTokenAuth(secret, writeToken, authToken)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401, got %d", rec.Code)
-		}
-	})
-
-	t.Run("valid_jwt_sets_context", func(t *testing.T) {
-		tok := makeSignedJWT(t, secret, 42, "alice@example.com", "admin", time.Hour)
-		var gotRole string
-		var gotUserID int
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Authorization", "Bearer "+tok)
-		JWTOrTokenAuth(secret, "", "")(captureRole(&gotRole, &gotUserID)).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", rec.Code)
-		}
-		if gotRole != "admin" {
-			t.Errorf("expected role=admin, got %q", gotRole)
-		}
-		if gotUserID != 42 {
-			t.Errorf("expected userID=42, got %d", gotUserID)
-		}
-	})
-
-	t.Run("expired_jwt_returns_401", func(t *testing.T) {
-		tok := makeSignedJWT(t, secret, 1, "bob@example.com", "viewer", -time.Minute)
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Authorization", "Bearer "+tok)
-		JWTOrTokenAuth(secret, "", "")(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401 for expired token, got %d", rec.Code)
-		}
-	})
-
-	t.Run("alg_none_attack_rejected", func(t *testing.T) {
-		// Craft a JWT with alg:none — no signature required. Without the algorithm
-		// check in jwtKeyFunc, this token would grant admin access to anyone.
-		header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
-		payload := base64.RawURLEncoding.EncodeToString([]byte(
-			`{"sub":"1","username":"attacker","role":"admin","iat":9999999999,"exp":9999999999}`))
-		forgedToken := header + "." + payload + "."
-
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Authorization", "Bearer "+forgedToken)
-		JWTOrTokenAuth(secret, writeToken, authToken)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("alg:none token must be rejected, got %d", rec.Code)
-		}
-	})
-
-	t.Run("wrong_secret_jwt_rejected", func(t *testing.T) {
-		tok := makeSignedJWT(t, []byte("different-secret"), 1, "eve@example.com", "admin", time.Hour)
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Authorization", "Bearer "+tok)
-		JWTOrTokenAuth(secret, writeToken, authToken)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401 for wrong-secret token, got %d", rec.Code)
-		}
-	})
-
-	t.Run("api_key_resolved_sets_context", func(t *testing.T) {
-		uid := 7
-		mockDB := &mockAPIKeyDB{key: &database.APIKey{ID: 1, Role: "editor", Label: "my-key", UserID: &uid}}
-		var gotRole string
-		var gotUserID int
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Authorization", "Bearer tre_abc123definitelynotvalid")
-		JWTOrTokenAuth(secret, "", "", mockDB)(captureRole(&gotRole, &gotUserID)).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", rec.Code)
-		}
-		if gotRole != "editor" {
-			t.Errorf("expected role=editor, got %q", gotRole)
-		}
-		if gotUserID != 7 {
-			t.Errorf("expected userID=7, got %d", gotUserID)
-		}
-	})
-
-	t.Run("api_key_not_found_falls_through_to_legacy", func(t *testing.T) {
-		mockDB := &mockAPIKeyDB{key: nil}
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Authorization", "Bearer tre_doesnotexist")
-		JWTOrTokenAuth(secret, writeToken, authToken, mockDB)(okHandler).ServeHTTP(rec, req)
-		// "tre_doesnotexist" doesn't match write or auth token either → 401
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401, got %d", rec.Code)
-		}
-	})
-
-	t.Run("legacy_write_token_grants_admin", func(t *testing.T) {
-		var gotRole string
-		var gotUserID int
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Authorization", "Bearer "+writeToken)
-		JWTOrTokenAuth(secret, writeToken, authToken)(captureRole(&gotRole, &gotUserID)).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", rec.Code)
-		}
-		if gotRole != "admin" {
-			t.Errorf("expected role=admin, got %q", gotRole)
-		}
-	})
-
-	t.Run("legacy_auth_token_grants_viewer", func(t *testing.T) {
-		var gotRole string
-		var gotUserID int
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Authorization", "Bearer "+authToken)
-		JWTOrTokenAuth(secret, writeToken, authToken)(captureRole(&gotRole, &gotUserID)).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", rec.Code)
-		}
-		if gotRole != "viewer" {
-			t.Errorf("expected role=viewer, got %q", gotRole)
-		}
-	})
-
-	t.Run("invalid_token_returns_401", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		req.Header.Set("Authorization", "Bearer garbage-token")
-		JWTOrTokenAuth(secret, writeToken, authToken)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401, got %d", rec.Code)
-		}
-	})
-}
-
-// ── AdminOnly ─────────────────────────────────────────────────────────────
-
-func TestAdminOnly(t *testing.T) {
-	cases := []struct {
-		role   string
-		wantOK bool
+func TestAPIHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		api  bool
 	}{
-		{"admin", true},
-		{"editor", false},
-		{"viewer", false},
-		{"", false},
-	}
-	for _, tc := range cases {
-		t.Run("role_"+tc.role, func(t *testing.T) {
-			rec := httptest.NewRecorder()
-			req := httptest.NewRequest("GET", "/", nil)
-			req = setAuthContext(req, 1, "u", tc.role, "jwt")
-			AdminOnly(okHandler).ServeHTTP(rec, req)
-			if tc.wantOK && rec.Code != http.StatusOK {
-				t.Errorf("expected 200 for role=%q, got %d", tc.role, rec.Code)
-			}
-			if !tc.wantOK && rec.Code != http.StatusForbidden {
-				t.Errorf("expected 403 for role=%q, got %d", tc.role, rec.Code)
-			}
-		})
-	}
-}
-
-// ── EditorOrAbove ─────────────────────────────────────────────────────────
-
-func TestEditorOrAbove(t *testing.T) {
-	cases := []struct {
-		role   string
-		wantOK bool
-	}{
-		{"admin", true},
-		{"editor", true},
-		{"viewer", false},
-		{"", false},
-	}
-	for _, tc := range cases {
-		t.Run("role_"+tc.role, func(t *testing.T) {
-			rec := httptest.NewRecorder()
-			req := httptest.NewRequest("GET", "/", nil)
-			req = setAuthContext(req, 1, "u", tc.role, "jwt")
-			EditorOrAbove(okHandler).ServeHTTP(rec, req)
-			if tc.wantOK && rec.Code != http.StatusOK {
-				t.Errorf("expected 200 for role=%q, got %d", tc.role, rec.Code)
-			}
-			if !tc.wantOK && rec.Code != http.StatusForbidden {
-				t.Errorf("expected 403 for role=%q, got %d", tc.role, rec.Code)
-			}
-		})
-	}
-}
-
-// ── WriteAuth ─────────────────────────────────────────────────────────────
-
-func TestWriteAuth(t *testing.T) {
-	writeToken := "wt"
-	authToken := "at"
-
-	t.Run("no_auth_configured_passes_all", func(t *testing.T) {
+		{"/api/v1/calls", true},
+		{"/api/v1", true},
+		{"/api/v10/x", false},
+		{"/index.html", false},
+		{"/metrics", false},
+	} {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/", nil)
-		WriteAuth("", "", false)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", rec.Code)
+		APIHeaders(okHandler).ServeHTTP(rec, httptest.NewRequest("GET", tc.path, nil))
+		cc, vary := rec.Header().Get("Cache-Control"), rec.Header().Get("Vary")
+		if tc.api && (cc != "no-store" || vary != "Authorization") {
+			t.Errorf("%s: Cache-Control %q, Vary %q; want no-store, Authorization", tc.path, cc, vary)
 		}
-	})
-
-	t.Run("GET_always_passes", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/", nil)
-		WriteAuth(writeToken, authToken, false)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200 for GET, got %d", rec.Code)
+		if !tc.api && (cc != "" || vary != "") {
+			t.Errorf("%s: Cache-Control %q, Vary %q; want none", tc.path, cc, vary)
 		}
-	})
-
-	t.Run("POST_with_editor_role_passes", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/", nil)
-		req = setAuthContext(req, 1, "u", "editor", "jwt")
-		WriteAuth(writeToken, authToken, false)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200 for editor, got %d", rec.Code)
-		}
-	})
-
-	t.Run("POST_with_admin_role_passes", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/", nil)
-		req = setAuthContext(req, 1, "u", "admin", "jwt")
-		WriteAuth(writeToken, authToken, false)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200 for admin, got %d", rec.Code)
-		}
-	})
-
-	t.Run("POST_with_viewer_role_returns_403", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/", nil)
-		req = setAuthContext(req, 1, "u", "viewer", "jwt")
-		WriteAuth(writeToken, authToken, false)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusForbidden {
-			t.Errorf("expected 403 for viewer, got %d", rec.Code)
-		}
-	})
-
-	t.Run("POST_no_role_matching_write_token_passes", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/", nil)
-		req.Header.Set("Authorization", "Bearer "+writeToken)
-		WriteAuth(writeToken, authToken, false)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200 with write token, got %d", rec.Code)
-		}
-	})
-
-	t.Run("POST_no_role_wrong_token_returns_403", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/", nil)
-		req.Header.Set("Authorization", "Bearer wrong-token")
-		WriteAuth(writeToken, authToken, false)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusForbidden {
-			t.Errorf("expected 403 with wrong token, got %d", rec.Code)
-		}
-	})
-
-	t.Run("POST_no_role_no_write_token_configured_returns_403", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("POST", "/", nil)
-		req.Header.Set("Authorization", "Bearer "+authToken)
-		WriteAuth("", authToken, false)(okHandler).ServeHTTP(rec, req)
-		if rec.Code != http.StatusForbidden {
-			t.Errorf("expected 403 when write token not set, got %d", rec.Code)
-		}
-	})
-}
-
-// ── UploadAuthWithKeys ────────────────────────────────────────────────────
-
-type mockAPIKeyResolver struct {
-	key *database.APIKey
-}
-
-func (m *mockAPIKeyResolver) ResolveAPIKey(_ context.Context, _ string) (*database.APIKey, error) {
-	if m.key != nil {
-		return m.key, nil
-	}
-	return nil, fmt.Errorf("not found")
-}
-
-func (m *mockAPIKeyResolver) TouchAPIKey(_ context.Context, _ int) error {
-	return nil
-}
-
-func TestUploadAuth_APIKey_FormField(t *testing.T) {
-	resolver := &mockAPIKeyResolver{
-		key: &database.APIKey{
-			ID:    1,
-			Label: "upload-key",
-			Role:  "editor",
-		},
-	}
-	mw := UploadAuthWithKeys("", resolver)
-
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-	writer.WriteField("key", "tre_test_api_key_12345")
-	writer.WriteField("call", `{"talkgroup":1234}`)
-	writer.Close()
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/v1/call-upload", &buf)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	mw(okHandler).ServeHTTP(rec, req)
-
-	if rec.Code != 200 {
-		t.Errorf("expected 200 with API key in form field, got %d", rec.Code)
-	}
-}
-
-func TestUploadAuth_LegacyToken_StillWorks(t *testing.T) {
-	mw := UploadAuthWithKeys("upload-secret", nil)
-
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-	writer.WriteField("key", "upload-secret")
-	writer.Close()
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/v1/call-upload", &buf)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	mw(okHandler).ServeHTTP(rec, req)
-
-	if rec.Code != 200 {
-		t.Errorf("expected 200 with legacy token in form field, got %d", rec.Code)
-	}
-}
-
-func TestUploadAuth_NoAuth_Rejects(t *testing.T) {
-	mw := UploadAuthWithKeys("upload-secret", nil)
-
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-	writer.WriteField("call", `{"talkgroup":1234}`)
-	writer.Close()
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/v1/call-upload", &buf)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	mw(okHandler).ServeHTTP(rec, req)
-
-	if rec.Code != 401 {
-		t.Errorf("expected 401 with no auth, got %d", rec.Code)
 	}
 }
 
@@ -792,66 +166,40 @@ func TestRecoverer(t *testing.T) {
 	})
 }
 
-func TestWriteAuth_OpenMode(t *testing.T) {
-	mw := WriteAuth("", "", false)
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/v1/talkgroups/1", nil)
-	mw(okHandler).ServeHTTP(rec, req)
-	if rec.Code != 200 {
-		t.Errorf("open mode POST should pass, got %d", rec.Code)
+func TestMaxBodySize(t *testing.T) {
+	var readErr error
+	h := MaxBodySize(8)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, readErr = io.ReadAll(r.Body)
+	}))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/", strings.NewReader("0123456789")))
+	if readErr == nil {
+		t.Error("reading more than the limit should fail")
 	}
 }
 
-func TestWriteAuth_FullMode_NoTokens_RequiresJWTRole(t *testing.T) {
-	mw := WriteAuth("", "", true)
+func TestResponseTimeout(t *testing.T) {
+	slow := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(time.Second):
+		case <-r.Context().Done():
+		}
+	})
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/v1/talkgroups/1", nil)
-	mw(okHandler).ServeHTTP(rec, req)
-	if rec.Code != 403 {
-		t.Errorf("expected 403 for POST without role in full mode, got %d", rec.Code)
+	ResponseTimeout(10*time.Millisecond)(slow).ServeHTTP(rec, httptest.NewRequest("GET", "/api/v1/calls", nil))
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "request_timeout") {
+		t.Errorf("slow handler: %d %s, want 503 request_timeout", rec.Code, rec.Body.String())
 	}
-}
 
-func TestWriteAuth_FullMode_EditorRole_Passes(t *testing.T) {
-	mw := WriteAuth("", "", true)
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/v1/talkgroups/1", nil)
-	req = setAuthContext(req, 1, "user", "editor", "jwt")
-	mw(okHandler).ServeHTTP(rec, req)
-	if rec.Code != 200 {
-		t.Errorf("expected 200 for editor POST, got %d", rec.Code)
-	}
-}
-
-func TestWriteAuth_FullMode_ViewerRole_Rejected(t *testing.T) {
-	mw := WriteAuth("", "", true)
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/v1/talkgroups/1", nil)
-	req = setAuthContext(req, 1, "user", "viewer", "jwt")
-	mw(okHandler).ServeHTTP(rec, req)
-	if rec.Code != 403 {
-		t.Errorf("expected 403 for viewer POST, got %d", rec.Code)
-	}
-}
-
-func TestWriteAuth_GETAlwaysPasses(t *testing.T) {
-	mw := WriteAuth("", "", true)
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/api/v1/systems", nil)
-	mw(okHandler).ServeHTTP(rec, req)
-	if rec.Code != 200 {
-		t.Errorf("GET should always pass, got %d", rec.Code)
-	}
-}
-
-func TestWriteAuth_DeprecatedWriteToken_StillWorks(t *testing.T) {
-	mw := WriteAuth("write-secret", "read-secret", true)
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/v1/talkgroups/1", nil)
-	req.Header.Set("Authorization", "Bearer write-secret")
-	req = setAuthContext(req, 0, "", "admin", "token")
-	mw(okHandler).ServeHTTP(rec, req)
-	if rec.Code != 200 {
-		t.Errorf("expected 200 with deprecated write token, got %d", rec.Code)
+	// Streaming endpoints are not wrapped.
+	quick := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(30 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	})
+	for _, path := range []string{"/api/v1/events/stream", "/api/v1/calls/1/audio", "/api/v1/audio/live"} {
+		rec := httptest.NewRecorder()
+		ResponseTimeout(10*time.Millisecond)(quick).ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: got %d, want 200 (not wrapped)", path, rec.Code)
+		}
 	}
 }

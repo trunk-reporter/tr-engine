@@ -1,5 +1,7 @@
 # auth.js Consolidation Implementation Plan
 
+> **Superseded by [2026-09-26-api-key-auth-design.md](../specs/2026-09-26-api-key-auth-design.md).** tr-engine now uses API keys, an anonymous access policy and tickets; the modes, tokens, logins and users described here no longer exist. Kept as a historical record. Current docs: `docs/auth.md`, `docs/migrating-auth.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Centralize all web UI auth handling in `auth.js` so pages never handle auth errors themselves.

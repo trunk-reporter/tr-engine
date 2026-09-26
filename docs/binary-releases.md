@@ -76,7 +76,7 @@ MQTT_TOPICS=trengine/#
 # WATCH_DIR=/path/to/trunk-recorder/audio
 ```
 
-All three modes can run simultaneously. See `sample.env` for all available options (HTTP port, auth token, log level, audio directory, backfill settings, raw archival).
+All three modes can run simultaneously. See `sample.env` for all available options (HTTP port, log level, audio directory, backfill settings, raw archival, rate limits). Access control is not configured here: tr-engine uses API keys (next step).
 
 ## 4. Run
 
@@ -93,20 +93,34 @@ You should see:
 {"level":"info","listen":":8080","message":"tr-engine ready"}
 ```
 
+On the first start with an empty database, tr-engine also prints an **admin API key**, once, in a box on stderr ("no admin API key existed, so one was created"). Copy the `tre_...` line into a password manager; it is never shown again. Create named keys for your clients with it and revoke it afterwards:
+
+```bash
+./tr-engine keys create --name "admin (me)" --scopes admin
+./tr-engine keys create --name "my browser" --scopes edit
+./tr-engine keys list
+./tr-engine keys revoke --prefix tre_xxxxxxxx   # the bootstrap key's prefix
+```
+
+Anonymous access is off on a new install. To let anyone who can reach tr-engine listen without a key: `./tr-engine access set --anonymous listen`. See [auth.md](auth.md).
+
 ## 5. Verify
 
 ```bash
-# Health check
+# Health check (public, no key needed)
 curl http://localhost:8080/api/v1/health
 
+KEY=tre_...   # your admin key, or a key from `./tr-engine keys create`
+curl -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/whoami
+
 # List discovered systems (populated once TR sends data)
-curl http://localhost:8080/api/v1/systems
+curl -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/systems
 
 # Watch live events
-curl -N http://localhost:8080/api/v1/events/stream
+curl -N -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/events/stream
 ```
 
-Open `http://localhost:8080/irc-radio-live.html` in a browser for the live web UI.
+Open `http://localhost:8080/irc-radio-live.html` in a browser for the live web UI, and paste a key when it asks.
 
 ## Running as a service
 

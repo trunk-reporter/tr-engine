@@ -214,7 +214,7 @@ func (h *UnitsHandler) ListUnitCalls(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	calls, total, err := h.db.ListCalls(r.Context(), filter)
+	calls, total, err := h.db.ListCalls(r.Context(), PrincipalFrom(r), filter)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "failed to list calls")
 		return

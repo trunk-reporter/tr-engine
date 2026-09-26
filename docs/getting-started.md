@@ -223,14 +223,9 @@ AUDIO_DIR=./audio
 # To serve audio directly from trunk-recorder's filesystem instead of
 # receiving it over MQTT, set TR_AUDIO_DIR to TR's audioBaseDir:
 # TR_AUDIO_DIR=/path/to/trunk-recorder/audio
-
-# Authentication
-# AUTH_TOKEN=my-secret           # token-mode shared API token
-# ADMIN_PASSWORD=change-me       # enables full auth with JWT login and API keys
-# WRITE_TOKEN=my-write-secret    # deprecated legacy write token
 ```
 
-> **Public-facing instances:** Set `ADMIN_PASSWORD` to enable full auth with user login, roles, and API keys. Use API keys (`tre_...`) for upload plugins and scripts. `WRITE_TOKEN` is still accepted for legacy deployments, but it is deprecated.
+> **Access control is not in `.env`.** Clients authenticate with API keys, and requests without a key follow the anonymous access policy (off on a new install). Both live in the database and are managed with `tr-engine keys` and `tr-engine access`. On the first start tr-engine prints an admin key; see [Your admin key](#your-admin-key) and [auth.md](auth.md).
 
 `MQTT_TOPICS` must match the topic prefixes from your TR plugin config. If all your TR topics share a common root (e.g. `topic: "trengine/feeds"`, `unit_topic: "trengine/units"`), a single wildcard like `trengine/#` covers everything. If they differ, comma-separate them: `MQTT_TOPICS=prefix1/#,prefix2/#`.
 
@@ -274,25 +269,51 @@ tr-engine auto-loads `.env` from the current directory. You can also use CLI fla
 ./tr-engine --listen :9090 --log-level debug --database-url postgres://...
 ```
 
+### Your admin key
+
+On its first start with an empty database, tr-engine creates an admin API key and prints it **once** to stderr, in a box ("no admin API key existed, so one was created"). Copy the `tre_...` line into a password manager; it is never shown again.
+
+Use it to create a named key for each client, then revoke the bootstrap key. The `keys` subcommand reads the same `.env`, so run it from the same directory (or pass `--env-file`):
+
+```bash
+./tr-engine keys create --name "admin (me)" --scopes admin
+./tr-engine keys create --name "my browser" --scopes edit
+./tr-engine keys list
+./tr-engine keys revoke --prefix tre_xxxxxxxx     # the bootstrap key's prefix
+
+# Optional: let anyone who can reach tr-engine listen without a key
+./tr-engine access set --anonymous listen
+```
+
+Lost every admin key? `./tr-engine keys create --name "admin" --scopes admin` creates a new one (it connects to the database directly). See [auth.md](auth.md) for scopes, restrictions, upload keys and reverse proxies.
+
 ### Verify
 
 ```bash
-# Health check — shows database, MQTT, and TR instance status
+# Health check (public) — shows database and MQTT status
 curl http://localhost:8080/api/v1/health
 
+# Everything else needs a key (unless anonymous access is on)
+KEY=tre_...   # a key from `./tr-engine keys create`, or the bootstrap key
+
+# What can this key do?
+curl -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/whoami
+
 # List systems (populated after TR connects and sends data)
-curl http://localhost:8080/api/v1/systems
+curl -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/systems
 
 # List talkgroups
-curl http://localhost:8080/api/v1/talkgroups?limit=10
+curl -H "Authorization: Bearer $KEY" "http://localhost:8080/api/v1/talkgroups?limit=10"
 
 # Watch live events
-curl -N http://localhost:8080/api/v1/events/stream
+curl -N -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/events/stream
 ```
+
+With a key, `/health` also shows the trunk-recorder instances and other details.
 
 ### Web UI
 
-tr-engine serves static files from a `web/` directory in dev mode. Open `http://localhost:8080/irc-radio-live.html` for an IRC-style live radio monitor.
+tr-engine serves static files from a `web/` directory in dev mode. Open `http://localhost:8080/irc-radio-live.html` for an IRC-style live radio monitor. The pages ask for an API key when they need one (paste a `listen` or `edit` key; "API key…" in the menu changes it).
 
 ## 5. Live Audio Streaming (optional)
 

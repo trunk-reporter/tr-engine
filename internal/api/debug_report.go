@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -68,15 +69,12 @@ func sanitizeConfig(cfg *config.Config) map[string]any {
 		"WriteTimeout": cfg.WriteTimeout.String(),
 		"IdleTimeout":  cfg.IdleTimeout.String(),
 
-		// Auth
-		"AuthEnabled":        cfg.AuthEnabled,
-		"AuthToken":          redact(cfg.AuthToken),
-		"AuthTokenGenerated": cfg.AuthTokenGenerated,
-		"WriteToken":         redact(cfg.WriteToken),
-		"RateLimitRPS":       cfg.RateLimitRPS,
-		"RateLimitBurst":     cfg.RateLimitBurst,
-		"CORSOrigins":        cfg.CORSOrigins,
-		"LogLevel":           cfg.LogLevel,
+		// Rate limits and proxies (access control itself lives in the
+		// database, not in the config)
+		"RateLimitRPS":   cfg.RateLimitRPS,
+		"RateLimitBurst": cfg.RateLimitBurst,
+		"TrustedProxies": cfg.TrustedProxies,
+		"LogLevel":       cfg.LogLevel,
 
 		// Raw archival
 		"RawStore":         cfg.RawStore,
@@ -133,6 +131,7 @@ func sanitizeConfig(cfg *config.Config) map[string]any {
 		"RetentionTrunkingMessages": cfg.RetentionTrunkingMessages.String(),
 		"RetentionCheckpoints":      cfg.RetentionCheckpoints.String(),
 		"RetentionStaleCalls":       cfg.RetentionStaleCalls.String(),
+		"RetentionAuditLog":         cfg.RetentionAuditLog.String(),
 
 		// Transcription worker pool
 		"TranscribeWorkers":     cfg.TranscribeWorkers,
@@ -183,6 +182,68 @@ func sanitizeURL(raw string) string {
 		return raw
 	}
 	u.User = nil
+	return u.String()
+}
+
+// secretFieldPattern matches the names of fields whose values are secrets
+// (§15): API keys, tokens, passwords, secrets, auth settings, credentials.
+var secretFieldPattern = regexp.MustCompile(`(?i)key|token|pass|secret|auth|credential`)
+
+// redactReport returns a copy of a decoded JSON value (maps, slices,
+// strings, numbers, booleans) that is safe to send to a third party, at any
+// depth: every field whose name matches secretFieldPattern has a non-empty
+// value replaced by "***" (booleans are kept), and every string that is a
+// URL loses its userinfo, query and fragment.
+func redactReport(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			if secretFieldPattern.MatchString(k) {
+				out[k] = redactSecretValue(val)
+			} else {
+				out[k] = redactReport(val)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = redactReport(val)
+		}
+		return out
+	case string:
+		return stripURLSecrets(t)
+	}
+	return v
+}
+
+// redactSecretValue hides the value of a secret-named field. Empty and null
+// values stay as they are, so a report still shows that a secret is unset.
+func redactSecretValue(v any) any {
+	switch t := v.(type) {
+	case nil, bool:
+		return t
+	case string:
+		if t == "" {
+			return ""
+		}
+	}
+	return "***"
+}
+
+// stripURLSecrets removes userinfo, query and fragment from a string that is
+// an absolute URL (scheme and host); other strings are returned unchanged.
+func stripURLSecrets(s string) string {
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return s
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
 	return u.String()
 }
 
@@ -274,7 +335,7 @@ func (h *DebugReportHandler) Submit(w http.ResponseWriter, r *http.Request) {
 		"server":         h.collectServerData(r.Context()),
 	}
 
-	reportJSON, err := json.Marshal(report)
+	reportJSON, err := redactedJSON(report)
 	if err != nil {
 		h.log.Error().Err(err).Msg("failed to marshal debug report")
 		w.Header().Set("Content-Type", "application/json")
@@ -320,6 +381,21 @@ func (h *DebugReportHandler) Submit(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"ok":true}`))
+}
+
+// redactedJSON encodes a report after passing all of it, client part
+// included, through redactReport. A JSON round trip first turns every
+// struct into maps, so redaction reaches every field at every depth.
+func redactedJSON(report map[string]any) ([]byte, error) {
+	raw, err := json.Marshal(report)
+	if err != nil {
+		return nil, err
+	}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil, err
+	}
+	return json.Marshal(redactReport(decoded))
 }
 
 // collectServerData gathers server-side diagnostics for the debug report.

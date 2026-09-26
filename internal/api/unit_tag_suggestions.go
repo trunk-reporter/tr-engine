@@ -149,7 +149,7 @@ func (h *UnitTagSuggestionsHandler) ApproveUnitTagSuggestion(w http.ResponseWrit
 		}
 	}
 
-	approval, err := h.db.ApproveUnitTagSuggestion(r.Context(), id, override, ContextUsername(r))
+	approval, err := h.db.ApproveUnitTagSuggestion(r.Context(), id, override, PrincipalFrom(r).Attribution())
 	if err != nil {
 		writeSuggestionError(w, err, "failed to approve unit tag suggestion")
 		return
@@ -189,7 +189,7 @@ func (h *UnitTagSuggestionsHandler) DismissUnitTagSuggestion(w http.ResponseWrit
 	if !ok {
 		return
 	}
-	if err := h.db.DismissUnitTagSuggestion(r.Context(), id, ContextUsername(r)); err != nil {
+	if err := h.db.DismissUnitTagSuggestion(r.Context(), id, PrincipalFrom(r).Attribution()); err != nil {
 		writeSuggestionError(w, err, "failed to dismiss unit tag suggestion")
 		return
 	}

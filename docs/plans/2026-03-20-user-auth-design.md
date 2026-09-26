@@ -1,5 +1,7 @@
 # User Authentication & Authorization Design
 
+> **Superseded by [2026-09-26-api-key-auth-design.md](../superpowers/specs/2026-09-26-api-key-auth-design.md).** tr-engine now uses API keys, an anonymous access policy and tickets; the modes, tokens, logins and users described here no longer exist. Kept as a historical record. Current docs: `docs/auth.md`, `docs/migrating-auth.md`.
+
 **Date:** 2026-03-20
 **Status:** Approved
 **Contributor:** jodfie (implementation), LumenPrima (design review)

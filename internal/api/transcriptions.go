@@ -30,31 +30,39 @@ func (h *TranscriptionsHandler) Routes(r chi.Router) {
 	r.Get("/transcriptions/queue", h.GetQueueStats)
 }
 
-// GetCallTranscription returns the primary transcription for a call.
+// GetCallTranscription returns the primary transcription for a call. A call
+// outside the caller's restriction is 404, like a missing one.
 func (h *TranscriptionsHandler) GetCallTranscription(w http.ResponseWriter, r *http.Request) {
 	id, err := PathInt64(r, "id")
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid call ID")
 		return
 	}
+	if !requireCallAccess(w, r, h.db, id, "call not found") {
+		return
+	}
 
-	t, err := h.db.GetPrimaryTranscription(r.Context(), id)
+	t, err := h.db.GetPrimaryTranscription(r.Context(), PrincipalFrom(r), id)
 	if err != nil {
-		WriteError(w, http.StatusNotFound, "no transcription found")
+		writeLookupError(w, err, "no transcription found", "failed to get transcription")
 		return
 	}
 	WriteJSON(w, http.StatusOK, t)
 }
 
-// ListCallTranscriptions returns all transcription variants for a call.
+// ListCallTranscriptions returns all transcription variants for a call. A
+// call outside the caller's restriction is 404, like a missing one.
 func (h *TranscriptionsHandler) ListCallTranscriptions(w http.ResponseWriter, r *http.Request) {
 	id, err := PathInt64(r, "id")
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid call ID")
 		return
 	}
+	if !requireCallAccess(w, r, h.db, id, "call not found") {
+		return
+	}
 
-	transcriptions, err := h.db.ListTranscriptionsByCall(r.Context(), id)
+	transcriptions, err := h.db.ListTranscriptionsByCall(r.Context(), PrincipalFrom(r), id)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "failed to list transcriptions")
 		return
@@ -64,6 +72,10 @@ func (h *TranscriptionsHandler) ListCallTranscriptions(w http.ResponseWriter, r 
 		"total":          len(transcriptions),
 	})
 }
+
+// transcriptionSources are the values the transcriptions.source CHECK
+// constraint accepts.
+var transcriptionSources = map[string]bool{"auto": true, "human": true, "llm": true}
 
 // SubmitCorrection accepts a human correction for a call's transcription.
 func (h *TranscriptionsHandler) SubmitCorrection(w http.ResponseWriter, r *http.Request) {
@@ -93,10 +105,16 @@ func (h *TranscriptionsHandler) SubmitCorrection(w http.ResponseWriter, r *http.
 	if source == "" {
 		source = "human"
 	}
+	if !transcriptionSources[source] {
+		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody, "source must be one of auto, human, llm")
+		return
+	}
 
 	// Look up the call to get start_time for partitioned insert
 	call, err := h.db.GetCallForTranscription(r.Context(), id)
-	if err != nil {
+	// Restricted principals never reach edit routes (§6.3); checking anyway
+	// keeps the handler fail-closed on its own.
+	if err != nil || !PrincipalFrom(r).AllowsTG(call.SystemID, call.Tgid) {
 		WriteError(w, http.StatusNotFound, "call not found")
 		return
 	}
@@ -124,7 +142,8 @@ func (h *TranscriptionsHandler) SubmitCorrection(w http.ResponseWriter, r *http.
 	})
 }
 
-// TranscribeCall enqueues a call for (re-)transcription.
+// TranscribeCall enqueues a call for (re-)transcription. A call that doesn't
+// exist is 404 (the queue can't tell it apart from a full queue).
 func (h *TranscriptionsHandler) TranscribeCall(w http.ResponseWriter, r *http.Request) {
 	id, err := PathInt64(r, "id")
 	if err != nil {
@@ -132,6 +151,9 @@ func (h *TranscriptionsHandler) TranscribeCall(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	if !requireCallAccess(w, r, h.db, id, "call not found") {
+		return
+	}
 	if h.live == nil {
 		WriteError(w, http.StatusServiceUnavailable, "transcription not available")
 		return
@@ -170,7 +192,9 @@ func (h *TranscriptionsHandler) setTranscriptionStatus(w http.ResponseWriter, r 
 	}
 
 	call, err := h.db.GetCallForTranscription(r.Context(), id)
-	if err != nil {
+	// Restricted principals never reach edit routes (§6.3); checking anyway
+	// keeps the handler fail-closed on its own.
+	if err != nil || !PrincipalFrom(r).AllowsTG(call.SystemID, call.Tgid) {
 		WriteError(w, http.StatusNotFound, "call not found")
 		return
 	}
@@ -197,7 +221,8 @@ func (h *TranscriptionsHandler) GetBatchTranscriptions(w http.ResponseWriter, r 
 		return
 	}
 
-	results, err := h.db.GetBatchTranscriptions(r.Context(), callIDs)
+	// Calls outside the caller's restriction are silently left out.
+	results, err := h.db.GetBatchTranscriptions(r.Context(), PrincipalFrom(r), callIDs)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "failed to get transcriptions")
 		return
@@ -242,7 +267,7 @@ func (h *TranscriptionsHandler) SearchTranscriptions(w http.ResponseWriter, r *h
 		filter.PrimaryOnly = &v
 	}
 
-	hits, total, err := h.db.SearchTranscriptions(r.Context(), q, filter)
+	hits, total, err := h.db.SearchTranscriptions(r.Context(), PrincipalFrom(r), q, filter)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "search failed")
 		return

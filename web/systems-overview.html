@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="auth.js?v=1"></script>
+<script src="auth.js?v=3"></script>
 <meta name="card-title" content="Systems Overview">
 <meta name="card-description" content="Multi-system dashboard with per-system health, rates, and recorder status">
 <meta name="card-order" content="2">
@@ -270,7 +270,7 @@ body::before {
 function getAPI() { return '/api/v1'; }
 
 const $ = id => document.getElementById(id);
-const esc = s => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
+const esc = s => trAuth.escapeHTML(s);
 
 // ── State ──
 let systems = [];
@@ -311,12 +311,20 @@ async function fetchJSON(path) {
 
 async function loadAll() {
   try {
-    const [sysData, statsData, healthResp, recData] = await Promise.all([
+    // /systems is required. /stats and /recorders are denied to keys (and
+    // anonymous policies) restricted to some talkgroups, so the page renders
+    // without them rather than failing as a whole.
+    const [sysRes, statsRes, healthRes, recRes] = await Promise.allSettled([
       fetchJSON('/systems'),
       fetchJSON('/stats'),
       fetchJSON('/health'),
       recLive ? Promise.resolve(null) : fetchJSON('/recorders'),
     ]);
+    if (sysRes.status === 'rejected') throw sysRes.reason;
+    const sysData = sysRes.value;
+    const statsData = statsRes.status === 'fulfilled' ? statsRes.value : {};
+    const healthResp = healthRes.status === 'fulfilled' ? healthRes.value : {};
+    const recData = recRes.status === 'fulfilled' ? recRes.value : null;
 
     systems = sysData.systems || [];
     healthData = healthResp;

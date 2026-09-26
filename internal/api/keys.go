@@ -1,214 +1,237 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/hlog"
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/database"
 )
 
-// RoleLevel returns the integer level for a role string.
-func RoleLevel(role string) int {
-	switch role {
-	case "viewer":
-		return 1
-	case "editor":
-		return 2
-	case "admin":
-		return 3
-	default:
-		return 0
-	}
+// keyStore is what KeysHandler needs from the database.
+type keyStore interface {
+	ListAPIKeys(ctx context.Context, includeRevoked bool) ([]database.APIKey, error)
+	CreateAPIKey(ctx context.Context, in database.NewAPIKey) (*database.APIKeyWithPlaintext, error)
+	GetAPIKeyByID(ctx context.Context, id int) (*database.APIKey, error)
+	PatchAPIKey(ctx context.Context, id int, p database.APIKeyPatch, guard database.LastAdminGuard) (*database.APIKey, error)
+	RevokeAPIKey(ctx context.Context, id int, guard database.LastAdminGuard) (*database.APIKey, error)
 }
 
-// KeysHandler handles API key management endpoints.
+// KeysHandler manages API keys (§4.2, admin).
 type KeysHandler struct {
-	db  *database.DB
-	log zerolog.Logger
+	db    keyStore
+	authn *authenticator
 }
 
-func NewKeysHandler(db *database.DB, log zerolog.Logger) *KeysHandler {
-	return &KeysHandler{db: db, log: log}
+func NewKeysHandler(db *database.DB, authn *authenticator) *KeysHandler {
+	return &KeysHandler{db: db, authn: authn}
 }
 
-// Routes registers API key management routes.
-// Caller is responsible for wrapping in appropriate auth middleware.
 func (h *KeysHandler) Routes(r chi.Router) {
-	r.Get("/auth/keys", h.ListOwn)
-	r.Post("/auth/keys", h.Create)
-	r.Delete("/auth/keys/{id}", h.DeleteOwn)
+	r.Get("/keys", h.List)
+	r.Post("/keys", h.Create)
+	r.Get("/keys/{id}", h.Get)
+	r.Patch("/keys/{id}", h.Patch)
+	r.Delete("/keys/{id}", h.Revoke)
 }
 
-// AdminRoutes registers admin-only API key routes.
-func (h *KeysHandler) AdminRoutes(r chi.Router) {
-	r.Get("/auth/keys/all", h.ListAll)
-	r.Post("/auth/keys/service", h.CreateServiceAccount)
-	r.Delete("/auth/keys/{id}/any", h.DeleteAny)
-}
-
-// ListOwn returns API keys owned by the current user.
-func (h *KeysHandler) ListOwn(w http.ResponseWriter, r *http.Request) {
-	userID := ContextUserID(r)
-	if userID == 0 {
-		WriteError(w, http.StatusUnauthorized, "user authentication required (API keys cannot list keys)")
-		return
+// List returns keys ordered by ID; revoked keys only with include_revoked.
+func (h *KeysHandler) List(w http.ResponseWriter, r *http.Request) {
+	includeRevoked := false
+	if v := r.URL.Query().Get("include_revoked"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidParameter, "include_revoked: must be true or false")
+			return
+		}
+		includeRevoked = b
 	}
-
-	keys, err := h.db.ListAPIKeysByUser(r.Context(), userID)
+	keys, err := h.db.ListAPIKeys(r.Context(), includeRevoked)
 	if err != nil {
-		h.log.Error().Err(err).Msg("keys: list own failed")
-		WriteError(w, http.StatusInternalServerError, "internal error")
+		WriteError(w, http.StatusInternalServerError, "failed to list API keys")
 		return
 	}
-	if keys == nil {
-		keys = []database.APIKey{}
-	}
-	WriteJSON(w, http.StatusOK, keys)
+	WriteJSON(w, http.StatusOK, map[string]any{"keys": keys, "total": len(keys)})
 }
 
-// Create creates a new API key for the current user.
-// The key's role is capped at the caller's own role.
+// Create makes a key and returns it with its plaintext, which is never
+// shown again.
 func (h *KeysHandler) Create(w http.ResponseWriter, r *http.Request) {
-	userID := ContextUserID(r)
-	if userID == 0 {
-		WriteError(w, http.StatusUnauthorized, "user authentication required")
-		return
-	}
-	callerRole := ContextRole(r)
-
 	var req struct {
-		Label string `json:"label"`
-		Role  string `json:"role"`
+		Name         string            `json:"name"`
+		Scopes       []string          `json:"scopes"`
+		Restriction  *auth.Restriction `json:"restriction"`
+		ExpiresAt    *time.Time        `json:"expires_at"`
+		RateLimitRPS *float32          `json:"rate_limit_rps"`
 	}
-	if err := DecodeJSON(r, &req); err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid request body")
+	if r.Body == nil {
+		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody, "missing request body")
 		return
 	}
-	if req.Role == "" {
-		req.Role = "viewer"
-	}
-	if req.Label == "" {
-		WriteError(w, http.StatusBadRequest, "label is required")
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody, "invalid request body: "+err.Error())
 		return
 	}
-
-	// Cap role at caller's level
-	if RoleLevel(req.Role) > RoleLevel(callerRole) {
-		WriteError(w, http.StatusForbidden, "cannot create key with higher role than your own")
-		return
-	}
-	if RoleLevel(req.Role) == 0 {
-		WriteError(w, http.StatusBadRequest, "invalid role (viewer, editor, admin)")
-		return
-	}
-
-	key, err := h.db.CreateAPIKey(r.Context(), &userID, req.Role, req.Label, false)
+	scopes, err := auth.ParseScopes(req.Scopes)
 	if err != nil {
-		h.log.Error().Err(err).Msg("keys: create failed")
-		WriteError(w, http.StatusInternalServerError, "internal error")
+		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody, "scopes: "+err.Error())
 		return
 	}
-
-	h.log.Info().
-		Int("user_id", userID).
-		Str("key_prefix", key.KeyPrefix).
-		Str("role", req.Role).
-		Str("label", req.Label).
-		Msg("api key created")
-
+	key, err := h.db.CreateAPIKey(r.Context(), database.NewAPIKey{
+		Name:         req.Name,
+		Scopes:       scopes,
+		Restriction:  req.Restriction,
+		ExpiresAt:    req.ExpiresAt,
+		RateLimitRPS: req.RateLimitRPS,
+	})
+	if writeKeyError(w, err) {
+		return
+	}
+	hlog.FromRequest(r).Info().Int("key_id", key.ID).Str("name", key.Name).Str("prefix", key.Prefix).
+		Strs("scopes", key.Scopes.Strings()).Str("by", PrincipalFrom(r).Attribution()).Msg("API key created")
 	WriteJSON(w, http.StatusCreated, key)
 }
 
-// DeleteOwn deletes an API key owned by the current user.
-func (h *KeysHandler) DeleteOwn(w http.ResponseWriter, r *http.Request) {
-	userID := ContextUserID(r)
-	if userID == 0 {
-		WriteError(w, http.StatusUnauthorized, "user authentication required")
+// Get returns one key.
+func (h *KeysHandler) Get(w http.ResponseWriter, r *http.Request) {
+	id, ok := keyIDParam(w, r)
+	if !ok {
 		return
 	}
+	key, err := h.db.GetAPIKeyByID(r.Context(), id)
+	if writeKeyError(w, err) {
+		return
+	}
+	WriteJSON(w, http.StatusOK, key)
+}
 
-	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+// Patch changes a key. An absent field is left unchanged; an explicit null
+// clears restriction, expires_at or rate_limit_rps.
+func (h *KeysHandler) Patch(w http.ResponseWriter, r *http.Request) {
+	id, ok := keyIDParam(w, r)
+	if !ok {
+		return
+	}
+	fields, err := decodeObject(r, "name", "scopes", "restriction", "expires_at", "rate_limit_rps")
 	if err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid key ID")
+		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody, err.Error())
 		return
 	}
-
-	if err := h.db.DeleteAPIKeyOwned(r.Context(), id, userID); err != nil {
-		WriteError(w, http.StatusNotFound, "key not found or not owned by you")
+	patch, msg := parseKeyPatch(fields)
+	if msg != "" {
+		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody, msg)
 		return
 	}
+	key, err := h.db.PatchAPIKey(r.Context(), id, patch, database.GuardLastAdmin)
+	if writeKeyError(w, err) {
+		return
+	}
+	// The database layer bumped the auth generation, which clears the key
+	// cache; drop the entry explicitly as well.
+	h.authn.invalidateKey(id)
+	hlog.FromRequest(r).Info().Int("key_id", id).Str("by", PrincipalFrom(r).Attribution()).Msg("API key changed")
+	WriteJSON(w, http.StatusOK, key)
+}
 
-	h.log.Info().Int("user_id", userID).Int("key_id", id).Msg("api key revoked (own)")
+// parseKeyPatch turns PATCH /keys/{id} fields into a patch, or returns a
+// message naming the bad field.
+func parseKeyPatch(fields map[string]json.RawMessage) (database.APIKeyPatch, string) {
+	var p database.APIKeyPatch
+	if raw, ok := fields["name"]; ok {
+		if isNull(raw) || json.Unmarshal(raw, &p.Name) != nil {
+			return p, "name: must be a string"
+		}
+		p.SetName = true
+	}
+	if raw, ok := fields["scopes"]; ok {
+		var in []string
+		if isNull(raw) || json.Unmarshal(raw, &in) != nil {
+			return p, "scopes: must be an array of scope names"
+		}
+		scopes, err := auth.ParseScopes(in)
+		if err != nil {
+			return p, "scopes: " + err.Error()
+		}
+		p.SetScopes, p.Scopes = true, scopes
+	}
+	if raw, ok := fields["restriction"]; ok {
+		r, err := decodeRestriction(raw)
+		if err != nil {
+			return p, "restriction: " + err.Error()
+		}
+		p.SetRestriction, p.Restriction = true, r
+	}
+	if raw, ok := fields["expires_at"]; ok {
+		p.SetExpiresAt = true
+		if !isNull(raw) {
+			var t time.Time
+			if err := json.Unmarshal(raw, &t); err != nil {
+				return p, "expires_at: must be an RFC3339 time or null"
+			}
+			p.ExpiresAt = &t
+		}
+	}
+	if raw, ok := fields["rate_limit_rps"]; ok {
+		p.SetRateLimitRPS = true
+		if !isNull(raw) {
+			var v float32
+			if err := json.Unmarshal(raw, &v); err != nil {
+				return p, "rate_limit_rps: must be a number or null"
+			}
+			p.RateLimitRPS = &v
+		}
+	}
+	return p, ""
+}
+
+// Revoke revokes a key. Revoking a revoked key succeeds.
+func (h *KeysHandler) Revoke(w http.ResponseWriter, r *http.Request) {
+	id, ok := keyIDParam(w, r)
+	if !ok {
+		return
+	}
+	_, err := h.db.RevokeAPIKey(r.Context(), id, database.GuardLastAdmin)
+	if writeKeyError(w, err) {
+		return
+	}
+	h.authn.invalidateKey(id)
+	hlog.FromRequest(r).Info().Int("key_id", id).Str("by", PrincipalFrom(r).Attribution()).Msg("API key revoked")
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ListAll returns all API keys (admin only).
-func (h *KeysHandler) ListAll(w http.ResponseWriter, r *http.Request) {
-	keys, err := h.db.ListAllAPIKeys(r.Context())
-	if err != nil {
-		h.log.Error().Err(err).Msg("keys: list all failed")
-		WriteError(w, http.StatusInternalServerError, "internal error")
-		return
+func keyIDParam(w http.ResponseWriter, r *http.Request) (int, bool) {
+	id, err := PathInt(r, "id")
+	if err != nil || id <= 0 {
+		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidParameter, "id: must be a positive integer")
+		return 0, false
 	}
-	if keys == nil {
-		keys = []database.APIKey{}
-	}
-	WriteJSON(w, http.StatusOK, keys)
+	return id, true
 }
 
-// CreateServiceAccount creates an API key that acts as its own identity.
-func (h *KeysHandler) CreateServiceAccount(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Label string `json:"label"`
-		Role  string `json:"role"`
+// writeKeyError answers a key store error and reports whether there was one.
+func writeKeyError(w http.ResponseWriter, err error) bool {
+	var fe *database.FieldError
+	switch {
+	case err == nil:
+		return false
+	case errors.As(err, &fe):
+		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidBody, fe.Error())
+	case errors.Is(err, database.ErrAPIKeyNotFound):
+		WriteErrorWithCode(w, http.StatusNotFound, ErrNotFound, "API key not found")
+	case errors.Is(err, database.ErrAPIKeyRevoked):
+		WriteErrorWithCode(w, http.StatusConflict, ErrConflict, "API key is revoked and can't be changed")
+	case errors.Is(err, database.ErrLastAdminKey):
+		WriteErrorWithCode(w, http.StatusConflict, ErrConflict, database.ErrLastAdminKey.Error())
+	default:
+		WriteError(w, http.StatusInternalServerError, "API key operation failed")
 	}
-	if err := DecodeJSON(r, &req); err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.Role == "" {
-		req.Role = "viewer"
-	}
-	if req.Label == "" {
-		WriteError(w, http.StatusBadRequest, "label is required")
-		return
-	}
-	if RoleLevel(req.Role) == 0 {
-		WriteError(w, http.StatusBadRequest, "invalid role (viewer, editor, admin)")
-		return
-	}
-
-	key, err := h.db.CreateAPIKey(r.Context(), nil, req.Role, req.Label, true)
-	if err != nil {
-		h.log.Error().Err(err).Msg("keys: create service account failed")
-		WriteError(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-
-	h.log.Info().
-		Str("key_prefix", key.KeyPrefix).
-		Str("role", req.Role).
-		Str("label", req.Label).
-		Msg("service account key created")
-
-	WriteJSON(w, http.StatusCreated, key)
-}
-
-// DeleteAny deletes any API key by ID (admin only).
-func (h *KeysHandler) DeleteAny(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.Atoi(chi.URLParam(r, "id"))
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid key ID")
-		return
-	}
-
-	if err := h.db.DeleteAPIKey(r.Context(), id); err != nil {
-		WriteError(w, http.StatusNotFound, "key not found")
-		return
-	}
-
-	h.log.Info().Int("key_id", id).Msg("api key revoked (admin)")
-	w.WriteHeader(http.StatusNoContent)
+	return true
 }

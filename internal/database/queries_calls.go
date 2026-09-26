@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/snarg/tr-engine/internal/auth"
 )
 
 // CallFilter specifies filters for listing calls.
@@ -71,13 +73,17 @@ type CallAPI struct {
 	CallFilename         string          `json:"-"` // TR's original path, not exposed in JSON; used for audio resolution
 }
 
-// ListCalls returns calls matching the filter with a total count.
-func (db *DB) ListCalls(ctx context.Context, filter CallFilter) ([]CallAPI, int, error) {
+// ListCalls returns calls matching the filter with a total count, limited to
+// the talkgroups p may see (§7.2). It serves GET /calls and the talkgroup and
+// unit call lists. The restriction is part of the WHERE shared by the count
+// and the rows, separate from the user's filters; patched_tgids is cut down to
+// allowed talkgroups. A nil p is ErrNoPrincipal.
+func (db *DB) ListCalls(ctx context.Context, p *auth.Principal, filter CallFilter) ([]CallAPI, int, error) {
 	// Always include the LEFT JOIN; the dedup condition skips it when not active.
 	const fromClause = `FROM calls c
 		JOIN systems s ON s.system_id = c.system_id
 		LEFT JOIN call_groups cg ON cg.id = c.call_group_id`
-	const whereClause = `
+	const filterClause = `
 		WHERE ($1::timestamptz IS NULL OR c.start_time >= $1)
 		  AND ($2::timestamptz IS NULL OR c.start_time < $2)
 		  AND ($3::int[] IS NULL OR c.system_id = ANY($3))
@@ -95,6 +101,12 @@ func (db *DB) ListCalls(ctx context.Context, filter CallFilter) ([]CallAPI, int,
 		pqIntArray(filter.UnitIDs), filter.Emergency, filter.Encrypted,
 		filter.Deduplicate,
 	}
+	restrict, restrictArgs, err := restrictSQL(p, "c.system_id", "c.tgid", len(args)+1)
+	if err != nil {
+		return nil, 0, err
+	}
+	whereClause := filterClause + restrict
+	args = append(args, restrictArgs...)
 
 	// Count query
 	var total int
@@ -129,8 +141,8 @@ func (db *DB) ListCalls(ctx context.Context, filter CallFilter) ([]CallAPI, int,
 			c.metadata_json, c.incidentdata
 		%s %s
 		ORDER BY %s
-		LIMIT $11 OFFSET $12
-	`, fromClause, whereClause, orderBy)
+		LIMIT %s OFFSET %s
+	`, fromClause, whereClause, orderBy, placeholder(len(args)+1), placeholder(len(args)+2))
 
 	rows, err := db.Pool.Query(ctx, dataQuery, append(args, filter.Limit, filter.Offset)...)
 	if err != nil {
@@ -167,6 +179,7 @@ func (db *DB) ListCalls(ctx context.Context, filter CallFilter) ([]CallAPI, int,
 		}
 		c.SrcList = NormalizeSrcFreqTimestamps(c.SrcList)
 		c.FreqList = NormalizeSrcFreqTimestamps(c.FreqList)
+		c.PatchedTgids = allowedPatchedTgids(p, c.SystemID, c.PatchedTgids)
 		calls = append(calls, c)
 	}
 	if calls == nil {
@@ -175,11 +188,17 @@ func (db *DB) ListCalls(ctx context.Context, filter CallFilter) ([]CallAPI, int,
 	return calls, total, rows.Err()
 }
 
-// GetCallByID returns a single call.
-func (db *DB) GetCallByID(ctx context.Context, callID int64) (*CallAPI, error) {
+// GetCallByID returns a single call. A call outside p's restriction is
+// pgx.ErrNoRows, like one that doesn't exist (§6.3), and patched_tgids is cut
+// down to allowed talkgroups. A nil p is ErrNoPrincipal.
+func (db *DB) GetCallByID(ctx context.Context, p *auth.Principal, callID int64) (*CallAPI, error) {
+	restrict, restrictArgs, err := restrictSQL(p, "c.system_id", "c.tgid", 2)
+	if err != nil {
+		return nil, err
+	}
 	var c CallAPI
 	var audioPath *string
-	err := db.Pool.QueryRow(ctx, `
+	err = db.Pool.QueryRow(ctx, `
 		SELECT c.call_id, c.call_group_id, c.system_id, COALESCE(c.system_name, ''), COALESCE(s.sysid, ''),
 			c.site_id, COALESCE(c.site_short_name, ''),
 			c.tgid, COALESCE(c.tg_alpha_tag, ''), COALESCE(c.tg_description, ''),
@@ -199,8 +218,10 @@ func (db *DB) GetCallByID(ctx context.Context, callID int64) (*CallAPI, error) {
 			c.metadata_json, c.incidentdata
 		FROM calls c
 		JOIN systems s ON s.system_id = c.system_id
-		WHERE c.call_id = $1
-	`, callID).Scan(
+		WHERE c.call_id = $1`+restrict+`
+		ORDER BY c.start_time DESC
+		LIMIT 1
+	`, append([]any{callID}, restrictArgs...)...).Scan(
 		&c.CallID, &c.CallGroupID, &c.SystemID, &c.SystemName, &c.Sysid,
 		&c.SiteID, &c.SiteShortName,
 		&c.Tgid, &c.TgAlphaTag, &c.TgDescription, &c.TgTag, &c.TgGroup,
@@ -226,6 +247,7 @@ func (db *DB) GetCallByID(ctx context.Context, callID int64) (*CallAPI, error) {
 	}
 	c.SrcList = NormalizeSrcFreqTimestamps(c.SrcList)
 	c.FreqList = NormalizeSrcFreqTimestamps(c.FreqList)
+	c.PatchedTgids = allowedPatchedTgids(p, c.SystemID, c.PatchedTgids)
 	return &c, nil
 }
 
@@ -390,17 +412,25 @@ type CallGroupAPI struct {
 	TranscriptionText   *string    `json:"transcription_text,omitempty"`
 }
 
-// ListCallGroups returns call groups matching the filter.
-func (db *DB) ListCallGroups(ctx context.Context, filter CallGroupFilter) ([]CallGroupAPI, int, error) {
+// ListCallGroups returns call groups matching the filter, limited to the
+// talkgroups p may see: the restriction is part of the WHERE shared by the
+// count and the rows (§7.2). A nil p is ErrNoPrincipal.
+func (db *DB) ListCallGroups(ctx context.Context, p *auth.Principal, filter CallGroupFilter) ([]CallGroupAPI, int, error) {
 	const fromClause = `FROM call_groups cg
 		JOIN systems s ON s.system_id = cg.system_id
 		LEFT JOIN calls pc ON pc.call_id = cg.primary_call_id AND pc.start_time >= cg.start_time - interval '10 seconds'`
-	const whereClause = `
+	const filterClause = `
 		WHERE ($1::timestamptz IS NULL OR cg.start_time >= $1)
 		  AND ($2::timestamptz IS NULL OR cg.start_time < $2)
 		  AND ($3::text[] IS NULL OR s.sysid = ANY($3))
 		  AND ($4::int[] IS NULL OR cg.tgid = ANY($4))`
 	args := []any{filter.StartTime, filter.EndTime, pqStringArray(filter.Sysids), pqIntArray(filter.Tgids)}
+	restrict, restrictArgs, err := restrictSQL(p, "cg.system_id", "cg.tgid", len(args)+1)
+	if err != nil {
+		return nil, 0, err
+	}
+	whereClause := filterClause + restrict
+	args = append(args, restrictArgs...)
 
 	var total int
 	if err := db.Pool.QueryRow(ctx, "SELECT count(*) "+fromClause+whereClause, args...).Scan(&total); err != nil {
@@ -419,7 +449,7 @@ func (db *DB) ListCallGroups(ctx context.Context, filter CallGroupFilter) ([]Cal
 			cg.transcription_text
 		` + fromClause + whereClause + `
 		ORDER BY cg.start_time DESC
-		LIMIT $5 OFFSET $6`
+		LIMIT ` + placeholder(len(args)+1) + ` OFFSET ` + placeholder(len(args)+2)
 
 	rows, err := db.Pool.Query(ctx, dataQuery, append(args, filter.Limit, filter.Offset)...)
 	if err != nil {
@@ -447,10 +477,22 @@ func (db *DB) ListCallGroups(ctx context.Context, filter CallGroupFilter) ([]Cal
 	return groups, total, rows.Err()
 }
 
-// GetCallGroupByID returns a call group with its individual recordings.
-func (db *DB) GetCallGroupByID(ctx context.Context, id int) (*CallGroupAPI, []CallAPI, error) {
+// GetCallGroupByID returns a call group with its individual recordings. A
+// group whose (system, talkgroup) p may not see is pgx.ErrNoRows, like one
+// that doesn't exist (§6.3). Member calls share the group's talkgroup, but
+// are filtered by the restriction too, and their patched_tgids are cut down
+// to allowed talkgroups. A nil p is ErrNoPrincipal.
+func (db *DB) GetCallGroupByID(ctx context.Context, p *auth.Principal, id int) (*CallGroupAPI, []CallAPI, error) {
+	groupRestrict, groupArgs, err := restrictSQL(p, "cg.system_id", "cg.tgid", 2)
+	if err != nil {
+		return nil, nil, err
+	}
+	callRestrict, callArgs, err := restrictSQL(p, "c.system_id", "c.tgid", 2)
+	if err != nil {
+		return nil, nil, err
+	}
 	var g CallGroupAPI
-	err := db.Pool.QueryRow(ctx, `
+	err = db.Pool.QueryRow(ctx, `
 		SELECT cg.id, cg.system_id, COALESCE(s.name, ''), COALESCE(s.sysid, ''),
 			pc.site_id, COALESCE(pc.site_short_name, ''),
 			cg.tgid, COALESCE(cg.tg_alpha_tag, ''), COALESCE(cg.tg_description, ''),
@@ -463,8 +505,8 @@ func (db *DB) GetCallGroupByID(ctx context.Context, id int) (*CallGroupAPI, []Ca
 		FROM call_groups cg
 		JOIN systems s ON s.system_id = cg.system_id
 		LEFT JOIN calls pc ON pc.call_id = cg.primary_call_id AND pc.start_time >= cg.start_time - interval '10 seconds'
-		WHERE cg.id = $1
-	`, id).Scan(
+		WHERE cg.id = $1`+groupRestrict+`
+	`, append([]any{id}, groupArgs...)...).Scan(
 		&g.ID, &g.SystemID, &g.SystemName, &g.Sysid,
 		&g.SiteID, &g.SiteShortName,
 		&g.Tgid, &g.TgAlphaTag, &g.TgDescription, &g.TgTag, &g.TgGroup,
@@ -496,9 +538,9 @@ func (db *DB) GetCallGroupByID(ctx context.Context, id int) (*CallGroupAPI, []Ca
 			c.metadata_json, c.incidentdata
 		FROM calls c
 		JOIN systems s ON s.system_id = c.system_id
-		WHERE c.call_group_id = $1
+		WHERE c.call_group_id = $1`+callRestrict+`
 		ORDER BY c.start_time DESC
-	`, id)
+	`, append([]any{id}, callArgs...)...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -533,6 +575,7 @@ func (db *DB) GetCallGroupByID(ctx context.Context, id int) (*CallGroupAPI, []Ca
 		}
 		c.SrcList = NormalizeSrcFreqTimestamps(c.SrcList)
 		c.FreqList = NormalizeSrcFreqTimestamps(c.FreqList)
+		c.PatchedTgids = allowedPatchedTgids(p, c.SystemID, c.PatchedTgids)
 		calls = append(calls, c)
 	}
 	if calls == nil {

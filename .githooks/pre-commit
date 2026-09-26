@@ -14,6 +14,9 @@ PATTERNS=(
     'SECRET_KEY=[^${\}]'
     'PRIVATE_KEY=[^${\}]'
     'BEGIN.*PRIVATE KEY'
+    # A tr-engine API key: tre_ + 64 hex characters. Docs and tests must use
+    # obviously fake shortened values (tre_4f1c…, tre_xxxxxxxx) instead.
+    'tre_[0-9a-f]{64}'
     'password\s*[:=]\s*['\''"][^'\''"]+['\''"]'
 )
 

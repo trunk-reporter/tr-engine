@@ -41,7 +41,7 @@ func (h *AdminHandler) MergeSystems(w http.ResponseWriter, r *http.Request) {
 	}
 
 	callsMoved, tgMoved, tgMerged, unitsMoved, unitsMerged, eventsMoved, err :=
-		h.db.MergeSystems(r.Context(), req.SourceID, req.TargetID, "api")
+		h.db.MergeSystems(r.Context(), req.SourceID, req.TargetID, mergePerformedBy(r))
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "merge failed: "+err.Error())
 		return
@@ -68,6 +68,15 @@ func (h *AdminHandler) MergeSystems(w http.ResponseWriter, r *http.Request) {
 		"units_merged":      unitsMerged,
 		"events_moved":      eventsMoved,
 	})
+}
+
+// mergePerformedBy is what system_merge_log.performed_by records for an API
+// merge: the key's name, plus " / <actor>" when the client named one (§9).
+func mergePerformedBy(r *http.Request) string {
+	if by := PrincipalFrom(r).Attribution(); by != "" {
+		return by
+	}
+	return "api"
 }
 
 // GetMaintenance returns current maintenance config and last run results.
@@ -175,6 +184,7 @@ var validRetentionKeys = map[string]bool{
 	"retention_trunking_messages": true,
 	"retention_checkpoints":       true,
 	"retention_stale_calls":       true,
+	"retention_audit_log":         true,
 }
 
 // SetMaintenanceConfig updates a single retention setting.
@@ -255,11 +265,6 @@ func (h *AdminHandler) Routes(r chi.Router) {
 	r.Get("/admin/transcribe-backfill", h.GetBackfillStatus)
 	r.Delete("/admin/transcribe-backfill/{id}", h.CancelBackfill)
 	r.Delete("/admin/transcribe-backfill", h.CancelBackfill)
-
-	// Retention config edit/delete requires admin role
-	r.Group(func(r chi.Router) {
-		r.Use(AdminOnly)
-		r.Put("/admin/maintenance/config", h.SetMaintenanceConfig)
-		r.Delete("/admin/maintenance/config/{key}", h.DeleteMaintenanceConfig)
-	})
+	r.Put("/admin/maintenance/config", h.SetMaintenanceConfig)
+	r.Delete("/admin/maintenance/config/{key}", h.DeleteMaintenanceConfig)
 }

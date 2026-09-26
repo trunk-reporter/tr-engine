@@ -14,7 +14,10 @@ type migration struct {
 }
 
 // migrations is the ordered list of schema migrations to apply.
-// Each must be idempotent (use IF NOT EXISTS, IF EXISTS, etc.).
+// Each must be idempotent (use IF NOT EXISTS, IF EXISTS, etc.). Migrate
+// evaluates every check before applying anything, so a migration must not
+// rely on the effects of another one pending in the same run, and its SQL
+// must also be correct when an earlier pending migration has just run.
 var migrations = []migration{
 	{
 		name:  "add calls.incidentdata",
@@ -89,30 +92,6 @@ ALTER TABLE systems ADD CONSTRAINT systems_system_type_check
 			  AND check_clause LIKE '%empty%')`,
 	},
 	{
-		name: "create users table",
-		sql: `CREATE TABLE IF NOT EXISTS users (
-			id            serial       PRIMARY KEY,
-			username      text         UNIQUE NOT NULL,
-			password_hash text         NOT NULL,
-			role          text         NOT NULL DEFAULT 'viewer'
-			              CHECK (role IN ('viewer', 'editor', 'admin')),
-			enabled       boolean      NOT NULL DEFAULT true,
-			created_at    timestamptz  NOT NULL DEFAULT now(),
-			updated_at    timestamptz  NOT NULL DEFAULT now()
-		);
-		CREATE TRIGGER trg_users_updated_at
-			BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION set_updated_at()`,
-		check: `SELECT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'users')`,
-	},
-	{
-		name: "add display_name and last_login to users",
-		sql: `ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name text NOT NULL DEFAULT '';
-		      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login timestamptz`,
-		check: `SELECT EXISTS (
-			SELECT 1 FROM information_schema.columns
-			WHERE table_name = 'users' AND column_name = 'display_name')`,
-	},
-	{
 		name: "create config_overrides table",
 		sql: `CREATE TABLE IF NOT EXISTS config_overrides (
 			key        text PRIMARY KEY,
@@ -122,22 +101,26 @@ ALTER TABLE systems ADD CONSTRAINT systems_system_type_check
 		check: `SELECT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'config_overrides')`,
 	},
 	{
+		// The current shape; databases that had the older, user-owned shape are
+		// converted by "convert api_keys to app keys" below.
 		name: "create api_keys table",
 		sql: `CREATE TABLE IF NOT EXISTS api_keys (
-			id                 serial       PRIMARY KEY,
-			key_hash           text         UNIQUE NOT NULL,
-			key_prefix         text         NOT NULL,
-			user_id            int          REFERENCES users(id) ON DELETE CASCADE,
-			role               text         NOT NULL DEFAULT 'viewer'
-			                   CHECK (role IN ('viewer', 'editor', 'admin')),
-			label              text         NOT NULL DEFAULT '',
-			is_service_account boolean      NOT NULL DEFAULT false,
-			created_at         timestamptz  NOT NULL DEFAULT now(),
-			last_used_at       timestamptz
+			id              serial       PRIMARY KEY,
+			key_hash        text         UNIQUE NOT NULL,
+			key_prefix      text         NOT NULL,
+			name            text         NOT NULL,
+			scopes          text[]       NOT NULL,
+			restriction     jsonb,
+			expires_at      timestamptz,
+			revoked_at      timestamptz,
+			rate_limit_rps  real,
+			legacy          boolean      NOT NULL DEFAULT false,
+			created_at      timestamptz  NOT NULL DEFAULT now(),
+			last_used_at    timestamptz,
+			CONSTRAINT api_keys_scopes_check CHECK (cardinality(scopes) > 0)
 		);
-		CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id);
 		CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash)`,
-		check: `SELECT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'api_keys')`,
+		check: `SELECT to_regclass('api_keys') IS NOT NULL`,
 	},
 	{
 		name: "create data_fixups table",
@@ -204,6 +187,133 @@ ALTER TABLE systems ADD CONSTRAINT systems_system_type_check
 			AND EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'scan_cursors')
 			AND EXISTS (SELECT 1 FROM information_schema.columns
 				WHERE table_name = 'unit_tag_suggestions' AND column_name = 'tag_at_sighting')`,
+	},
+	{
+		// API keys stop belonging to users and become client credentials with
+		// scopes (docs/auth.md). One DO block, and every statement that touches
+		// the old columns or users goes through EXECUTE, so it parses on any
+		// database and works as the manual SQL MigrationError prints. It does
+		// nothing unless api_keys still has the old label column (a database
+		// that gets api_keys from "create api_keys table" already has the new
+		// shape). users is resolved like the old code resolved it (unqualified).
+		//
+		// A user-owned key keeps the lower of its own role and its owner's
+		// current role (viewer < editor < admin) and gets " (<username>)" or
+		// " (<username>, disabled)" appended to its name; keys of disabled users
+		// are revoked. Roles map to scopes viewer → listen, editor → edit,
+		// admin → admin, and service-account keys (the documented upload
+		// credential) also get upload. A role outside the three maps to listen
+		// and the key is revoked.
+		name: "convert api_keys to app keys",
+		sql: `DO $mig$
+DECLARE
+    key_rank  CONSTANT text := $r$CASE k.role WHEN 'admin' THEN 3 WHEN 'editor' THEN 2 WHEN 'viewer' THEN 1 ELSE 0 END$r$;
+    rank_expr text := key_rank;
+    rank_src  text := 'api_keys k';
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute
+                   WHERE attrelid = to_regclass('api_keys') AND attname = 'label' AND NOT attisdropped) THEN
+        RETURN;
+    END IF;
+
+    EXECUTE 'ALTER TABLE api_keys
+        ADD COLUMN IF NOT EXISTS scopes text[],
+        ADD COLUMN IF NOT EXISTS restriction jsonb,
+        ADD COLUMN IF NOT EXISTS expires_at timestamptz,
+        ADD COLUMN IF NOT EXISTS revoked_at timestamptz,
+        ADD COLUMN IF NOT EXISTS rate_limit_rps real,
+        ADD COLUMN IF NOT EXISTS legacy boolean NOT NULL DEFAULT false';
+
+    IF to_regclass('users') IS NOT NULL THEN
+        EXECUTE 'UPDATE api_keys k SET revoked_at = COALESCE(k.revoked_at, now())
+                 FROM users u WHERE u.id = k.user_id AND u.enabled IS NOT TRUE';
+        EXECUTE $q$
+            UPDATE api_keys k SET label = COALESCE(NULLIF(btrim(k.label), ''), 'key ' || k.key_prefix)
+                || ' (' || u.username || CASE WHEN u.enabled IS TRUE THEN ')' ELSE ', disabled)' END
+            FROM users u WHERE u.id = k.user_id$q$;
+        rank_expr := format($r$LEAST(%s, CASE WHEN u.id IS NULL THEN 3 WHEN u.role = 'admin' THEN 3
+            WHEN u.role = 'editor' THEN 2 WHEN u.role = 'viewer' THEN 1 ELSE 0 END)$r$, key_rank);
+        rank_src := 'api_keys k LEFT JOIN users u ON u.id = k.user_id';
+    END IF;
+    EXECUTE format($q$
+        UPDATE api_keys k SET
+            scopes = CASE r.rank WHEN 3 THEN ARRAY['admin'] WHEN 2 THEN ARRAY['edit'] ELSE ARRAY['listen'] END
+                     || CASE WHEN k.is_service_account THEN ARRAY['upload'] ELSE '{}'::text[] END,
+            revoked_at = CASE WHEN r.rank = 0 THEN COALESCE(k.revoked_at, now()) ELSE k.revoked_at END
+        FROM (SELECT k.id, %s AS rank FROM %s) r
+        WHERE r.id = k.id$q$, rank_expr, rank_src);
+
+    EXECUTE 'ALTER TABLE api_keys RENAME COLUMN label TO name';
+    EXECUTE $q$UPDATE api_keys SET name = 'key ' || key_prefix WHERE btrim(name) = ''$q$;
+    EXECUTE 'ALTER TABLE api_keys ALTER COLUMN name DROP DEFAULT';
+    EXECUTE 'ALTER TABLE api_keys ALTER COLUMN scopes SET NOT NULL';
+    EXECUTE 'ALTER TABLE api_keys ADD CONSTRAINT api_keys_scopes_check CHECK (cardinality(scopes) > 0)';
+    EXECUTE 'DROP INDEX IF EXISTS idx_api_keys_user_id';
+    EXECUTE 'ALTER TABLE api_keys DROP COLUMN IF EXISTS user_id, DROP COLUMN IF EXISTS role,
+        DROP COLUMN IF EXISTS is_service_account';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys (key_hash)';
+END
+$mig$`,
+		check: `SELECT EXISTS (SELECT 1 FROM pg_attribute
+				WHERE attrelid = to_regclass('api_keys') AND attname = 'scopes' AND NOT attisdropped)
+			AND NOT EXISTS (SELECT 1 FROM pg_attribute
+				WHERE attrelid = to_regclass('api_keys') AND attname = 'label' AND NOT attisdropped)`,
+	},
+	{
+		// tr-engine has no user accounts any more. Record who had one
+		// (data_fixups 'removed-user-accounts', logged once at startup) and drop
+		// the table. Runs after "convert api_keys to app keys", which reads it.
+		name: "record and drop users",
+		sql: `DO $mig$
+DECLARE
+    login_col text := 'NULL::timestamptz';
+BEGIN
+    IF to_regclass('users') IS NULL THEN
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_attribute
+               WHERE attrelid = to_regclass('users') AND attname = 'last_login' AND NOT attisdropped) THEN
+        login_col := 'last_login';
+    END IF;
+    EXECUTE format($q$
+        INSERT INTO data_fixups (name, detail)
+        SELECT 'removed-user-accounts', COALESCE(jsonb_agg(jsonb_build_object(
+                   'username', username, 'role', role, 'enabled', enabled, 'last_login', %s)
+                   ORDER BY id), '[]'::jsonb)
+        FROM users
+        ON CONFLICT (name) DO NOTHING$q$, login_col);
+    EXECUTE 'DROP TABLE users CASCADE';
+END
+$mig$`,
+		check: `SELECT to_regclass('users') IS NULL`,
+	},
+	{
+		name: "create auth_settings table",
+		sql: `CREATE TABLE IF NOT EXISTS auth_settings (
+			name        text         PRIMARY KEY,
+			value       jsonb        NOT NULL,
+			updated_at  timestamptz  NOT NULL DEFAULT now()
+		)`,
+		check: `SELECT to_regclass('auth_settings') IS NOT NULL`,
+	},
+	{
+		name: "create audit_log table",
+		sql: `CREATE TABLE IF NOT EXISTS audit_log (
+			id          bigserial    PRIMARY KEY,
+			"time"      timestamptz  NOT NULL DEFAULT now(),
+			key_id      int          NOT NULL,
+			key_name    text         NOT NULL,
+			actor       text,
+			method      text         NOT NULL,
+			path        text         NOT NULL,
+			status      int          NOT NULL,
+			request_id  text
+		);
+		CREATE INDEX IF NOT EXISTS idx_audit_log_time ON audit_log ("time" DESC);
+		CREATE INDEX IF NOT EXISTS idx_audit_log_key_time ON audit_log (key_id, "time" DESC)`,
+		check: `SELECT to_regclass('audit_log') IS NOT NULL
+			AND to_regclass('idx_audit_log_time') IS NOT NULL
+			AND to_regclass('idx_audit_log_key_time') IS NOT NULL`,
 	},
 }
 

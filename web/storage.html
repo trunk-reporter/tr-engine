@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="auth.js?v=2"></script>
+<script src="auth.js?v=3"></script>
 <meta name="card-title" content="Storage">
 <meta name="card-description" content="Database storage stats, retention config, and manual purge">
 <meta name="card-order" content="21">
@@ -132,11 +132,19 @@
     <div id="purge-rows"></div>
   </div>
 
-  <!-- No Access -->
-  <div id="noaccess" style="display:none;text-align:center;padding:60px 20px;color:var(--muted);font-size:14px">
-    <p>Admin role required to manage storage.</p>
-    <p style="margin-top:8px">You are logged in as <strong id="noaccess-user">–</strong> (<span id="noaccess-role">–</span>).</p>
-    <p style="margin-top:12px"><a href="/" style="color:var(--accent)">Back to home</a></p>
+  <!-- No Access: needs an admin key, kept for this tab only (shared with admin.html) -->
+  <div id="noaccess" class="panel" style="display:none;max-width:520px;margin:40px auto;text-align:center">
+    <div class="panel-title" style="justify-content:center">Admin key required</div>
+    <p style="font-size:13px;color:var(--muted);line-height:1.5;margin-bottom:14px">
+      Storage management needs an API key with the <span class="mono">admin</span> scope.
+      It is kept in this tab's session storage only and sent only to this engine.
+    </p>
+    <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+      <input type="password" id="admin-key-input" class="config-value" style="width:300px" placeholder="tre_…" autocomplete="off" spellcheck="false" aria-label="Admin API key">
+      <button class="btn btn-primary btn-sm" id="admin-key-btn">Connect</button>
+    </div>
+    <p id="noaccess-msg" style="margin-top:10px;font-size:12px;color:#e74c3c"></p>
+    <p style="margin-top:12px;font-size:13px"><a href="admin.html" style="color:var(--accent)">Admin page</a> · <a href="/" style="color:var(--accent)">Back to home</a></p>
   </div>
 </div>
 
@@ -153,19 +161,38 @@
 
 <script src="theme-engine.js?v=2"></script>
 <script>
-// ── API ──
+// ── Admin key (session storage, this tab only; shared with admin.html) ──
+
+var SESSION_KEY = 'tr-engine-admin-key';
+var adminKey = '';
+
+function sessionGet() {
+  try { return sessionStorage.getItem(SESSION_KEY) || ''; } catch (e) { return ''; }
+}
+function sessionSet(v) {
+  try { sessionStorage.setItem(SESSION_KEY, v); } catch (e) { /* kept in memory only */ }
+}
+function sessionClear() {
+  try { sessionStorage.removeItem(SESSION_KEY); } catch (e) { /* ignore */ }
+}
+
+var esc = function(s) { return trAuth.escapeHTML(s); };
+
+// ── API: the admin key is sent explicitly, so auth.js leaves the request alone ──
 
 function api(method, path, body) {
-  var opts = { method: method, headers: {} };
+  var opts = { method: method, headers: { 'Authorization': 'Bearer ' + adminKey }, cache: 'no-store' };
   if (body) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
   return fetch('/api/v1' + path, opts).then(function(resp) {
     if (resp.status === 204) return { _status: 204, _ok: true };
-    return resp.json().then(function(data) {
+    return resp.json().catch(function() { return {}; }).then(function(data) {
+      if (!data || typeof data !== 'object' || Array.isArray(data)) data = { _data: data };
       data._status = resp.status;
       data._ok = resp.ok;
+      if (resp.status === 401) showNoAccess('The admin key was rejected' + (data.error ? ': ' + data.error : '.'));
       return data;
     });
   });
@@ -179,26 +206,63 @@ var statsSortDesc = true;
 var configData = {};
 var expandedTables = {};
 
-// ── Auth guard ──
+// ── Auth guard: needs the admin scope, checked with GET /whoami ──
 
-async function init() {
-  try {
-    var me = await api('GET', '/auth/me');
-    if (me._ok) {
-      if (me.role === 'admin') {
-        document.getElementById('loading').style.display = 'block';
-        await Promise.all([loadStats(), loadConfig()]);
-        document.getElementById('loading').style.display = 'none';
-        document.getElementById('panel-stats').style.display = '';
-        document.getElementById('panel-config').style.display = '';
-        document.getElementById('panel-purge').style.display = '';
-        return;
-      }
-    }
-  } catch(e) {}
+function showNoAccess(msg) {
+  adminKey = '';
+  sessionClear();
   document.getElementById('loading').style.display = 'none';
+  ['panel-stats', 'panel-config', 'panel-purge'].forEach(function(id) {
+    document.getElementById(id).style.display = 'none';
+  });
   document.getElementById('noaccess').style.display = '';
+  document.getElementById('noaccess-msg').textContent = msg || '';
 }
+
+async function checkAdminKey(key) {
+  var resp;
+  try {
+    resp = await fetch('/api/v1/whoami', { headers: { 'Authorization': 'Bearer ' + key }, cache: 'no-store' });
+  } catch (e) {
+    return 'Could not reach tr-engine.';
+  }
+  var body = await resp.json().catch(function() { return {}; });
+  if (resp.status === 401) return 'Key rejected' + (body && body.error ? ': ' + body.error : '.');
+  if (!resp.ok) return 'Could not check the key (HTTP ' + resp.status + ').';
+  var scopes = body && Array.isArray(body.scopes) ? body.scopes : [];
+  if (scopes.indexOf('admin') < 0) return 'This key has the scopes ' + (scopes.join(', ') || 'none') + '; storage management needs the admin scope.';
+  return '';
+}
+
+async function init(key) {
+  key = String(key || sessionGet()).trim();
+  if (!key) { showNoAccess(''); return; }
+  var problem = await checkAdminKey(key);
+  if (problem) { showNoAccess(problem); return; }
+  adminKey = key;
+  sessionSet(key);
+  document.getElementById('noaccess').style.display = 'none';
+  document.getElementById('loading').style.display = 'block';
+  await Promise.all([loadStats(), loadConfig()]);
+  document.getElementById('loading').style.display = 'none';
+  if (!adminKey) return;   // the key was rejected meanwhile
+  document.getElementById('panel-stats').style.display = '';
+  document.getElementById('panel-config').style.display = '';
+  document.getElementById('panel-purge').style.display = '';
+  renderPurgeRows();
+}
+
+function connectFromInput() {
+  var input = document.getElementById('admin-key-input');
+  var key = input.value.trim();
+  if (!key) return;
+  input.value = '';
+  init(key);
+}
+document.getElementById('admin-key-btn').addEventListener('click', connectFromInput);
+document.getElementById('admin-key-input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') connectFromInput();
+});
 
 // ── Format helpers ──
 
@@ -264,7 +328,7 @@ function renderStats() {
     if (hasParts) tr.setAttribute('data-table', t.name);
     if (hasParts) tr.onclick = function() { toggleExpand(t.name); };
     tr.innerHTML =
-      '<td>' + (hasParts ? '<span class="chevron">▶</span>' : '') + t.name + '</td>' +
+      '<td>' + (hasParts ? '<span class="chevron">▶</span>' : '') + esc(t.name) + '</td>' +
       '<td class="num">' + fmtNum(t.row_count) + '</td>' +
       '<td class="num">' + fmtBytes(t.table_bytes) + '</td>' +
       '<td class="num">' + fmtBytes(t.index_bytes) + '</td>' +
@@ -275,7 +339,7 @@ function renderStats() {
         var ptr = document.createElement('tr');
         ptr.className = 'partition-row';
         ptr.innerHTML =
-          '<td>' + p.name + '</td>' +
+          '<td>' + esc(p.name) + '</td>' +
           '<td class="num">–</td>' +
           '<td class="num">–</td>' +
           '<td class="num">–</td>' +
@@ -347,9 +411,9 @@ function renderConfig() {
     var display = fmtDuration(value);
 
     row.innerHTML =
-      '<span class="config-key">' + label + ' ' + badge + '</span>' +
-      '<input class="config-value" id="input-' + key + '" value="' + value + '"' + inputDisabled + '>' +
-      '<span class="mono" style="font-size:11px;color:var(--muted)">(' + display + ')</span>' +
+      '<span class="config-key">' + esc(label) + ' ' + badge + '</span>' +
+      '<input class="config-value" id="input-' + key + '" value="' + esc(value) + '"' + inputDisabled + '>' +
+      '<span class="mono" style="font-size:11px;color:var(--muted)">(' + esc(display) + ')</span>' +
       saveBtn +
       resetLink +
       '<span class="feedback" id="fb-' + key + '"></span>';
@@ -427,7 +491,7 @@ function renderPurgeRows() {
     var defVal = configData[t.retentionKey] || '';
     row.innerHTML =
       '<span class="purge-name">' + t.label + '</span>' +
-      '<input class="purge-input" id="purge-input-' + t.key + '" value="' + defVal + '" placeholder="e.g. 48h">' +
+      '<input class="purge-input" id="purge-input-' + t.key + '" value="' + esc(defVal) + '" placeholder="e.g. 48h">' +
       '<button class="btn btn-danger btn-sm" onclick="confirmPurge(\'' + t.key + '\', \'' + t.label + '\')">Purge</button>' +
       '<span class="purge-result" id="purge-result-' + t.key + '"></span>';
     container.appendChild(row);
@@ -442,7 +506,7 @@ function confirmPurge(key, label) {
   if (!duration) { alert('Enter a duration value (e.g. 48h).'); return; }
   pendingPurge = { key: key, label: label, duration: duration };
   document.getElementById('confirm-msg').innerHTML =
-    'This will permanently delete rows from <strong>' + label + '</strong> older than <strong>' + duration + '</strong>. This cannot be undone.';
+    'This will permanently delete rows from <strong>' + esc(label) + '</strong> older than <strong>' + esc(duration) + '</strong>. This cannot be undone.';
   document.getElementById('confirm-modal').style.display = '';
   document.getElementById('confirm-btn').textContent = 'Purge ' + label;
 }
@@ -493,9 +557,7 @@ function showError(msg) {
 
 // ── Bootstrap ──
 
-init().then(function() {
-  renderPurgeRows();
-});
+init();
 </script>
 </body>
 </html>

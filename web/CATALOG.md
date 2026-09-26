@@ -13,7 +13,7 @@
 | **D3.js 7.9.0** | `cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js` | `stream-graph.html` | Stream graph visualization, stack layouts, force simulation |
 | **Chart.js 4.x** | `cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js` | `talkgroup-research.html` | Bar, line, and doughnut charts for deep-dive analytics |
 | **CKEditor** (inline) | `cdn.ckeditor.com` | `talkgroup-research.html` | Rich text editing for reports |
-| **auth.js** (local) | `web/auth.js` | All pages | Unified auth: JWT sessions, API tokens, transparent retry on 401/403 |
+| **auth.js** (local) | `web/auth.js` | All pages | API-key auth (`?v=3`): one stored key sent as `Authorization: Bearer` on same-origin `/api/` requests, tickets for `EventSource`/`<audio>`/WebSocket, key prompt on 401 `invalid_key`/`key_required`, `window.trAuth` |
 | **theme-config.js** (local) | `web/theme-config.js` | All pages | 10+ themes as CSS custom variables (Crystal, Apple Glass, Obsidian, etc.) |
 | **theme-engine.js** (local) | `web/theme-engine.js` | All pages | Applies themes, builds switcher UI, persists to localStorage |
 | **audio-engine.js** (local) | `web/audio-engine.js` | `audio-diagnostics.html`, scanner pages | WebSocket audio streaming, per-TG AudioWorklet, jitter tracking |
@@ -30,7 +30,7 @@
 |-----------|-------------|-----------|-------|
 | **REST GET** | Standard fetch from `/api/v1/...` with JSON payloads | `/systems`, `/talkgroups`, `/calls`, `/units`, `/units/{id}`, `/talkgroups/{id}/calls`, etc. | Most pages |
 | **REST POST (custom SQL)** | `POST /query` with server-side SQL, `$1` parameters, row limits | `/query` | `stream-graph.html`, `signal-flow-data.js` |
-| **REST POST (admin)** | Authenticated admin POST for mutations | `/admin/transcribe-backfill`, `/admin/maintenance` | N/A (no UI) |
+| **REST POST (admin)** | Mutations with an `admin` API key | `/admin/transcribe-backfill`, `/admin/maintenance` | N/A (no UI) |
 | **Paginated REST** | `/calls?limit=PAGE&offset=OFFSET` with server-side pagination | `/calls`, `/talkgroups`, `/units` | `call-history.html`, `emergency-log.html` |
 | **Filtered REST** | Multiple query params: `emergency=true`, `system_id=N`, `start_time`, `end_time`, `sort=-stop_time`, `deduplicate=true` | `/calls`, `/talkgroups` | Most pages |
 | **SSE Stream** | `GET /events/stream` with `Last-Event-ID` reconnect, filter params: `systems`, `sites`, `tgids`, `units`, `types`, `emergency_only` | `/events/stream` | `events.html`, `ir-radio-live.html`, `stream-graph.html` |
@@ -43,7 +43,7 @@
 
 | Technique | Description | Pages |
 |-----------|-------------|-------|
-| **localStorage persistence** | `tr-engine-token`, `tr-engine-write-token`, `tr-engine-jwt` for auth; `eh-theme` for theme; `eh-hidden-pages` for nav visibility | `auth.js`, `theme-engine.js` |
+| **localStorage persistence** | `tr-engine-api-key` for the API key (admin pages keep an admin key in `sessionStorage` for the tab only); `eh-theme` for theme; `eh-hidden-pages` for nav visibility | `auth.js`, `theme-engine.js` |
 | **In-memory state** | Time bucket map (tgid → call count), roster map (tgid → unit IDs), SSE event buffers | `signal-flow-data.js` |
 | **Circular buffer** | `_maxDeltas = 500` for jitter tracking, `_maxTransmissions = 100` for transmission log | `audio-engine.js` |
 | **Debounced search** | 300ms debounce on search input before re-filtering in-memory data | `unit-tracker.html` |

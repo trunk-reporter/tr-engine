@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <script src="auth.js?v=1"></script>
+  <script src="auth.js?v=3"></script>
   <meta name="card-title" content="TG Sunburst">
   <meta name="card-description" content="System-tg-hour call volume in hierarchical sunburst">
   <meta name="card-order" content="24">
@@ -186,8 +186,9 @@
       chartInstance.setOption({
         tooltip: {
           formatter: function(info) {
-            if (!info.data) return info.name;
-            return '<b>' + info.name + '</b><br/>Calls: ' + info.value;
+            var esc = trAuth.escapeHTML;
+            if (!info.data) return esc(info.name);
+            return '<b>' + esc(info.name) + '</b><br/>Calls: ' + esc(info.value);
           }
         },
         series: {

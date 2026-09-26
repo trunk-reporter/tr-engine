@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/database/sqlcdb"
 )
 
@@ -117,11 +119,19 @@ func allSiteRowToAPI(r sqlcdb.LoadAllSitesAPIRow) SiteAPI {
 	return s
 }
 
-// GetSiteByID returns a single site.
-func (db *DB) GetSiteByID(ctx context.Context, siteID int) (*SiteAPI, error) {
+// GetSiteByID returns a single site. A site whose system p may not see is
+// pgx.ErrNoRows, like one that doesn't exist (§6.3). A nil p is
+// ErrNoPrincipal.
+func (db *DB) GetSiteByID(ctx context.Context, p *auth.Principal, siteID int) (*SiteAPI, error) {
+	if p == nil {
+		return nil, ErrNoPrincipal
+	}
 	row, err := db.Q.GetSiteByID(ctx, siteID)
 	if err != nil {
 		return nil, err
+	}
+	if !p.SystemVisible(row.SystemID) {
+		return nil, pgx.ErrNoRows
 	}
 	s := siteRowToAPI(row)
 	return &s, nil

@@ -12,14 +12,18 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/database"
 	"github.com/snarg/tr-engine/internal/mqttclient"
 )
 
+// HealthResponse is the /health body. Everyone gets status, version and
+// checks; the rest only goes to a key with unrestricted listen or better
+// (§6.3).
 type HealthResponse struct {
 	Status         string                `json:"status"`
 	Version        string                `json:"version"`
-	UptimeSeconds  int64                 `json:"uptime_seconds"`
+	UptimeSeconds  *int64                `json:"uptime_seconds,omitempty"`
 	Checks         map[string]string     `json:"checks"`
 	Database       *DatabasePoolStats    `json:"database_pool,omitempty"`
 	TrunkRecorders []TRInstanceStatusData `json:"trunk_recorders,omitempty"`
@@ -200,7 +204,9 @@ func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	httpStatus := http.StatusOK
 
 	// Database check
-	if err := h.db.HealthCheck(r.Context()); err != nil {
+	if h.db == nil {
+		checks["database"] = "not_configured"
+	} else if err := h.db.HealthCheck(r.Context()); err != nil {
 		checks["database"] = "error"
 		status = "unhealthy"
 		httpStatus = http.StatusServiceUnavailable
@@ -238,6 +244,13 @@ func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Only a key with unrestricted listen (or better) sees more than the
+	// checks: TR instances, pool stats, the stream address and updates.
+	if p := PrincipalFrom(r); p == nil || p.Kind != auth.KindKey || !p.Has(auth.ScopeListen) || p.Restricted() {
+		writeHealth(w, httpStatus, HealthResponse{Status: status, Version: h.version, Checks: checks})
+		return
+	}
+
 	// TR instance status
 	var trInstances []TRInstanceStatusData
 	if h.live != nil {
@@ -245,15 +258,18 @@ func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Database pool stats
-	stat := h.db.Pool.Stat()
-	poolStats := &DatabasePoolStats{
-		MaxConns:          stat.MaxConns(),
-		TotalConns:        stat.TotalConns(),
-		AcquiredConns:     stat.AcquiredConns(),
-		IdleConns:         stat.IdleConns(),
-		ConstructingConns: stat.ConstructingConns(),
-		AcquireCount:      stat.AcquireCount(),
-		EmptyAcquireCount: stat.EmptyAcquireCount(),
+	var poolStats *DatabasePoolStats
+	if h.db != nil {
+		stat := h.db.Pool.Stat()
+		poolStats = &DatabasePoolStats{
+			MaxConns:          stat.MaxConns(),
+			TotalConns:        stat.TotalConns(),
+			AcquiredConns:     stat.AcquiredConns(),
+			IdleConns:         stat.IdleConns(),
+			ConstructingConns: stat.ConstructingConns(),
+			AcquireCount:      stat.AcquireCount(),
+			EmptyAcquireCount: stat.EmptyAcquireCount(),
+		}
 	}
 
 	// Audio stream status
@@ -262,10 +278,11 @@ func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		audioStreamStatus = h.audioStreamer.AudioStreamStatus()
 	}
 
+	uptime := int64(time.Since(h.startTime).Seconds())
 	resp := HealthResponse{
 		Status:         status,
 		Version:        h.version,
-		UptimeSeconds:  int64(time.Since(h.startTime).Seconds()),
+		UptimeSeconds:  &uptime,
 		Checks:         checks,
 		Database:       poolStats,
 		TrunkRecorders: trInstances,
@@ -281,7 +298,11 @@ func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.RUnlock()
 
+	writeHealth(w, httpStatus, resp)
+}
+
+func writeHealth(w http.ResponseWriter, status int, resp HealthResponse) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(httpStatus)
+	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(resp)
 }

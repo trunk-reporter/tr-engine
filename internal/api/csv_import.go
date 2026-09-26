@@ -7,13 +7,14 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/database"
 )
 
 // importSystemResolver is the subset of database.DB used to pick the target
 // system for a CSV import.
 type importSystemResolver interface {
-	GetSystemByID(ctx context.Context, systemID int) (*database.SystemAPI, error)
+	GetSystemByID(ctx context.Context, p *auth.Principal, systemID int) (*database.SystemAPI, error)
 	FindSystemsByName(ctx context.Context, name string) ([]database.AmbiguousMatch, error)
 }
 
@@ -27,7 +28,7 @@ type importSystemResolver interface {
 // returns ok=false.
 func resolveImportSystem(w http.ResponseWriter, r *http.Request, db importSystemResolver) (int, bool) {
 	if id, ok := QueryInt(r, "system_id"); ok && id > 0 {
-		if _, err := db.GetSystemByID(r.Context(), id); err != nil {
+		if _, err := db.GetSystemByID(r.Context(), PrincipalFrom(r), id); err != nil {
 			WriteError(w, http.StatusNotFound, fmt.Sprintf("system_id %d not found", id))
 			return 0, false
 		}

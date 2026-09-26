@@ -87,7 +87,7 @@ func (h *CallsHandler) ListCalls(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	calls, total, err := h.db.ListCalls(r.Context(), filter)
+	calls, total, err := h.db.ListCalls(r.Context(), PrincipalFrom(r), filter)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "failed to list calls")
 		return
@@ -101,7 +101,9 @@ func (h *CallsHandler) ListCalls(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ListActiveCalls returns currently active calls from the in-memory MQTT tracker.
+// ListActiveCalls returns currently active calls from the in-memory MQTT
+// tracker. The caller's restriction is applied to every call, whether or not
+// the request has filters of its own.
 func (h *CallsHandler) ListActiveCalls(w http.ResponseWriter, r *http.Request) {
 	if h.live == nil {
 		WriteJSON(w, http.StatusOK, map[string]any{
@@ -111,32 +113,32 @@ func (h *CallsHandler) ListActiveCalls(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	calls := h.live.ActiveCalls()
-
-	// Apply filters
+	// Apply the restriction and the filters
+	p := PrincipalFrom(r)
 	sysid, hasSysid := QueryString(r, "sysid")
 	tgid, hasTgid := QueryInt(r, "tgid")
 	emergency, hasEmergency := QueryBool(r, "emergency")
 	encrypted, hasEncrypted := QueryBool(r, "encrypted")
 
-	if hasSysid || hasTgid || hasEmergency || hasEncrypted {
-		filtered := make([]ActiveCallData, 0, len(calls))
-		for _, c := range calls {
-			if hasSysid && c.Sysid != sysid {
-				continue
-			}
-			if hasTgid && c.Tgid != tgid {
-				continue
-			}
-			if hasEmergency && c.Emergency != emergency {
-				continue
-			}
-			if hasEncrypted && c.Encrypted != encrypted {
-				continue
-			}
-			filtered = append(filtered, c)
+	all := h.live.ActiveCalls()
+	calls := make([]ActiveCallData, 0, len(all))
+	for _, c := range all {
+		if !p.AllowsTG(c.SystemID, c.Tgid) {
+			continue
 		}
-		calls = filtered
+		if hasSysid && c.Sysid != sysid {
+			continue
+		}
+		if hasTgid && c.Tgid != tgid {
+			continue
+		}
+		if hasEmergency && c.Emergency != emergency {
+			continue
+		}
+		if hasEncrypted && c.Encrypted != encrypted {
+			continue
+		}
+		calls = append(calls, c)
 	}
 
 	WriteJSON(w, http.StatusOK, map[string]any{
@@ -145,7 +147,8 @@ func (h *CallsHandler) ListActiveCalls(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetCall returns a single call by ID.
+// GetCall returns a single call by ID. A call outside the caller's
+// restriction is 404, like a missing one.
 func (h *CallsHandler) GetCall(w http.ResponseWriter, r *http.Request) {
 	id, err := PathInt64(r, "id")
 	if err != nil {
@@ -153,9 +156,9 @@ func (h *CallsHandler) GetCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	call, err := h.db.GetCallByID(r.Context(), id)
+	call, err := h.db.GetCallByID(r.Context(), PrincipalFrom(r), id)
 	if err != nil {
-		WriteError(w, http.StatusNotFound, "call not found")
+		writeLookupError(w, err, "call not found", "failed to get call")
 		return
 	}
 	if h.trAudioDir != "" && call.AudioURL == nil && call.CallFilename != "" {
@@ -165,17 +168,21 @@ func (h *CallsHandler) GetCall(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, call)
 }
 
-// GetCallAudio streams the audio file for a call.
+// GetCallAudio streams the audio file for a call. A call outside the
+// caller's restriction is 404, like a missing one.
 func (h *CallsHandler) GetCallAudio(w http.ResponseWriter, r *http.Request) {
 	id, err := PathInt64(r, "id")
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid call ID")
 		return
 	}
+	if !requireCallAccess(w, r, h.db, id, "audio not found") {
+		return
+	}
 
-	audioPath, callFilename, err := h.db.GetCallAudioPath(r.Context(), id)
+	audioPath, callFilename, err := h.db.GetCallAudioPath(r.Context(), PrincipalFrom(r), id)
 	if err != nil {
-		WriteError(w, http.StatusNotFound, "audio not found")
+		writeLookupError(w, err, "audio not found", "failed to look up audio")
 		return
 	}
 
@@ -241,22 +248,30 @@ func (h *CallsHandler) resolveAudioFile(audioPath, callFilename string) string {
 	return audio.ResolveFile(h.audioDir, h.trAudioDir, audioPath, callFilename)
 }
 
-// GetCallFrequencies returns frequency entries for a call.
+// GetCallFrequencies returns frequency entries for a call. A call outside the
+// caller's restriction is 404, like a missing one.
 func (h *CallsHandler) GetCallFrequencies(w http.ResponseWriter, r *http.Request) {
 	id, err := PathInt64(r, "id")
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid call ID")
 		return
 	}
-
-	freqs, err := h.db.GetCallFrequencies(r.Context(), id)
+	p, err := ParsePagination(r)
 	if err != nil {
-		WriteError(w, http.StatusNotFound, "call not found")
+		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidParameter, err.Error())
+		return
+	}
+	if !requireCallAccess(w, r, h.db, id, "call not found") {
+		return
+	}
+
+	freqs, err := h.db.GetCallFrequencies(r.Context(), PrincipalFrom(r), id)
+	if err != nil {
+		writeLookupError(w, err, "call not found", "failed to get call frequencies")
 		return
 	}
 
 	total := len(freqs)
-	p, _ := ParsePagination(r)
 	if p.Offset > 0 || p.Limit < total {
 		if p.Offset >= total {
 			freqs = []database.CallFrequencyAPI{}
@@ -277,22 +292,30 @@ func (h *CallsHandler) GetCallFrequencies(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// GetCallTransmissions returns transmission entries for a call.
+// GetCallTransmissions returns transmission entries for a call. A call
+// outside the caller's restriction is 404, like a missing one.
 func (h *CallsHandler) GetCallTransmissions(w http.ResponseWriter, r *http.Request) {
 	id, err := PathInt64(r, "id")
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid call ID")
 		return
 	}
-
-	txs, err := h.db.GetCallTransmissions(r.Context(), id)
+	p, err := ParsePagination(r)
 	if err != nil {
-		WriteError(w, http.StatusNotFound, "call not found")
+		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidParameter, err.Error())
+		return
+	}
+	if !requireCallAccess(w, r, h.db, id, "call not found") {
+		return
+	}
+
+	txs, err := h.db.GetCallTransmissions(r.Context(), PrincipalFrom(r), id)
+	if err != nil {
+		writeLookupError(w, err, "call not found", "failed to get call transmissions")
 		return
 	}
 
 	total := len(txs)
-	p, _ := ParsePagination(r)
 	if p.Offset > 0 || p.Limit < total {
 		if p.Offset >= total {
 			txs = []database.CallTransmissionAPI{}

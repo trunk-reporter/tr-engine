@@ -363,12 +363,12 @@
 ## Implementation Notes
 
 ### Common patterns across all pages (established by existing pages):
-- Include `auth.js?v=1` — patches fetch for JWT/token auth, retry on 401/403
+- Include `auth.js?v=3` first — adds the stored API key to same-origin `/api/` fetches, mints tickets for `EventSource`, prompts for a key only when needed (`trAuth.mediaUrl(url)` for `<audio>`, `await trAuth.ticketUrl(url)` for WebSocket)
 - Include `theme-config.js` — CSS variable definitions (var(--bg), --text, --tile-bg, etc.)
 - Include `theme-engine.js?v=2` at bottom — applies themes, persists user preferences
 - Use CSS custom variables for ALL colors — do NOT use hardcoded #fff
 - Chart must respond to window resize (ResizeObserver + resize() call)
-- Data fetched via: `fetch('/api/v1/...')` — auth.js handles token injection
+- Data fetched via: `fetch('/api/v1/...')` — auth.js adds the key; render API strings with `textContent`; use `Promise.allSettled` when mixing endpoints restricted keys may be denied
 - Meta card tags required: card-title, card-description, card-order
 
 ### API endpoints used across concepts:

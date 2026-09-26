@@ -65,15 +65,46 @@ On first run:
 - PostgreSQL starts and tr-engine auto-applies the database schema
 - Mosquitto starts on `127.0.0.1:1883` and requires the login you just created
 - tr-engine connects to both and serves the web UI/API on `127.0.0.1:8080`
-- With no auth variables set, tr-engine starts in open mode. See [Configuration](#configuration) before exposing it outside your machine.
+- tr-engine creates an **admin API key** and prints it once to its log (see [First run: your admin key](#first-run-your-admin-key)). Anonymous access is off: the API and web pages need a key until you decide otherwise.
 
 PostgreSQL is never published on the host, and every published port listens on `127.0.0.1` (this machine only) until you choose otherwise. See [Network exposure](#network-exposure).
 
-Verify it's running:
+Verify it's running (`/health` is public; it needs no key):
 
 ```bash
 curl http://localhost:8080/api/v1/health
 ```
+
+### First run: your admin key
+
+On its first start with an empty database, tr-engine creates a key named `bootstrap admin` and prints it once, in a box, to its log:
+
+```bash
+docker compose logs tr-engine | grep -A3 "no admin API key"
+```
+
+Copy the `tre_...` line into a password manager now; it is never shown again. Check it works:
+
+```bash
+curl -H "Authorization: Bearer tre_..." http://localhost:8080/api/v1/whoami
+```
+
+Then create a named key for each client and revoke the bootstrap key. The `tr-engine keys` command runs inside the container; `-T` lets you capture its output:
+
+```bash
+docker compose exec -T tr-engine tr-engine keys create --name "admin (me)" --scopes admin
+docker compose exec -T tr-engine tr-engine keys create --name "web browser" --scopes edit
+docker compose exec -T tr-engine tr-engine keys list
+docker compose exec -T tr-engine tr-engine keys revoke --prefix tre_xxxxxxxx   # the bootstrap key's prefix
+```
+
+Paste a key into the web UI when it asks ("API key…" in the menu). To let anyone who can reach tr-engine listen without a key:
+
+```bash
+docker compose exec -T tr-engine tr-engine access set --anonymous listen
+```
+
+If you lose every admin key, create a new one the same way: `docker compose exec -T tr-engine tr-engine keys create --name "admin" --scopes admin`. See [auth.md](./auth.md) for keys, scopes, anonymous access and restrictions.
 
 ## 4. Point trunk-recorder at the broker
 
@@ -145,7 +176,7 @@ Every published port is bound to `127.0.0.1` by default. Opening one to other ma
 
 | Variable | Port | Default | When to change it |
 |----------|------|---------|-------------------|
-| `HTTP_BIND_IP` | tr-engine `8080` | `127.0.0.1` | To use the web UI/API from other machines. Set `ADMIN_PASSWORD` first (see [Securing a public-facing instance](#securing-a-public-facing-instance)). |
+| `HTTP_BIND_IP` | tr-engine `8080` | `127.0.0.1` | To use the web UI/API from other machines. Decide on anonymous access first (see [Securing a public-facing instance](#securing-a-public-facing-instance)). |
 | `MQTT_BIND_IP` | Mosquitto `1883` | `127.0.0.1` | When trunk-recorder runs on another machine. Login is still required. |
 | `BIND_IP` | Caddy `80`/`443` | `127.0.0.1` | Only if you run the `caddy` service; see the [full stack guide](./docker-full-stack.md). |
 
@@ -166,7 +197,7 @@ Data persists across restarts and upgrades in directories next to your `docker-c
 To back up the database (use your `POSTGRES_USER`/`POSTGRES_DB` if you changed them):
 
 ```bash
-docker compose exec postgres pg_dump -U trengine trengine > backup.sql
+docker compose exec -T postgres pg_dump -U trengine trengine > backup.sql
 ```
 
 ## Configuration
@@ -183,12 +214,9 @@ curl -sO https://raw.githubusercontent.com/trunk-reporter/tr-engine/master/sampl
 Common settings:
 
 ```bash
-AUTH_TOKEN=my-secret            # optional shared token for token-mode deployments
-ADMIN_PASSWORD=change-me        # enables full auth with JWT login and API keys
 MQTT_TOPICS=trengine/#          # match your TR plugin's topic prefix (default: #)
-# WRITE_TOKEN=my-write-secret   # deprecated legacy write token
-# CORS_ORIGINS=https://example.com  # restrict CORS (empty = allow all)
 LOG_LEVEL=info                  # debug, info, warn, error
+# TRUSTED_PROXIES=loopback,private  # proxies whose X-Forwarded-For is believed
 # TR_DIR=/tr-config             # auto-discover from TR's config.json (see below)
 # WATCH_DIR=/tr-audio           # file watch mode (alternative to MQTT)
 ```
@@ -213,18 +241,21 @@ See [`sample.env`](https://github.com/trunk-reporter/tr-engine/blob/master/sampl
 
 Then restart: `docker compose up -d`
 
+Access control is not configured in `.env`: it lives in the database and is managed with API keys (`tr-engine keys`) and the anonymous access policy (`tr-engine access`). See [auth.md](./auth.md).
+
 ### Securing a public-facing instance
 
-If your tr-engine instance is accessible from the internet, use full auth:
+Before exposing tr-engine beyond your machine, decide what people **without** a key may do:
 
 ```bash
-ADMIN_PASSWORD=my-admin-password # enables login, JWT sessions, and API keys
-AUTH_TOKEN=my-public-read-token  # optional public read token returned by /auth-init
+docker compose exec -T tr-engine tr-engine access show
+# Nobody without a key (the default):
+docker compose exec -T tr-engine tr-engine access set --anonymous off
+# Public listening, except sensitive talkgroups:
+docker compose exec -T tr-engine tr-engine access set --anonymous listen --all-talkgroups --exclude-talkgroups 1:5001
 ```
 
-**Why this matters:** full auth gives browser users JWT sessions with roles and lets you create `tre_...` API keys for upload plugins or scripts. If `AUTH_TOKEN` is also set, it is treated as a public read token and returned by `GET /api/v1/auth-init`; write operations still require an editor/admin JWT, API key, or the deprecated `WRITE_TOKEN`.
-
-`WRITE_TOKEN` is still accepted for older deployments, but new installs should use `ADMIN_PASSWORD` plus API keys instead.
+Anonymous visitors can at most listen; editing needs an `edit` key and administration an `admin` key. Give every client its own key with the least access it needs, and never put an `edit` or `admin` key in a page other people load: a key that reaches other people's browsers is public. Use HTTPS (see the [full stack guide](./docker-full-stack.md)) and set `TRUSTED_PROXIES` if a reverse proxy sits in front. Details: [auth.md](./auth.md).
 
 ### TR auto-discovery (TR_DIR)
 
@@ -468,6 +499,8 @@ docker compose pull && docker compose up -d
 ```
 
 The database persists — your data is safe. If a release includes schema migrations, they'll be noted in the release notes. If you're updating `docker-compose.yml` itself from an older copy, read the next section first.
+
+**Upgrading from a version with `AUTH_TOKEN`, `WRITE_TOKEN` or `ADMIN_PASSWORD`** (before v0.10.0): back up the database and follow [migrating-auth.md](./migrating-auth.md). The first start converts what it can of the old settings into API keys and an anonymous access policy; tr-engine, tr-dashboard and any bind-mounted `web/` must be upgraded together.
 
 ### Security defaults changed
 

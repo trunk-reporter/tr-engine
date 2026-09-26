@@ -30,6 +30,38 @@ var talkgroupSortFields = map[string]string{
 	"unit_count": "t.unit_count_30d",
 }
 
+// resolveTalkgroup parses the {id} path parameter, a composite
+// "system_id:tgid" or a plain tgid, into a talkgroup the caller may see. A
+// plain tgid resolves among the caller's allowed talkgroups only, so a 409
+// lists only systems whose talkgroup the caller may see, and a talkgroup
+// outside the caller's restriction is 404 like a missing one (§6.3). On
+// failure it writes the response and returns ok=false.
+func (h *TalkgroupsHandler) resolveTalkgroup(w http.ResponseWriter, r *http.Request) (CompositeID, bool) {
+	cid, err := ParseCompositeID(r, "id")
+	if err != nil {
+		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidParameter, err.Error())
+		return cid, false
+	}
+	p := PrincipalFrom(r)
+	if cid.IsPlain {
+		matches, err := h.db.FindTalkgroupSystems(r.Context(), p, cid.EntityID)
+		if err != nil || len(matches) == 0 {
+			WriteError(w, http.StatusNotFound, "talkgroup not found")
+			return cid, false
+		}
+		if len(matches) > 1 {
+			WriteAmbiguous(w, cid.EntityID, matches)
+			return cid, false
+		}
+		cid.SystemID = matches[0].SystemID
+	}
+	if !p.AllowsTG(cid.SystemID, cid.EntityID) {
+		WriteError(w, http.StatusNotFound, "talkgroup not found")
+		return cid, false
+	}
+	return cid, true
+}
+
 // ListTalkgroups returns talkgroups with embedded stats.
 func (h *TalkgroupsHandler) ListTalkgroups(w http.ResponseWriter, r *http.Request) {
 	p, err := ParsePagination(r)
@@ -58,7 +90,7 @@ func (h *TalkgroupsHandler) ListTalkgroups(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	talkgroups, total, err := h.db.ListTalkgroups(r.Context(), filter)
+	talkgroups, total, err := h.db.ListTalkgroups(r.Context(), PrincipalFrom(r), filter)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "failed to list talkgroups")
 		return
@@ -73,28 +105,14 @@ func (h *TalkgroupsHandler) ListTalkgroups(w http.ResponseWriter, r *http.Reques
 
 // GetTalkgroup returns a single talkgroup by composite or plain ID.
 func (h *TalkgroupsHandler) GetTalkgroup(w http.ResponseWriter, r *http.Request) {
-	cid, err := ParseCompositeID(r, "id")
-	if err != nil {
-		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidParameter, err.Error())
+	cid, ok := h.resolveTalkgroup(w, r)
+	if !ok {
 		return
 	}
 
-	if cid.IsPlain {
-		matches, err := h.db.FindTalkgroupSystems(r.Context(), cid.EntityID)
-		if err != nil || len(matches) == 0 {
-			WriteError(w, http.StatusNotFound, "talkgroup not found")
-			return
-		}
-		if len(matches) > 1 {
-			WriteAmbiguous(w, cid.EntityID, matches)
-			return
-		}
-		cid.SystemID = matches[0].SystemID
-	}
-
-	tg, err := h.db.GetTalkgroupByComposite(r.Context(), cid.SystemID, cid.EntityID)
+	tg, err := h.db.GetTalkgroupByComposite(r.Context(), PrincipalFrom(r), cid.SystemID, cid.EntityID)
 	if err != nil {
-		WriteError(w, http.StatusNotFound, "talkgroup not found")
+		writeLookupError(w, err, "talkgroup not found", "failed to get talkgroup")
 		return
 	}
 	WriteJSON(w, http.StatusOK, tg)
@@ -102,23 +120,9 @@ func (h *TalkgroupsHandler) GetTalkgroup(w http.ResponseWriter, r *http.Request)
 
 // UpdateTalkgroup patches talkgroup metadata.
 func (h *TalkgroupsHandler) UpdateTalkgroup(w http.ResponseWriter, r *http.Request) {
-	cid, err := ParseCompositeID(r, "id")
-	if err != nil {
-		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidParameter, err.Error())
+	cid, ok := h.resolveTalkgroup(w, r)
+	if !ok {
 		return
-	}
-
-	if cid.IsPlain {
-		matches, err := h.db.FindTalkgroupSystems(r.Context(), cid.EntityID)
-		if err != nil || len(matches) == 0 {
-			WriteError(w, http.StatusNotFound, "talkgroup not found")
-			return
-		}
-		if len(matches) > 1 {
-			WriteAmbiguous(w, cid.EntityID, matches)
-			return
-		}
-		cid.SystemID = matches[0].SystemID
 	}
 
 	var patch struct {
@@ -143,7 +147,7 @@ func (h *TalkgroupsHandler) UpdateTalkgroup(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	tg, err := h.db.GetTalkgroupByComposite(r.Context(), cid.SystemID, cid.EntityID)
+	tg, err := h.db.GetTalkgroupByComposite(r.Context(), PrincipalFrom(r), cid.SystemID, cid.EntityID)
 	if err != nil {
 		WriteError(w, http.StatusNotFound, "talkgroup not found")
 		return
@@ -178,23 +182,9 @@ func (h *TalkgroupsHandler) UpdateTalkgroup(w http.ResponseWriter, r *http.Reque
 
 // ListTalkgroupCalls returns calls for a specific talkgroup.
 func (h *TalkgroupsHandler) ListTalkgroupCalls(w http.ResponseWriter, r *http.Request) {
-	cid, err := ParseCompositeID(r, "id")
-	if err != nil {
-		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidParameter, err.Error())
+	cid, ok := h.resolveTalkgroup(w, r)
+	if !ok {
 		return
-	}
-
-	if cid.IsPlain {
-		matches, err := h.db.FindTalkgroupSystems(r.Context(), cid.EntityID)
-		if err != nil || len(matches) == 0 {
-			WriteError(w, http.StatusNotFound, "talkgroup not found")
-			return
-		}
-		if len(matches) > 1 {
-			WriteAmbiguous(w, cid.EntityID, matches)
-			return
-		}
-		cid.SystemID = matches[0].SystemID
 	}
 
 	p, err := ParsePagination(r)
@@ -219,7 +209,7 @@ func (h *TalkgroupsHandler) ListTalkgroupCalls(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	calls, total, err := h.db.ListCalls(r.Context(), filter)
+	calls, total, err := h.db.ListCalls(r.Context(), PrincipalFrom(r), filter)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "failed to list calls")
 		return
@@ -234,23 +224,9 @@ func (h *TalkgroupsHandler) ListTalkgroupCalls(w http.ResponseWriter, r *http.Re
 
 // ListTalkgroupUnits returns units affiliated with a talkgroup.
 func (h *TalkgroupsHandler) ListTalkgroupUnits(w http.ResponseWriter, r *http.Request) {
-	cid, err := ParseCompositeID(r, "id")
-	if err != nil {
-		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidParameter, err.Error())
+	cid, ok := h.resolveTalkgroup(w, r)
+	if !ok {
 		return
-	}
-
-	if cid.IsPlain {
-		matches, err := h.db.FindTalkgroupSystems(r.Context(), cid.EntityID)
-		if err != nil || len(matches) == 0 {
-			WriteError(w, http.StatusNotFound, "talkgroup not found")
-			return
-		}
-		if len(matches) > 1 {
-			WriteAmbiguous(w, cid.EntityID, matches)
-			return
-		}
-		cid.SystemID = matches[0].SystemID
 	}
 
 	p, err := ParsePagination(r)
@@ -324,7 +300,7 @@ func (h *TalkgroupsHandler) ListTalkgroupDirectory(w http.ResponseWriter, r *htt
 		filter.Mode = &v
 	}
 
-	entries, total, err := h.db.SearchTalkgroupDirectory(r.Context(), filter)
+	entries, total, err := h.db.SearchTalkgroupDirectory(r.Context(), PrincipalFrom(r), filter)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "failed to search talkgroup directory")
 		return

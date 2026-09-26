@@ -7,7 +7,7 @@
   <meta name="card-description" content="Browse and export talkgroup IDs and tags to CSV" />
   <title>Talkgroup Export</title>
 
-  <script src="auth.js?v=1"></script>
+  <script src="auth.js?v=3"></script>
   <script src="theme-config.js"></script>
 
   <style>
@@ -692,7 +692,7 @@
         <td class="unit-id-cell">${escHtml(tg.tgid ?? '')}</td>
         <td class="tag-cell">${tag !== '' ? escHtml(tag) : '<span class="empty-tag">—</span>'}</td>
         <td class="system-cell">${escHtml(getSystemName(tg) || '—')}</td>
-        <td class="last-seen-cell">${lastSeen}</td>`;
+        <td class="last-seen-cell">${escHtml(lastSeen)}</td>`;
       tbody.appendChild(row);
     });
 
@@ -862,11 +862,7 @@
   }
 
   function escHtml(s) {
-    return String(s)
-      .replace(/&/g,'&amp;')
-      .replace(/</g,'&lt;')
-      .replace(/>/g,'&gt;')
-      .replace(/"/g,'&quot;');
+    return trAuth.escapeHTML(s);
   }
 
   function showToast(msg) {

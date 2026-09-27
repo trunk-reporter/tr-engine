@@ -265,6 +265,68 @@ func drain(t *testing.T, s *Scanner) {
 	t.Fatal("scanner did not catch up")
 }
 
+// waitForClusterXminPast waits until the xmin of a fresh snapshot
+// (pg_snapshot_xmin(pg_current_snapshot()), the oldest xid of a transaction
+// still running anywhere in the cluster) is past xid, i.e. until every
+// transaction that got its xid no later than xid has ended. The scanner settles a row
+// inside the in-doubt window only once its writer precedes that xmin, and it
+// is cluster-wide on purpose: a write transaction left open on any database,
+// such as another test package's running in parallel on the same server,
+// holds the scanner back too. A test that expects rows to be scanned after its
+// own blocking transaction ends waits here first, so it does not depend on
+// what other sessions are doing at that moment.
+func waitForClusterXminPast(t *testing.T, db *database.DB, xid int64, timeout time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	start := time.Now()
+	for {
+		var xmin int64
+		if err := db.Pool.QueryRow(ctx, `SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint`).Scan(&xmin); err != nil {
+			t.Fatalf("read cluster xmin: %v", err)
+		}
+		if xmin > xid {
+			if waited := time.Since(start); waited > 50*time.Millisecond {
+				t.Logf("waited %v for other sessions' transactions to pass xid %d", waited.Round(time.Millisecond), xid)
+			}
+			return
+		}
+		if time.Since(start) > timeout {
+			t.Fatalf("cluster xmin still %d after %v, not past xid %d of the committed rows, so the scanner "+
+				"(correctly) still treats them as in doubt. Another session on this PostgreSQL server, probably "+
+				"another package's test, has held a write transaction open since before they were written. "+
+				"Oldest open transactions: %s", xmin, timeout, xid, openTransactions(db))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// openTransactions describes the oldest transactions holding an xid, for
+// waitForClusterXminPast's failure message.
+func openTransactions(db *database.DB) string {
+	rows, err := db.Pool.Query(context.Background(), `
+		SELECT line FROM (
+			SELECT age(backend_xid) AS age,
+				format('pid %s db %s app %L state %s xid %s open %ss: %L', pid, datname, application_name, state,
+					backend_xid, round(extract(epoch FROM now() - xact_start)::numeric, 1),
+					regexp_replace(left(query, 160), '\s+', ' ', 'g')) AS line
+			FROM pg_stat_activity WHERE backend_xid IS NOT NULL
+			UNION ALL
+			SELECT age(transaction), format('prepared transaction %L db %s xid %s since %s', gid, database, transaction, prepared)
+			FROM pg_prepared_xacts
+		) x ORDER BY age DESC LIMIT 5`)
+	if err != nil {
+		return fmt.Sprintf("(query failed: %v)", err)
+	}
+	list, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return fmt.Sprintf("(query failed: %v)", err)
+	}
+	if len(list) == 0 {
+		return "none now"
+	}
+	return fmt.Sprintf("%q", list)
+}
+
 // findSuggestion looks a row up by its natural key, bypassing the review gate
 // (like GET /unit-tag-suggestions/{id}).
 func findSuggestion(t *testing.T, db *database.DB, systemID, unitID int, key string) *database.UnitTagSuggestionAPI {
@@ -898,20 +960,22 @@ func TestIntegrationUnitTagSuggestions(t *testing.T) {
 		startA := f.base.Add(-5 * time.Hour)
 		startB := startA.Add(time.Minute)
 		cA, cB := bareCall(1012, startA), bareCall(1013, startB)
-		// Both rows are past the settle delay but inside the in-doubt window.
+		// Both rows are past the settle delay but inside the in-doubt window,
+		// so whether they are settled depends on the cluster xmin.
 		const insert = `INSERT INTO transcriptions (call_id, call_start_time, text, source, is_primary, created_at)
-			VALUES ($1, $2, $3, 'auto', true, now() - interval '5 minutes') RETURNING id`
+			VALUES ($1, $2, $3, 'auto', true, now() - interval '5 minutes')
+			RETURNING id, pg_current_xact_id()::text::bigint`
 
 		txA, err := db.Pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { txA.Rollback(context.Background()) })
-		var idA, idB int64
-		if err := txA.QueryRow(ctx, insert, cA, startA, "County, Tanker 9 on scene.").Scan(&idA); err != nil {
+		var idA, idB, xidA, xidB int64
+		if err := txA.QueryRow(ctx, insert, cA, startA, "County, Tanker 9 on scene.").Scan(&idA, &xidA); err != nil {
 			t.Fatal(err)
 		}
-		if err := db.Pool.QueryRow(ctx, insert, cB, startB, "County, Tanker 10 on scene.").Scan(&idB); err != nil {
+		if err := db.Pool.QueryRow(ctx, insert, cB, startB, "County, Tanker 10 on scene.").Scan(&idB, &xidB); err != nil {
 			t.Fatal(err)
 		}
 		if idB <= idA {
@@ -929,6 +993,10 @@ func TestIntegrationUnitTagSuggestions(t *testing.T) {
 		if err := txA.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
+		// Other sessions on the server (e.g. test packages running in
+		// parallel) may still hold transactions older than these rows, which
+		// rightly keeps them in doubt; wait those out.
+		waitForClusterXminPast(t, db, max(xidA, xidB), 10*time.Second)
 		drain(t, s)
 		if findSuggestion(t, db, 1, 1012, "TANKER 9") == nil || findSuggestion(t, db, 1, 1013, "TANKER 10") == nil {
 			t.Error("rows not scanned once the open transaction committed")

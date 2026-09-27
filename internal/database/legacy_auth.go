@@ -27,6 +27,11 @@ const (
 	// removedUserAccountsLoggedFixup marks that RemovedUserAccountsSummary
 	// has handed out its one-time log line.
 	removedUserAccountsLoggedFixup = "removed-user-accounts-logged"
+	// SchemaCreatedFixup is inserted by schema.sql itself: the database's
+	// schema was created by a version with API-key auth, by whichever
+	// process ran it (the server, a CLI subcommand, psql), so the legacy
+	// import has nothing to carry over. Migrations never write it.
+	SchemaCreatedFixup = "schema-created-with-api-key-auth"
 )
 
 // Names of the keys the engine creates itself.
@@ -48,7 +53,7 @@ const (
 
 // Why a set legacy variable was not imported as a key (LegacySkipped.Reason).
 const (
-	SkipFreshDatabase     = "fresh_database"                // the schema was created by this process
+	SkipFreshDatabase     = "fresh_database"                // the schema was created by this version (SchemaCreatedFixup)
 	SkipAuthDisabled      = "auth_disabled"                 // AUTH_ENABLED=false cleared it
 	SkipPublicToken       = "public_token"                  // full-mode AUTH_TOKEN: /auth-init handed it out
 	SkipPublishedAsPublic = "published_as_public_token"     // full-mode WRITE_TOKEN equal to AUTH_TOKEN
@@ -68,7 +73,8 @@ type LegacyAuthInput struct {
 	// HTTP uploads were in use.
 	UploadInstanceID string
 	// FreshDatabase: InitSchema created the schema in this process, so there
-	// is nothing to carry over.
+	// is nothing to carry over. ImportLegacyAuth also treats a database
+	// carrying SchemaCreatedFixup as fresh, whichever process created it.
 	FreshDatabase bool
 }
 
@@ -240,7 +246,10 @@ func (in LegacyAuthInput) variablesSet() []string {
 // database (§11.2). It claims LegacyAuthImportFixup and, in one transaction:
 //
 //  1. derives the old mode (deriveLegacyConfig);
-//  2. on a fresh database imports nothing and leaves anonymous access off;
+//  2. on a fresh database (FreshDatabase, or schema.sql's
+//     SchemaCreatedFixup marker: the schema was created by this version,
+//     not upgraded from an old one) imports nothing and leaves anonymous
+//     access off;
 //  3. imports WRITE_TOKEN as "legacy WRITE_TOKEN" with ["admin","upload"],
 //     unless the old mode was full and it equals AUTH_TOKEN (then it was
 //     public, and nothing is imported);
@@ -278,6 +287,16 @@ func (db *DB) ImportLegacyAuth(ctx context.Context, in LegacyAuthInput) (LegacyA
 		return db.recordedLegacyAuthImport(ctx)
 	}
 
+	// Fresh is a property of the database, not of which process created
+	// its schema: `tr-engine import`/`keys`/`access`, psql -f schema.sql,
+	// or a server that stopped before this import committed all create it
+	// with the marker.
+	if !in.FreshDatabase {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM data_fixups WHERE name = $1)`,
+			SchemaCreatedFixup).Scan(&in.FreshDatabase); err != nil {
+			return LegacyAuthResult{}, fmt.Errorf("check schema origin: %w", err)
+		}
+	}
 	d, err := importLegacyAuth(ctx, tx, in)
 	if err != nil {
 		return LegacyAuthResult{}, err
@@ -300,6 +319,18 @@ func (db *DB) ImportLegacyAuth(ctx context.Context, in LegacyAuthInput) (LegacyA
 		return LegacyAuthResult{}, err
 	}
 	return LegacyAuthResult{Ran: true, ImportedAt: appliedAt, Detail: d, WeakKeys: weak}, nil
+}
+
+// LegacyAuthImportPending reports whether the next server start will run
+// the one-time legacy import on an upgraded database: the import hasn't
+// run, and schema.sql didn't create the database (SchemaCreatedFixup), so
+// it may still import AUTH_TOKEN/WRITE_TOKEN as keys and set the anonymous
+// policy.
+func (db *DB) LegacyAuthImportPending(ctx context.Context) (bool, error) {
+	var done bool
+	err := db.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM data_fixups WHERE name IN ($1, $2))`,
+		LegacyAuthImportFixup, SchemaCreatedFixup).Scan(&done)
+	return !done, err
 }
 
 func (db *DB) recordedLegacyAuthImport(ctx context.Context) (LegacyAuthResult, error) {

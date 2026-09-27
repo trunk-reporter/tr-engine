@@ -125,7 +125,7 @@ Anonymous access is off on a new install, so everything except `/api/v1/health` 
 # Check logs — look for "mqtt connected" and "subscribing"
 docker compose logs tr-engine --tail 30
 
-# Health check (public) — database and mqtt should both show "connected"
+# Health check (public) — database and mqtt should both show "ok"
 curl http://localhost:8080/api/v1/health
 
 # Watch live events (Ctrl-C to stop); use the admin key from the log

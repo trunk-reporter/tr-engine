@@ -91,9 +91,11 @@ SELECT EXISTS (SELECT FROM pg_tables
   │
   ├── true  → no-op (schema already loaded)
   └── false → Exec(embedded schema.sql)
-               Creates all 20+ tables, indexes, triggers,
+               Creates all 27 tables, indexes, triggers,
                helper functions, initial partitions
 ```
+
+`main` calls `db.ApplySchemaIfEmpty()`, the same check that also reports whether this process applied the schema. `schema.sql` itself inserts the `data_fixups` row `schema-created-with-api-key-auth`, whichever process runs it (the server, a `tr-engine` subcommand, `psql -f`), and the legacy auth import treats a database carrying it as fresh and imports nothing; databases upgraded from older versions never get it. It and `Migrate` hold a session advisory lock (`schemaLockKey` in `schema.go`), so two engines, or a `tr-engine keys ...` command run while the server starts, never set up the schema at the same time: the second one logs "another tr-engine process is setting up the database schema; waiting for it" and then finds the work done.
 
 ### Migrate
 
@@ -106,7 +108,7 @@ for each migration in migrations slice:
        └── on failure → return MigrationError with remaining SQL
 ```
 
-Migrations handle post-`schema.sql` changes (new columns, replaced indexes). Fatal on failure since queries depend on the schema being current.
+Migrations handle post-`schema.sql` changes (new columns, replaced indexes). Fatal on failure since queries depend on the schema being current. The auth migrations read and drop a `users` table only if it is old tr-engine's (`trEngineUsersSQL`: its `trg_users_updated_at` trigger or viewer/editor role CHECK); another application's `users` table in a shared database is left alone.
 
 ### Partition Maintenance
 
@@ -121,7 +123,7 @@ Run by `Pipeline.maintenanceLoop()` — once immediately on startup, then every 
 7. Clean orphaned call_groups
 8. Expire stale in-memory active calls (>1 hour old)
 
-On-demand partition creation: if an INSERT fails with "no partition found", `ensurePartitionsFor()` creates the needed partition and the caller retries.
+On-demand partition creation: if an INSERT fails with "no partition found", `ensurePartitionsFor()` creates the needed partition and the caller retries, for MQTT, file-watch and upload ingest alike. It only does this for months from 12 before to 3 after the current month (partitions are permanent, so a wrong clock or a crafted upload must not create them for arbitrary months); a call outside that window is dropped with a WARN, and an upload gets `400 invalid_body`. The `WATCH_DIR` startup backfill still creates the partitions for its whole date range itself (see §7).
 
 ## 4. Audio Storage
 
@@ -426,11 +428,18 @@ POST /api/v1/call-upload
   │     └── "audio" field → OpenMHz format
   │           ParseOpenMHzFields(form) → CallUploadData
   │
+  ├── validateUploadMeta → 400 invalid_body for a short name with '/', '\',
+  │     '..' or control characters or over 128 bytes, a talkgroup <= 0, a
+  │     missing/non-positive start time, or a start time > 10 min ahead
+  │
   └── pipeline.ProcessUploadedCall(ctx, data)
         ├── identity.Resolve(uploadInstanceID, sysName)
         ├── Dedup check: FindCallByTgidStartTime
-        ├── InsertCall (status=COMPLETED)
-        ├── Save audio file (store.Save)
+        ├── InsertCall (status=COMPLETED); a month with no partition outside
+        │     the on-demand window (12 back to 3 ahead) → 400 invalid_body
+        ├── Save audio file (store.Save) as upload/<system_id>/<YYYY-MM-DD>/
+        │     <call_id>.<ext> (m4a/mp3/wav/ogg/bin from audioType or the file
+        │     name; never overwrites: an existing file gets a random suffix)
         ├── Assign call_group
         ├── Enqueue transcription
         └── PublishEvent("call_end")
@@ -440,7 +449,7 @@ POST /api/v1/call-upload
 
 ### Middleware Stack
 
-`internal/api/server.go:NewServer()` — exact order as wired:
+`internal/api/server.go:buildRouter()` — exact order as wired. The code is split across `middleware.go` (RequestID, CORS, Recoverer, Logger, APIHeaders, MaxBodySize, ResponseTimeout), `pipeline.go` (Match, Resolve, Authorize, Audit, UploadAuth), `authn.go` (key and ticket resolution, rate limits), `keycache.go` (key cache, limiter sets) and `streamauth.go` (re-checks of open streams, see [SSE Handler](#sse-handler)).
 
 Router construction lives in `buildRouter(opts) *chi.Mux`. Every route is registered flat (no `r.Route(...)` sub-routers), so `chi.Walk` and `Mux.Find` agree on pattern strings, and every route has an entry in the policy table in `internal/api/policy.go`. HEAD requests are served by the GET handler (`middleware.GetHead`).
 
@@ -449,8 +458,12 @@ Root middleware, in order:
   1. RequestID   — keep a client X-Request-ID only if ≤64 chars of [A-Za-z0-9._-]
   2. CORS        — Access-Control-Allow-Origin: * on every response, never
                    Allow-Credentials; OPTIONS → 204 here, before auth or routing
+     GetHead     — HEAD requests are served by the GET handler
   3. Recoverer   — catch panics → JSON 500
-     Logger      — structured request logging (zerolog/hlog)
+     Logger      — one access line (zerolog/hlog) for every request, refusals
+                   included; a WebSocket upgrade is logged as 101 when the
+                   socket closes
+     APIHeaders  — Cache-Control: no-store and Vary: Authorization on /api/v1
   4. Match       — path = URL.RawPath or URL.Path; pattern = root.Find(fresh
                    route context, method, path), HEAD falling back to GET
                    ├── no pattern → chi answers 404/405, no handler runs
@@ -465,13 +478,15 @@ Root middleware, in order:
                    lacks scope: 403 insufficient_scope
                    restricted and Restricted == Deny: 403 restricted_credential
   7. Audit       — key principals, non-GET/HEAD/OPTIONS, except call-upload and
-                   tickets; records the status the client received
+                   tickets; records the status the client received (runs after
+                   Authorize, so auth-layer refusals are only in the access
+                   log); path without query, capped at 1024 bytes
   8. Route-group middleware: MaxBodySize (10 MB API, 50 MB upload),
      [InstrumentHandler if metrics enabled], upload middleware,
      ResponseTimeout (http.TimeoutHandler; skips SSE + audio) → handler
 ```
 
-Rate limiting (step 5): no credential → per-IP limiter (`RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`, IP from `TrustedProxies.ClientIP`). A bearer found in the positive key cache → the key's own `rate_limit_rps` limiter if set, otherwise none (legacy keys: per-IP). A bearer not in the positive cache → take a per-IP token first (429 without touching the database if none), then the negative cache, then the database (2 s timeout; errors → 503, never cached). Tickets: MAC and expiry checked without the database, key resolved through the cache, per-IP limited.
+Rate limiting (step 5): no credential → per-IP limiter (this includes uploads whose key is in the multipart form: Resolve sees no header credential and charges the IP; UploadAuth then resolves the form key, charging a second IP token on a cache miss) (`RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`, IP from `TrustedProxies.ClientIP`). A bearer found in the positive key cache → the key's own `rate_limit_rps` limiter if set, otherwise none (legacy keys: per-IP). A bearer not in the positive cache → take a per-IP token first (429 without touching the database if none), then the negative cache, then the database (2 s timeout; errors → 503, never cached). Tickets: MAC and expiry checked without the database, key resolved through the cache, per-IP limited.
 
 Key cache: separate bounded LRUs for positive and negative results (so guesses can't evict valid keys), 30 s TTL, keyed by SHA-256 of the presented value, positive entries also indexed by key ID for tickets. `expires_at`/`revoked_at` are re-checked on every hit. API PATCH/DELETE invalidates the key's entries; an auth-generation bump clears both caches. `last_used_at` is written at most once a minute per key, asynchronously.
 
@@ -509,6 +524,7 @@ http.Server{
     ReadTimeout:  cfg.ReadTimeout,    // default 5s
     IdleTimeout:  cfg.IdleTimeout,    // default 120s
     WriteTimeout: 0,                  // disabled for SSE
+    MaxHeaderBytes: 64 << 10,         // request line + headers; larger → 431
 }
 ```
 
@@ -525,8 +541,9 @@ EventBus
   ├── subscribers: map[uint64]subscriber
   │     each has: chan SSEEvent (buffered 64), EventFilter
   ├── ring buffer: []SSEEvent (4096 slots, ~60s at high rate)
-  ├── seq: atomic counter for unique event IDs
-  └── separate RWMutex for subscribers vs ring buffer
+  ├── seq: publish sequence number (orders the ring, dedupes replay vs live)
+  ├── idCipher: per-process AES key that turns seq into the public event ID
+  └── one mutex: numbering, the ring and distribution happen under it
 ```
 
 ### Publish
@@ -535,27 +552,35 @@ EventBus
 EventBus.Publish(EventData)
   │
   ├── JSON marshal payload
-  ├── Generate ID: "{unix_millis}-{seq}"
-  ├── Write to ring buffer (ringMu write lock)
-  │     ring[ringHead] = event
-  │     ringHead = (ringHead + 1) % ringSize
-  │
-  └── Distribute to subscribers (mu read lock)
-        for each subscriber:
-          matchesFilter(event, sub.filter)?
-            ├── yes → non-blocking send to sub.ch
-            │         (drop if subscriber is slow)
-            └── no  → skip
+  └── under eb.mu (publishLocked):
+        ├── seq++; ID = "{unix_millis}-{32 hex}": seq encrypted with idCipher,
+        │     so IDs are opaque, unique per process and not sequential
+        │     (a restricted subscriber can't count the events it wasn't shown)
+        ├── Write to ring buffer
+        │     ring[ringHead] = event   (evicting the oldest once full)
+        │     ringHead = (ringHead + 1) % ringSize
+        └── Distribute to subscribers
+              for each subscriber:
+                matchesFilter(event, sub.filter, sub.principal)?
+                  ├── yes → non-blocking send to sub.ch
+                  │         (drop if subscriber is slow)
+                  └── no  → skip
+  then, outside the lock: WARN about ring evictions (at most once a minute)
+  and slow-subscriber drops (one line per publish)
 ```
 
 ### Subscribe
 
 ```
-EventBus.Subscribe(filter)
-  → returns (<-chan SSEEvent, cancelFn)
-  channel buffered to 64 events
+EventBus.SubscribeSince(lastEventID, filter, principal)
+  → returns (replay []SSEEvent, <-chan SSEEvent, cancelFn)
+  channel buffered to max(64, len(replay)+64) events
   cancel removes subscriber and closes channel
 ```
+
+`LiveDataSource` (the interface `internal/api` sees) exposes only `SubscribeSince`; the old `Subscribe`/`ReplaySince` pair is gone (see [Replay](#replay-last-event-id)). `principal` is an `*atomic.Pointer[auth.Principal]` that the stream's `streamGuard` swaps when the credential changes. The live-audio side works the same way: `AudioStreamer.SubscribeAudio(filter, principal)` → `AudioBus.Subscribe(filter, principal)`.
+
+After a system merge, `EventBus.RewriteSystemID(old, new)` relabels buffered events of the merged-away system, so a replay checks them against the (rewritten) restrictions under the ID their data now has.
 
 ### Filter Logic
 
@@ -612,18 +637,24 @@ This replaces replay-then-subscribe, which lost events published in between. The
 4. Loop:
    ├── event from channel → write SSE frame
    ├── 15s ticker → write ": keepalive" comment
-   ├── 60s ticker, or auth generation changed → re-resolve the principal
+   ├── 60s ticker, auth generation changed, or the key reached expires_at
+   │     → re-resolve the principal (streamGuard, internal/api/streamauth.go)
    │     (key re-read by ID bypassing the cache; ticket: key + narrowing + expiry;
    │      anonymous: current policy)
    │     ├── still has listen → swap the subscriber's principal atomically
-   │     └── lost listen, or ticket expired →
+   │     ├── database unreachable → keep the stream as it is, retry next time
+   │     └── lost listen, key expired/revoked, or ticket expired →
    │           "event: auth" / data {"code": invalid_key|key_required|
    │           insufficient_scope|ticket_expired}, then end the response
+   │           (a ticket whose narrowing names a merged-away system →
+   │            ticket_expired: a new ticket fixes it)
    └── client disconnect → cancel subscription
 Headers: Content-Type: text/event-stream, X-Accel-Buffering: no
 ```
 
-`GET /api/v1/audio/live` (WebSocket) does the same re-check. Its principal is stored on the audio subscriber separately from the client-updatable `AudioFilter`; for a restricted principal `matchesAudioFilter` also requires `AllowsTG(frame.SystemID, frame.TGID)`. On auth loss it closes with code 4401 (`invalid_key`, `key_required`, `ticket_expired`) or 4403 (`insufficient_scope`), the code string as the reason. CLI changes (another process) reach open connections through the 60 s re-check, which reads the database directly.
+`GET /api/v1/audio/live` (WebSocket) does the same re-check. Its principal is stored on the audio subscriber separately from the client-updatable `AudioFilter`; for a restricted principal `matchesAudioFilter` also requires `AllowsTG(frame.SystemID, frame.TGID)`. On auth loss it closes with code 4401 (`invalid_key`, `key_required`, `ticket_expired`) or 4403 (`insufficient_scope`), the code string as the reason. CLI changes (another process) reach open connections through the 60 s re-check, which reads the database directly. The WebSocket also sends a ping with each 15 s keepalive (whose `active_streams` counts only allowed talkgroups for a restricted principal), closes a peer it hasn't heard from (pongs included) for 60 s, and closes with 1009 on a client message over 64 KiB.
+
+Live audio relies on correct system attribution of simplestream packets. The audio router maps a sender IP to a TR instance (`STREAM_SOURCE_MAP`, or worked out again for every chunk from the instances that have the packet's short name: real TR instances before the `WATCH_INSTANCE_ID` identity, before the `UPLOAD_INSTANCE_ID` identity, leaving out instances the source map gives to other senders); when the preferred instances use the short name for different systems, including when such an instance appears after the sender was attributed, it drops the sender's audio with a WARN instead of guessing.
 
 ## 11. Shutdown
 

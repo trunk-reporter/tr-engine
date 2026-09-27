@@ -458,10 +458,17 @@ func (a *authenticator) resolveTicket(ctx context.Context, token string, fresh b
 
 // mergedAway reports whether any of ids was ever merged into another
 // system. Answers are cached for settingsCacheTTL and dropped when the auth
-// generation moves (every merge bumps it).
+// generation moves (every merge bumps it). Callers pass the systems of a
+// validated ticket narrowing (at most auth.MaxTicketEntries); a longer list
+// is answered but never cached, so cache entries stay small.
 func (a *authenticator) mergedAway(ctx context.Context, ids []int) (bool, error) {
 	if len(ids) == 0 {
 		return false, nil
+	}
+	if len(ids) > auth.MaxTicketEntries {
+		lctx, cancel := context.WithTimeout(ctx, credentialLookupTimeout)
+		defer cancel()
+		return a.store.AnyMergedAwaySystem(lctx, ids)
 	}
 	parts := make([]string, len(ids))
 	for i, id := range ids {

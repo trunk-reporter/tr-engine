@@ -236,14 +236,14 @@ func (a *authenticator) recordAudit(r *http.Request, p *auth.Principal, status i
 		KeyName:   p.KeyName,
 		Actor:     &actor,
 		Method:    r.Method,
-		Path:      r.URL.EscapedPath(), // as requested, without the query
+		Path:      r.URL.EscapedPath(), // as requested, without the query; InsertAuditLog caps it (once)
 		Status:    status,
 		RequestID: requestID,
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
 	defer cancel()
 	if err := a.store.InsertAuditLog(ctx, e); err != nil {
-		hlog.FromRequest(r).Error().Err(err).Str("path", e.Path).Int("key_id", e.KeyID).
+		hlog.FromRequest(r).Error().Err(err).Str("path", database.TruncateAuditPath(e.Path)).Int("key_id", e.KeyID).
 			Msg("audit log: recording a request failed")
 	}
 }

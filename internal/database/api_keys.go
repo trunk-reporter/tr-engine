@@ -23,8 +23,13 @@ var (
 	ErrAPIKeyNotFound = errors.New("api key not found")
 	// ErrAPIKeyRevoked: a revoked key can't be changed (409).
 	ErrAPIKeyRevoked = errors.New("api key is revoked")
-	// ErrLastAdminKey: the change would leave no active admin key (409).
+	// ErrLastAdminKey: the change would leave no active admin key, now or
+	// when the remaining ones expire (409). Errors that say which also match
+	// it with errors.Is.
 	ErrLastAdminKey = errors.New("this is the last active admin key: create another admin key first")
+	// ErrRetiredPublicToken: `keys import` of the pre-upgrade public
+	// AUTH_TOKEN (§11.2), which is never imported.
+	ErrRetiredPublicToken = errors.New("this value is the pre-upgrade public AUTH_TOKEN, which the old engine handed to every visitor, so it can't become a key: create a new key with `tr-engine keys create` and configure the client with that")
 	// ErrLegacySecretUnexpanded: a legacy secret contains "$(", an unexpanded
 	// shell substitution copied from old docs. It is never imported.
 	ErrLegacySecretUnexpanded = errors.New(`value contains "$(" (an unexpanded shell substitution); not imported`)
@@ -210,16 +215,23 @@ func NormalizeAPIKeyName(name string) (string, error) {
 }
 
 // validateKeyFields checks everything about a key except its name, as it
-// will be stored: the scopes and restriction together (auth.ValidateKey), an
-// expiry after now, and a positive, finite rate limit. It returns the
-// normalized scopes and restriction.
-func validateKeyFields(scopes auth.Scopes, r *auth.Restriction, expiresAt *time.Time, rps *float32, now time.Time) (auth.Scopes, *auth.Restriction, error) {
+// will be stored: the scopes and restriction together (auth.ValidateKey, or
+// auth.ValidateStoredKey when the restriction is the stored one rather than
+// newRestriction input), an expiry after now, and a positive, finite rate
+// limit. It returns the normalized scopes and restriction.
+func validateKeyFields(scopes auth.Scopes, r *auth.Restriction, newRestriction bool, expiresAt *time.Time, rps *float32, now time.Time) (auth.Scopes, *auth.Restriction, error) {
 	if err := scopes.Validate(); err != nil {
 		return nil, nil, fieldErr("scopes", err)
 	}
 	scopes = scopes.Normalize()
 	r = r.Normalize()
-	if err := auth.ValidateKey(scopes, r); err != nil {
+	// The entry limit applies to a restriction the request sets, not to the
+	// stored one, which system merges may have grown past it (r2-11).
+	validate := auth.ValidateKey
+	if !newRestriction {
+		validate = auth.ValidateStoredKey
+	}
+	if err := validate(scopes, r); err != nil {
 		return nil, nil, fieldErr("restriction", err)
 	}
 	if expiresAt != nil && !expiresAt.After(now) {
@@ -274,9 +286,17 @@ func (db *DB) CreateAPIKey(ctx context.Context, in NewAPIKey) (*APIKeyWithPlaint
 	if err != nil {
 		return nil, err
 	}
-	key, err := insertAPIKey(ctx, db.Pool, hash, prefix, false, in)
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	key, err := insertAPIKey(ctx, tx, hash, prefix, false, in)
 	if err != nil {
 		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
 	}
 	return &APIKeyWithPlaintext{APIKey: *key, Plaintext: plaintext}, nil
 }
@@ -285,8 +305,10 @@ func (db *DB) CreateAPIKey(ctx context.Context, in NewAPIKey) (*APIKeyWithPlaint
 // WRITE_TOKEN, or one given to `tr-engine keys import`): it stores the hash
 // with legacy = true and a "legacy_" prefix. The strength rules apply
 // (CheckLegacySecret): "$(" is refused, and a weak secret is imported and
-// remembered for WeakLegacyKeys. A secret whose hash is already stored is not
-// duplicated: the existing key is returned with created = false, unchanged.
+// remembered for WeakLegacyKeys. The retired public AUTH_TOKEN, stored or
+// forgotten, is refused (ErrRetiredPublicToken). A secret whose hash is
+// already stored is not duplicated: the existing key is returned with
+// created = false, unchanged.
 func (db *DB) CreateLegacyAPIKey(ctx context.Context, secret string, in NewAPIKey) (key *APIKey, created bool, err error) {
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
@@ -309,6 +331,11 @@ func createLegacyAPIKey(ctx context.Context, tx pgx.Tx, secret string, in NewAPI
 		return nil, false, err
 	}
 	hash := HashAPIKey(secret)
+	if retired, err := isRetiredPublicToken(ctx, tx, hash); err != nil {
+		return nil, false, err
+	} else if retired {
+		return nil, false, ErrRetiredPublicToken
+	}
 	if existing, err := scanAPIKey(tx.QueryRow(ctx,
 		`SELECT `+apiKeyColumns+` FROM api_keys WHERE key_hash = $1`, hash)); err == nil {
 		return existing, false, nil
@@ -327,20 +354,26 @@ func createLegacyAPIKey(ctx context.Context, tx pgx.Tx, secret string, in NewAPI
 	return key, true, nil
 }
 
-func insertAPIKey(ctx context.Context, q dbtx, hash, prefix string, legacy bool, in NewAPIKey) (*APIKey, error) {
+// insertAPIKey validates and inserts a key. A restriction naming a
+// merged-away system is rewritten as the merge would have rewritten it
+// (rewriteForMerges).
+func insertAPIKey(ctx context.Context, tx pgx.Tx, hash, prefix string, legacy bool, in NewAPIKey) (*APIKey, error) {
 	name, err := NormalizeAPIKeyName(in.Name)
 	if err != nil {
 		return nil, err
 	}
-	scopes, r, err := validateKeyFields(in.Scopes, in.Restriction, in.ExpiresAt, in.RateLimitRPS, time.Now())
+	scopes, r, err := validateKeyFields(in.Scopes, in.Restriction, true, in.ExpiresAt, in.RateLimitRPS, time.Now())
 	if err != nil {
+		return nil, err
+	}
+	if r, err = rewriteForMerges(ctx, tx, r); err != nil {
 		return nil, err
 	}
 	rj, err := restrictionJSON(r)
 	if err != nil {
 		return nil, err
 	}
-	return scanAPIKey(q.QueryRow(ctx, `
+	return scanAPIKey(tx.QueryRow(ctx, `
 		INSERT INTO api_keys (key_hash, key_prefix, name, scopes, restriction, expires_at, rate_limit_rps, legacy)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING `+apiKeyColumns,
@@ -437,20 +470,51 @@ func lockAdminKeys(ctx context.Context, tx pgx.Tx, id int) (*APIKey, error) {
 	return k, err
 }
 
-// checkLastAdmin returns ErrLastAdminKey when key is an active admin key and
-// no other active admin key exists. The caller holds apiKeyAdminLockKey.
+// MinUsableAdminRPS is the lowest per-key rate limit (requests per second)
+// at which an admin key still counts as able to undo changes for the
+// last-admin guard: below it the key gets a single request per 1/rps
+// seconds (a burst of 1), too few to reach the PATCH that lifts the limit.
+const MinUsableAdminRPS = 1.0
+
+// usableAdminKeySQL narrows activeAdminKeySQL to keys that are not
+// rate-limited below MinUsableAdminRPS.
+const usableAdminKeySQL = `(rate_limit_rps IS NULL OR rate_limit_rps >= 1)`
+
+// lastAdminError is an ErrLastAdminKey with a more specific message.
+type lastAdminError struct{ msg string }
+
+func (e *lastAdminError) Error() string        { return e.msg }
+func (e *lastAdminError) Is(target error) bool { return target == ErrLastAdminKey }
+
+// checkLastAdmin guards a change that ends, shortens or throttles key's
+// admin access (revoking it, removing admin, moving its expiry earlier, or
+// rate-limiting it below MinUsableAdminRPS): it returns ErrLastAdminKey
+// unless another active admin key, not rate-limited below
+// MinUsableAdminRPS, lasts at least as long as key does now (it has no
+// expiry, or one no earlier than key's). Otherwise a near-future expiry, a
+// rate limit of one request an hour, or shortening one admin key and then
+// revoking the other, would leave no usable admin key as surely as revoking
+// the last one. A key that isn't an active admin key is not guarded. The
+// caller holds apiKeyAdminLockKey.
 func checkLastAdmin(ctx context.Context, tx pgx.Tx, key *APIKey) error {
 	if !key.Scopes.Has(auth.ScopeAdmin) || !key.ActiveAt(time.Now()) {
 		return nil
 	}
-	var others bool
-	if err := tx.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM api_keys WHERE id <> $1 AND `+activeAdminKeySQL+`)`, key.ID,
-	).Scan(&others); err != nil {
+	var others, outlasting bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM api_keys WHERE id <> $1 AND `+activeAdminKeySQL+` AND `+usableAdminKeySQL+`),
+		       EXISTS (SELECT 1 FROM api_keys WHERE id <> $1 AND `+activeAdminKeySQL+` AND `+usableAdminKeySQL+`
+		               AND (expires_at IS NULL OR ($2::timestamptz IS NOT NULL AND expires_at >= $2)))`,
+		key.ID, key.ExpiresAt,
+	).Scan(&others, &outlasting); err != nil {
 		return fmt.Errorf("count admin keys: %w", err)
 	}
-	if !others {
+	switch {
+	case !others:
 		return ErrLastAdminKey
+	case !outlasting:
+		return &lastAdminError{msg: "every other active admin key expires before this one, so this change would eventually leave no admin key: " +
+			"give another admin key a later expiry (or none) first"}
 	}
 	return nil
 }
@@ -460,7 +524,9 @@ func checkLastAdmin(ctx context.Context, tx pgx.Tx, key *APIKey) error {
 // scopes/restriction combination: a restricted key must clear its
 // restriction in the same patch that changes its scopes away from
 // ["listen"]), or, with GuardLastAdmin, ErrLastAdminKey when the patch would
-// take admin away from the last active admin key. It bumps the auth
+// take admin away from, set an earlier expiry on, or set a rate limit below
+// MinUsableAdminRPS on, an active admin key that no other usable active
+// admin key outlasts (checkLastAdmin). It bumps the auth
 // generation after a successful change.
 func (db *DB) PatchAPIKey(ctx context.Context, id int, p APIKeyPatch, guard LastAdminGuard) (*APIKey, error) {
 	tx, err := db.Pool.Begin(ctx)
@@ -469,6 +535,14 @@ func (db *DB) PatchAPIKey(ctx context.Context, id int, p APIKeyPatch, guard Last
 	}
 	defer tx.Rollback(ctx)
 
+	// A new restriction is rewritten for past merges (rewriteForMerges),
+	// under restrictionMergeLockKey, which must come before the key's row
+	// lock (see lockRestrictions).
+	if p.SetRestriction && len(p.Restriction.ReferencedSystems()) > 0 {
+		if err := lockRestrictions(ctx, tx); err != nil {
+			return nil, err
+		}
+	}
 	cur, err := lockAdminKeys(ctx, tx, id)
 	if err != nil {
 		return nil, err
@@ -501,13 +575,37 @@ func (db *DB) PatchAPIKey(ctx context.Context, id int, p APIKeyPatch, guard Last
 	if !p.SetExpiresAt {
 		expiry = nil
 	}
-	if next.Scopes, next.Restriction, err = validateKeyFields(next.Scopes, next.Restriction, expiry, next.RateLimitRPS, time.Now()); err != nil {
+	// A restriction sent back unchanged (the admin pages send it with every
+	// edit) is the stored one, not new input (see validateKeyFields).
+	newRestriction := p.SetRestriction && !p.Restriction.Equal(cur.Restriction)
+	if next.Scopes, next.Restriction, err = validateKeyFields(next.Scopes, next.Restriction, newRestriction, expiry, next.RateLimitRPS, time.Now()); err != nil {
 		return nil, err
 	}
-
-	if guard == GuardLastAdmin && cur.Scopes.Has(auth.ScopeAdmin) && !next.Scopes.Has(auth.ScopeAdmin) {
-		if err := checkLastAdmin(ctx, tx, cur); err != nil {
+	if p.SetRestriction {
+		if next.Restriction, err = rewriteForMerges(ctx, tx, next.Restriction); err != nil {
 			return nil, err
+		}
+	}
+
+	if guard == GuardLastAdmin && cur.Scopes.Has(auth.ScopeAdmin) {
+		demoted := !next.Scopes.Has(auth.ScopeAdmin)
+		// An expiry earlier than the current one (or than none) shortens the
+		// key's admin access just as surely.
+		shortened := p.SetExpiresAt && next.ExpiresAt != nil &&
+			(cur.ExpiresAt == nil || next.ExpiresAt.Before(*cur.ExpiresAt))
+		// So does a new or lower rate limit that leaves the key too few
+		// requests to lift it again.
+		throttled := p.SetRateLimitRPS && next.RateLimitRPS != nil && *next.RateLimitRPS < MinUsableAdminRPS &&
+			(cur.RateLimitRPS == nil || *next.RateLimitRPS < *cur.RateLimitRPS)
+		if demoted || shortened || throttled {
+			if err := checkLastAdmin(ctx, tx, cur); err != nil {
+				if throttled && !demoted && !shortened {
+					return nil, &lastAdminError{msg: fmt.Sprintf(
+						"a rate limit below %g request/second on this admin key would leave no admin key that can lift it: "+
+							"create another admin key without a rate limit first", MinUsableAdminRPS)}
+				}
+				return nil, err
+			}
 		}
 	}
 
@@ -532,7 +630,8 @@ func (db *DB) PatchAPIKey(ctx context.Context, id int, p APIKeyPatch, guard Last
 
 // RevokeAPIKey revokes key id (sets revoked_at) and returns it. Revoking a
 // revoked key changes nothing and succeeds. With GuardLastAdmin it refuses
-// (ErrLastAdminKey) to revoke the last active admin key. It bumps the auth
+// (ErrLastAdminKey) to revoke an active admin key that no other active admin
+// key outlasts (checkLastAdmin). It bumps the auth
 // generation after a revocation.
 func (db *DB) RevokeAPIKey(ctx context.Context, id int, guard LastAdminGuard) (*APIKey, error) {
 	tx, err := db.Pool.Begin(ctx)

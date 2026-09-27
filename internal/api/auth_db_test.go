@@ -301,6 +301,27 @@ func TestIntegrationKeysAPI(t *testing.T) {
 	}
 	expectStatus(t, call(t, r, "GET", "/api/v1/admin/audit-log?since=yesterday", second.Key, nil, nil), 400, ErrInvalidParameter, "bad since")
 	expectStatus(t, call(t, r, "GET", "/api/v1/admin/audit-log?key_id=-1", second.Key, nil, nil), 400, ErrInvalidParameter, "bad key_id")
+
+	// A long path is stored capped, with a marker giving the requested
+	// path's length, not the length of an already-capped copy (r2-12).
+	for _, n := range []int{1500, 5000} {
+		long := "/api/v1/talkgroups/1:" + strings.Repeat("9", n)
+		call(t, r, "PATCH", long+"?q=secret", second.Key, `{"alpha_tag":"x"}`, nil)
+		var one struct {
+			Entries []database.AuditEntry `json:"entries"`
+		}
+		call(t, r, "GET", "/api/v1/admin/audit-log?limit=1", second.Key, nil, &one)
+		want := fmt.Sprintf("…(truncated, %d bytes)", len(long))
+		if len(one.Entries) != 1 {
+			t.Fatalf("audit entries = %+v", one.Entries)
+		}
+		if !strings.HasSuffix(one.Entries[0].Path, want) ||
+			!strings.HasPrefix(one.Entries[0].Path, long[:database.MaxAuditPathBytes]) ||
+			len(one.Entries[0].Path) != database.MaxAuditPathBytes+len(want) {
+			t.Errorf("long path (%d bytes) stored as %.60q...%q", len(long), one.Entries[0].Path,
+				one.Entries[0].Path[max(0, len(one.Entries[0].Path)-40):])
+		}
+	}
 }
 
 func TestIntegrationAnonymousAccessAPI(t *testing.T) {
@@ -449,6 +470,11 @@ func TestIntegrationTickets(t *testing.T) {
 		t.Errorf("performed_by = %q, want the key name and actor", by)
 	}
 	expectStatus(t, call(t, r, "GET", "/api/v1/calls/42/audio?ticket="+narrowed.Ticket, "", nil, nil), 401, ErrInvalidTicket, "ticket naming a merged system")
+	// ...and refused at mint time once the merge happened.
+	expectStatus(t, call(t, r, "POST", "/api/v1/tickets", listen.Plaintext, `{"restriction":{"systems":[2]}}`, nil),
+		400, ErrInvalidBody, "minting a ticket naming a merged system")
+	expectStatus(t, call(t, r, "POST", "/api/v1/tickets", listen.Plaintext, `{"restriction":{"systems":[1]}}`, nil),
+		200, "", "minting a ticket naming the merge target")
 
 	// Revoking the key kills its tickets at once.
 	expectStatus(t, call(t, r, "DELETE", fmt.Sprintf("/api/v1/keys/%d", listen.ID), admin.Plaintext, nil, nil), 204, "", "revoke")

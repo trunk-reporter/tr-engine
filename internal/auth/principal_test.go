@@ -123,7 +123,7 @@ func TestPrincipalAttribution(t *testing.T) {
 func i32(v ...int32) []int32 { return v }
 
 func TestPrincipalSQL(t *testing.T) {
-	const tgNotZero = "c.tgid IS NOT NULL AND c.tgid <> 0"
+	const tgNotZero = "c.tgid > 0 AND c.system_id > 0"
 	restricted := func(rs ...Restriction) *Principal {
 		return &Principal{Kind: KindKey, Scopes: Scopes{ScopeListen}, Restrictions: rs}
 	}
@@ -196,7 +196,7 @@ func TestPrincipalSQL(t *testing.T) {
 func TestPrincipalSQLUnqualifiedColumns(t *testing.T) {
 	p := &Principal{Restrictions: []Restriction{{Systems: []int{4}}}}
 	clause, args := p.SQL("system_id", "tgid", 2)
-	want := " AND ((tgid IS NOT NULL AND tgid <> 0 AND system_id = ANY($2::int[])))"
+	want := " AND ((tgid > 0 AND system_id > 0 AND system_id = ANY($2::int[])))"
 	if clause != want || !reflect.DeepEqual(args, []any{i32(4)}) {
 		t.Errorf("SQL = %q, %v; want %q, [[4]]", clause, args, want)
 	}

@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/rs/zerolog"
@@ -172,26 +173,23 @@ func (ir *IdentityResolver) LookupByShortName(instanceID, shortName string) (sys
 	return 0, 0, false
 }
 
-// LookupByShortNameAny scans all identity cache entries for a matching short name,
-// skipping entries whose instanceID is in the exclude set. Returns the first
-// non-excluded match along with its instanceID. Used for auto-learning source IP
-// to instance mappings in multi-instance simplestream setups.
-func (ir *IdentityResolver) LookupByShortNameAny(shortName string, exclude map[string]bool) (systemID, siteID int, instanceID string, ok bool) {
+// InstancesByShortName returns the IDs of every TR instance whose cache has
+// a system with this short name, sorted. The live-audio router learns a
+// simplestream sender's instance from it only when the answer is unique.
+func (ir *IdentityResolver) InstancesByShortName(shortName string) []string {
 	ir.mu.RLock()
 	defer ir.mu.RUnlock()
 
+	var ids []string
 	for key, ri := range ir.cache {
-		if ri.SystemName != shortName {
+		if ri.SystemName != shortName || len(key) <= len(shortName) {
 			continue
 		}
 		// Extract instanceID from cache key ("instanceID:sysName")
-		instID := key[:len(key)-len(shortName)-1]
-		if exclude[instID] {
-			continue
-		}
-		return ri.SystemID, ri.SiteID, instID, true
+		ids = append(ids, key[:len(key)-len(shortName)-1])
 	}
-	return 0, 0, "", false
+	slices.Sort(ids)
+	return slices.Compact(ids)
 }
 
 // RewriteSystemID updates all cache entries pointing at oldSystemID to use newSystemID.

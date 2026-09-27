@@ -491,8 +491,11 @@ func (db *DB) SearchTalkgroupDirectory(ctx context.Context, p *auth.Principal, f
 		mode = *filter.Mode
 	}
 
+	// Rows of a merged-away (soft-deleted) system are never listed: merges
+	// move them to the target, and restrictions only name the target.
 	const filterClause = `
 		WHERE ($1::int[] IS NULL OR td.system_id = ANY($1))
+		  AND NOT EXISTS (SELECT 1 FROM systems ds WHERE ds.system_id = td.system_id AND ds.deleted_at IS NOT NULL)
 		  AND ($2::text IS NULL OR td.search_vector @@ plainto_tsquery('english', $2))
 		  AND ($3::text IS NULL OR td.category = $3)
 		  AND ($4::text IS NULL OR td.mode = $4)`

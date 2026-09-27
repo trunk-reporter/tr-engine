@@ -84,12 +84,12 @@ A restriction limits *which radio data* a listen credential can see.
 **Semantics.** A (system, talkgroup) pair is allowed when:
 
 ```
-allowed = tgid is not NULL and tgid != 0
+allowed = tgid > 0 AND system > 0          (NULL fails both)
           AND (allow_all OR system ∈ systems OR (system, tgid) ∈ talkgroups)
           AND (system, tgid) ∉ exclude_talkgroups
 ```
 
-Data with a NULL or 0 talkgroup is **never** allowed for a restricted principal, whatever the restriction says.
+Data with a NULL, zero or negative talkgroup or system ID is **never** allowed for a restricted principal, whatever the restriction says.
 
 A **system is visible**, meaning its metadata may be shown, when `allow_all` is true, or the system is in `systems`, or at least one entry in `talkgroups` belongs to it.
 
@@ -104,13 +104,15 @@ A **system is visible**, meaning its metadata may be shown, when `allow_all` is 
 A request's **effective restriction** is the intersection of every restriction that applies to it (key ∩ ticket narrowing). In the implementation, a principal carries a list of restrictions, and a pair is allowed only if *every* restriction allows it. An empty list means unrestricted.
 
 **Validation:**
-- Each array holds at most 1000 entries (tickets: see §3.5).
+- Each array of a **new** restriction (key create/PATCH, anonymous PUT, the CLI) holds at most 1000 entries (tickets: see §3.5). The limit applies to input only: merge rewrites keep every exclusion and add copies (below), so a stored `exclude_talkgroups` can grow past 1000. Such a stored restriction stays valid, and sending it back unchanged (`PATCH /keys/{id}` with the stored restriction, `PUT /anonymous-access`, `access set` without restriction flags) is accepted.
 - Talkgroup strings must parse as `<positive int>:<positive int>`.
 - System IDs must be positive.
 - IDs are not required to exist, so a key can be prepared before its system appears.
 - Duplicates are removed and arrays are stored sorted.
 
-**System merges.** `MergeSystems` runs both from the admin API and automatically at ingest when P25 identity matches. In the same transaction it rewrites every restriction reference from the source system to the target system: `systems` entries, and `source:tgid` entries in `talkgroups`/`exclude_talkgroups`. It does this for every row of `api_keys.restriction` and for `auth_settings.anonymous_access`, dedupes, and then bumps the auth generation (§7.5). A ticket whose narrowing references a system that appears as `source_id` in `system_merge_log` is rejected as `invalid_ticket`; the client simply mints a new one.
+**System merges.** `MergeSystems` runs both from the admin API and automatically at ingest when P25 identity matches. In the same transaction it rewrites every restriction reference to the source system: `systems` entries and `source:tgid` entries in `talkgroups` become the target's; `exclude_talkgroups` is kept **symmetric** across the two IDs: every entry naming the source or the target is kept and gets a copy naming the other one, and replaying this over the logged merges until nothing changes makes an exclusion naming any system of a chain of merges (a into b, b into c) name all of them. Data still carrying an old ID (written or buffered around the merge, and never moved) thus stays excluded, whichever ID the exclusion named. It does this for every row of `api_keys.restriction` and for `auth_settings.anonymous_access`, dedupes, and then bumps the auth generation (§7.5). A restriction stored later (key create/PATCH, anonymous PUT, the CLI) that names a system appearing in `system_merge_log` is rewritten the same way on store (allow entries moved, exclusions made symmetric), under an advisory lock shared with the merge. A ticket narrowing that names a merged-away system in any array, `exclude_talkgroups` included, is refused at mint time (400 `invalid_body`); a ticket minted before the merge is rejected as `invalid_ticket` on use (and its open stream closes with `ticket_expired`); the client simply mints a new one. Stored key and anonymous restrictions keep merged-away IDs in their exclusions, so a backend that builds narrowings from them must drop those entries (their copies for the surviving system stay).
+
+A merge never leaves an allow entry (`systems`, `talkgroups`) pointing at a merged-away system and never voids an exclusion (exclusions keep the old ID next to the surviving one), but it can widen access: an allow entry that named either system then covers the whole merged system, including data the other system already held. That is intended when both are one radio network; an admin merging unrelated systems must review restricted keys and the anonymous policy first.
 
 ### 3.3 Principals and credential presentation
 
@@ -153,7 +155,7 @@ Every request resolves to exactly one principal:
 
 **Management.** Only `admin` keys can list, create, change or revoke keys.
 
-**Last-admin guard.** The API refuses with 409 `conflict` to revoke the **last active admin key**, or to change its scopes so it loses `admin`. A request that sets `expires_at` in the past is already a 400. The guard runs in one transaction that takes `pg_advisory_xact_lock` on a fixed constant before counting, so concurrent requests can't both pass. The CLI is not subject to the guard.
+**Last-admin guard.** The API refuses with 409 `conflict` to revoke an active admin key, to change its scopes so it loses `admin`, to move its `expires_at` earlier (including giving it one), or to set or lower its `rate_limit_rps` below 1 request/second, unless another active admin key lasts at least as long (no expiry, or one no earlier than this key's current expiry). Only admin keys not rate-limited below 1 request/second count as that other key, for revoke, demote, earlier expiry and throttle alike. Otherwise a near-future expiry, a limit of one request an hour, or shortening one admin key and then revoking the other, would leave no usable admin key as surely as revoking the last one; in particular the only admin key can't be given an expiry, or such a rate limit, through the API. The throttle case has its own message ("a rate limit below 1 request/second on this admin key would leave no admin key that can lift it: create another admin key without a rate limit first"). A request that sets `expires_at` in the past is already a 400. The guard runs in one transaction that takes `pg_advisory_xact_lock` on a fixed constant before counting, so concurrent requests can't both pass. The CLI is not subject to the guard; `tr-engine keys update ID --no-rate-limit` undoes an over-tight limit.
 
 ### 3.5 Tickets
 
@@ -169,7 +171,7 @@ A ticket is a stateless, HMAC-signed, short-lived credential for URLs.
 3. Decode the JSON.
 4. `e > now`, and `e ≤ now + 3600 + 60` (60 s of clock skew).
 5. Resolve the key by ID. It must exist, not be revoked or expired, and have `listen`.
-6. Reject a narrowing that references a merged-away system (§3.2).
+6. Reject a narrowing that references a merged-away system in any array, `exclude_talkgroups` included (§3.2).
 
 Any failure is 401 `invalid_ticket`.
 
@@ -306,6 +308,7 @@ Every 401 carries `WWW-Authenticate: Bearer realm="tr-engine"`. The existing cod
 - **SSE `Last-Event-ID`:** accepted from the `Last-Event-ID` header, or from a `last_event_id` query parameter (the header wins). The parameter exists because a client that re-creates an `EventSource` with a fresh ticket can't set the header.
 - **HEAD:** the root router uses chi's `middleware.GetHead`, so a HEAD request is served by the GET handler, and policy lookup uses the GET route (§6).
 - **`X-Request-ID`:** a client value is kept only if it is at most 64 characters of `[A-Za-z0-9._-]`; otherwise a new one is generated. This applies globally.
+- **Header size:** the server limits the request line plus headers to 64 KiB (`http.Server.MaxHeaderBytes`); a larger request gets `431 Request Header Fields Too Large` before any middleware runs.
 
 ## 6. Route policy and the request pipeline
 
@@ -338,7 +341,7 @@ This is the root router's middleware order:
    - Store `(pattern, policy)` in the request context.
    - `pattern == ""`: chi will answer 404 or 405 without running any handler. Skip steps 5–7 (no principal, no log) and let the router reply. This is still fail-closed, because no handler runs.
    - Pattern found but not in the table: 403 `forbidden` plus an ERROR log "route has no auth policy".
-5. **Resolve principal** (§3.3): header first; `?ticket=` only if `policy.Ticket` and the method is GET/HEAD. Rate limiting is interleaved with this step (§8).
+5. **Resolve principal** (§3.3): on routes with `policy.Ticket` and method GET/HEAD, a `?ticket=` is resolved first and wins over the `Authorization` header; otherwise the Bearer header; otherwise anonymous. Rate limiting is interleaved with this step (§8).
 6. **Authorize**:
    - Public: pass.
    - `FormKey` and no header principal: pass to the upload middleware, which decides.
@@ -459,7 +462,7 @@ A new package with no dependencies on other tr-engine packages, so `database`, `
   - `Internal`, a package-level unrestricted principal for internal callers.
 - `(*Principal) SQL(sysCol, tgCol string, firstArg int) (clause string, args []any)`:
   - Returns `""` for unrestricted principals.
-  - Otherwise returns `" AND (...)"` with positional args starting at `$firstArg`. For every restriction it emits `tgCol IS NOT NULL AND tgCol <> 0`, then:
+  - Otherwise returns `" AND (...)"` with positional args starting at `$firstArg`. For every restriction it emits `tgCol > 0 AND sysCol > 0` (so NULL, zero and negative talkgroup or system IDs are never visible to a restricted principal), then:
     - allow part:
       - `allow_all`: nothing.
       - Allow-nothing: `FALSE`.
@@ -470,7 +473,7 @@ A new package with no dependencies on other tr-engine packages, so `database`, `
 - The auth generation: an `atomic.Uint64` with `Generation()` and `Bump()`. It is bumped by key PATCH/DELETE, anonymous-policy PUT and system merges. Caches and long-lived connections watch it.
 
 Everything above is table-tested. The SQL helper is also tested against a real PostgreSQL in `internal/database`, gated on `TEST_DATABASE_URL`, with a fresh database per test as `internal/unittags` does. The cases include:
-- NULL and 0 tgids;
+- NULL, 0 and negative tgids, and 0 and negative system IDs;
 - allow_all + exclude, systems-only, talkgroups-only, and allow-nothing;
 - multiple restrictions, and an empty intersection;
 - a test that removing the last allowed entry never widens access.
@@ -509,6 +512,10 @@ The principal is stored on the **subscriber** at subscribe time, separately from
 
 The principal is stored on the audio subscriber at `Subscribe` time, separately from the client-updatable `AudioFilter`. `UpdateAudioFilter` never touches it. For a restricted subscriber, `matchesAudioFilter` also requires `AllowsTG(frame.SystemID, frame.TGID)`, whatever the client's subscribe message says.
 
+**Connection limits.** The server sends a keepalive message and a WebSocket ping every 15 s (the keepalive's `active_streams` counts only allowed talkgroups for a restricted principal). A connection from which nothing arrives for 60 s, pongs included, is closed. A client message over 64 KiB closes the connection with `1009`.
+
+**Attribution.** Clamping by restriction is only as good as the `SystemID` on each frame, which the audio router derives from the simplestream sender. A sender mapped by `STREAM_SOURCE_MAP` (`ip=instance_id` pairs) uses that instance. Otherwise the instance is worked out again for every chunk from the instances that have the packet's short name: real trunk-recorder instances are preferred over the `WATCH_INSTANCE_ID` (file watch / `TR_DIR`) identity, which is preferred over the `UPLOAD_INSTANCE_ID` identity, and instances the source map gives to other senders are left out (only source-map entries do that). When the preferred instances map the short name to different systems, including when such an instance appears after the sender was attributed, the router drops the sender's audio with a WARN (at most every 5 minutes) instead of guessing; `STREAM_SOURCE_MAP` is then required.
+
 ### 7.5 Long-lived connections: re-check and close signals
 
 Each SSE and WebSocket connection re-resolves its principal **every 60 s** and **immediately when the auth generation changes**:
@@ -539,6 +546,7 @@ API changes reach open streams at once. CLI changes, which happen in another pro
    - Not found, revoked or expired: negative-cache it, then 401.
    - Lookup error: 503, not cached, and never treated as anonymous.
 4. **Ticket:** verifying the MAC and expiry costs no database access; resolving the key goes through the cache as above. Ticket requests are **per-IP limited, like anonymous requests**, and are not charged to the key's per-key limit. Tickets live in many browsers, each with its own IP.
+5. **Upload with the key in a form field** (no Bearer header): the request is first resolved as having no credential (step 1, one per-IP token); the upload middleware then resolves the form key as in steps 2–3. That costs a second per-IP token when the key isn't in the positive cache, and on every request for a legacy key, so such uploads get half the per-IP rate.
 
 **Caches:**
 - Positive and negative results live in **separate** bounded LRUs, so random guesses can't evict valid keys.
@@ -579,7 +587,7 @@ Denials the handler itself decides (401/403 from inside handlers) are included. 
 **What is skipped:** anonymous and failed-auth attempts; these stay in the access log. `POST /api/v1/call-upload` and `POST /api/v1/tickets` are also skipped, as high-volume routes with no state change worth auditing.
 
 **Mechanics:**
-- The path is stored without its query string.
+- The path is stored without its query string, and capped at 1024 bytes (cut at a UTF-8 boundary) with a "…(truncated, N bytes)" marker (`database.TruncateAuditPath`).
 - The response writer is wrapped only for audited methods, using a wrapper with `Unwrap`, `Flush` and `Hijack`, like `metrics.statusWriter`.
 
 **`X-Actor` request header:** optional free text naming the end user on whose behalf a multi-user client acted. It is trimmed, Unicode categories Cc and Cf are removed, and it is capped at 200 characters. It is recorded but never used for authorization.
@@ -624,7 +632,7 @@ The tr-dashboard Access page and `web/admin.html` show a warning while a key nam
 
 ### 10.2 CLI
 
-New subcommands follow the `export`/`import` pattern in `cmd/tr-engine`: their own FlagSet, `--env-file`/`--database-url`, `config.Load`, `database.Connect`, `InitSchema` + `Migrate`. They differ in two ways: **logs go to stderr at WARN level**, and a `Migrate` failure is fatal.
+New subcommands follow the `export`/`import` pattern in `cmd/tr-engine`: their own FlagSet, `--env-file`/`--database-url`, `config.Load`, `database.Connect`, `InitSchema` + `Migrate`. They differ in three ways: **logs go to stderr at WARN level**, a `Migrate` failure is fatal, and pending migrations are named on stderr before they run. On a database from before API keys, the irreversible ones (`convert api_keys to app keys`, `record and drop users`) are refused unless `--migrate` is given, since an older engine still running on that database would stop working; the recommended order is to start the new server first, which also runs the legacy import. `keys list` and `access show` print a stderr note while that one-time import is still to come.
 
 ```
 tr-engine keys list   [--all]
@@ -644,16 +652,17 @@ tr-engine access forget-retired-token
 
 **Arguments and output:**
 - A numeric argument is always an ID; prefixes need `--prefix`.
-- `keys create` and `keys import` print the plaintext key (create) or the new key's ID (import) on stdout, and nothing else, so scripts can capture it (`docker compose exec -T ...`). All messages go to stderr.
+- `keys create` and `keys import` print the plaintext key (create) or the new key's ID (import) on stdout, and nothing else, so scripts can capture it (`docker compose exec -T ...`). All messages go to stderr; `keys create` reports there the restriction as stored (after any merge rewrite).
 
 **Restriction flags:**
+- `--systems`, `--talkgroups` and `--exclude-talkgroups` take comma-separated values and may be repeated; repeats add up.
 - `--systems ""` or `--talkgroups ""` means an *empty* allow list, not "absent".
 - `--all-talkgroups` sets `allow_all`.
 - `access set` without restriction flags keeps the stored restriction.
 
-`keys import` enforces the legacy strength rules (§11.2).
+`keys import` enforces the legacy strength rules (§11.2). It also refuses the retired public token (§11.2), both while it is stored and after `access forget-retired-token` (whose hash is kept in `auth_settings` `forgotten_public_tokens` for this), and a secret that is already stored. `access forget-retired-token` refuses while an active key has the retired token's hash, naming that key.
 
-The CLI is not subject to the last-admin guard.
+The CLI is not subject to the last-admin guard; `keys revoke`/`update` warn when no active admin key is left or every remaining one expires within a day.
 
 `--expires` accepts:
 - a Go duration;
@@ -700,7 +709,7 @@ The old variables are read **only** to migrate and to warn; they no longer confi
    - `write-token-only`: only `WRITE_TOKEN` set;
    - `token`: `AUTH_TOKEN` set, `ADMIN_PASSWORD` not set;
    - `full`: `ADMIN_PASSWORD` set.
-2. **Fresh database** (`InitSchema` created the schema in this process): import nothing, and leave the anonymous policy `off`. The per-variable warnings still apply.
+2. **Fresh database** (the schema was created by this version): import nothing, and leave the anonymous policy `off`. The per-variable warnings still apply. `schema.sql` itself inserts the `data_fixups` row `schema-created-with-api-key-auth` (only when `systems` is empty), so this holds whichever process ran it: the server, `tr-engine import`/`export`/`keys`/`access`, or `psql -f schema.sql`. Migrations never insert it, so a database upgraded from an older version doesn't carry it.
 3. **`WRITE_TOKEN`** is imported as the key `legacy WRITE_TOKEN`, scopes `["admin","upload"]`. **Exception:** in `full` mode, if `WRITE_TOKEN` equals `AUTH_TOKEN`, nothing is imported and an ERROR is logged: "WRITE_TOKEN was published by /auth-init as the public read token; not imported — create a new admin key". The bootstrap key is then printed.
 4. **`AUTH_TOKEN` in `token` mode** is imported as the key `legacy AUTH_TOKEN`, scopes `["listen"]`, plus `upload` only if `WRITE_TOKEN` is unset (the old upload auth preferred `WRITE_TOKEN`). If it equals `WRITE_TOKEN`, it was already imported in step 3 and is not duplicated.
 5. **`AUTH_TOKEN` in `full` mode** is not imported, because it was public. Its SHA-256 is stored as `auth_settings.retired_public_token` (§3.3).
@@ -709,7 +718,7 @@ The old variables are read **only** to migrate and to warn; they no longer confi
 8. **Uploads.** If calls from `UPLOAD_INSTANCE_ID` exist in the last 7 days and no active key has `upload` after the import, the engine logs a WARN: "HTTP uploads were in use but no key can upload now — create one with `tr-engine keys create --name 'uploads' --scopes upload` and configure it in trunk-recorder". It also lists migrated keys without `upload` that were used in the last 7 days.
 
 **Every start.** Each old variable that is still set produces one WARN line:
-- For imported ones: "AUTH_TOKEN is no longer used (imported as API key #3 'legacy AUTH_TOKEN' on 2026-09-26) — remove it from your configuration; see docs/migrating-auth.md".
+- For imported ones: "AUTH_TOKEN is no longer used (imported as API key #3 'legacy AUTH_TOKEN' on 2026-09-26) — remove it from your configuration; see docs/migrating-auth.md". This message, and the retired token's "treated as anonymous", appear only when this process's value is the imported key or the retired token. Otherwise the WARN says the value was never imported (clients sending it get 401 `invalid_key`) and suggests `tr-engine keys import`.
 - For the others: "ADMIN_PASSWORD is no longer used — tr-engine has no user accounts; clients use API keys. See docs/auth.md".
 - `CORS_ORIGINS`: "no longer needed: the API allows all origins and never uses cookies".
 
@@ -723,7 +732,7 @@ The old variables are read **only** to migrate and to warn; they no longer confi
 2. **Upgrade the engine, tr-dashboard and any bind-mounted `web/` together**, with pinned versions. When copying the new `web/` into a bind-mounted directory, keep any pages you saved yourself.
 3. **Start the new version once with the old `.env` unchanged**, so the import can read it.
 4. **Copy the bootstrap key** from `docker compose logs tr-engine` (stderr) if one was printed.
-5. **Remove any reverse-proxy block that injects `Authorization`** (the Caddy block in `caddy/Caddyfile` and on gerty; the nginx and Caddy examples in the old tr-dashboard README). The engine tolerates the old public token and empty bearers, but any other injected value makes every anonymous request 401.
+5. **Remove any reverse-proxy block that injects `Authorization`** (the Caddy block in `caddy/Caddyfile` and on gerty; the nginx and Caddy examples in the old tr-dashboard README). The engine tolerates the old public token (logging a WARN at most hourly) and empty bearers (silently), but any other injected value makes every anonymous request 401. Operators check the proxy config itself, since an empty injection never logs.
 6. Check `tr-engine keys list`, and **give every client its own named key**: dashboards, scripts, each trunk-recorder upload host (`upload` scope), and Prometheus (`listen`). Revoke the legacy keys and the bootstrap key afterwards.
 7. **Set the anonymous policy deliberately** (`access show`/`access set`).
 8. **Remove the old variables** from `.env`.
@@ -790,7 +799,7 @@ The old variables are read **only** to migrate and to warn; they no longer confi
 - the `readToken`/`writeToken`/`accessToken`/`jwtEnabled`/`user` state and the guest state;
 - `credentials: 'include'`.
 
-**Dev proxy:** `TR_AUTH_TOKEN` becomes `TR_API_KEY`, injected only when the browser request has no `Authorization` header. The README and `examples/` lose every proxy-injection example.
+**Dev proxy:** `TR_AUTH_TOKEN` becomes `TR_API_KEY`, injected only when the browser request has no `Authorization` header. The dev server listens on `0.0.0.0`, so the key is added only to same-origin requests from a loopback client (`mayAddDevKey`: not other devices on the network, nor other sites open in the developer's browser, checked with `Sec-Fetch-Site`/`Origin`), and `vite preview` never adds it. `TR_API_KEY` should be a `listen` key, never the bootstrap admin key. The README and `examples/` lose every proxy-injection example.
 
 **Types:** regenerate `src/api/generated.ts` from the new `openapi.yaml`.
 
@@ -839,8 +848,9 @@ The old variables are read **only** to migrate and to warn; they no longer confi
 |---|---|
 | `AUTH_ENABLED`, `AUTH_TOKEN`, `WRITE_TOKEN`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `JWT_SECRET`, `CORS_ORIGINS` | **Removed.** Read only for the one-time import and to warn (§11.2). |
 | `TRUSTED_PROXIES` | Kept (default `loopback,private`). |
-| `RATE_LIMIT_RPS`, `RATE_LIMIT_BURST` | Kept. They now apply to anonymous, ticket, legacy-key and failed-lookup requests. |
+| `RATE_LIMIT_RPS`, `RATE_LIMIT_BURST` | Kept. They now apply to anonymous, ticket, legacy-key and key-cache-miss requests, and to uploads with the key in a form field (§8). |
 | `RETENTION_AUDIT_LOG` | New; default `8760h`. |
+| `STREAM_SOURCE_MAP` | New; comma-separated `ip=instance_id` pairs attributing simplestream senders to trunk-recorder instances. Needed when instances share a short name for different systems: that audio is otherwise dropped with a WARN, since live-audio restrictions depend on attribution (§7.4). |
 
 The Docker Compose files drop the `TR_AUTH_TOKEN` variable passed to tr-dashboard. `caddy/Caddyfile` drops the token-injection block. `.githooks/pre-commit` adds a `tre_[0-9a-f]{64}` pattern and keeps the old ones.
 
@@ -860,7 +870,8 @@ The Docker Compose files drop the `TR_AUTH_TOKEN` variable passed to tr-dashboar
    - A restricted principal gets 403 `restricted_credential` on every non-Enforced route.
    - On Enforced routes it never receives rows, totals, events or audio frames outside its restriction, and never `patched_tgids` or 409 ambiguity details for disallowed talkgroups.
    - An empty allow list never widens access.
-   - System merges never widen access.
+   - System merges never leave an allow entry naming a merged-away system and never void an exclusion (exclusions keep the old ID next to the surviving one, symmetric along chains of merges). (They can widen allow lists to the whole merged system, §3.2.)
+   - SSE event IDs are opaque (the publish sequence encrypted per process), so a restricted subscriber can't count the events it wasn't shown. Known limitation: call IDs are one sequence across all talkgroups, so gaps in the `call_id`s a restricted credential sees reveal how much activity happened outside its restriction, though never what it was.
 6. **No cookies:** `Access-Control-Allow-Credentials` never appears, and no cookies are set.
 7. **Route coverage:** every registered route has a policy (tested), and a matched route without a policy fails closed. Unmatched routes get 404/405 with no handler run.
 8. **Uploads:** upload requires a key with `upload`; nothing else can upload. Form-field keys are read only from the multipart body, after the size limit.

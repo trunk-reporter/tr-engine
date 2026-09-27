@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -13,11 +14,27 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/snarg/tr-engine/internal/audio"
+	"github.com/snarg/tr-engine/internal/auth"
 )
 
 var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true }, // CORS handled by middleware
 }
+
+const (
+	// wsMaxMessageBytes caps one client control message. Subscribe messages
+	// are small (a few KB even with hundreds of talkgroups); a larger one
+	// closes the connection (1009) instead of being buffered, since the
+	// hijacked connection is no longer covered by the request body limit.
+	wsMaxMessageBytes = 64 << 10
+	// wsReadTimeout is how long the connection may go without any frame from
+	// the client (a message, or the pong to the ping sent with every
+	// keepalive) before it is treated as gone.
+	wsReadTimeout = 60 * time.Second
+	// defaultKeepaliveInterval is how often the server sends a ping and a
+	// keepalive message.
+	defaultKeepaliveInterval = 15 * time.Second
+)
 
 // AudioStreamHandler serves live audio over WebSocket.
 type AudioStreamHandler struct {
@@ -25,14 +42,17 @@ type AudioStreamHandler struct {
 	maxClients int
 	clients    atomic.Int32
 	log        zerolog.Logger
+	// keepaliveInterval is defaultKeepaliveInterval; tests shorten it.
+	keepaliveInterval time.Duration
 }
 
 // NewAudioStreamHandler creates a new handler for live audio WebSocket connections.
 func NewAudioStreamHandler(streamer AudioStreamer, maxClients int) *AudioStreamHandler {
 	return &AudioStreamHandler{
-		streamer:   streamer,
-		maxClients: maxClients,
-		log:        log.With().Str("component", "audio_stream").Logger(),
+		streamer:          streamer,
+		maxClients:        maxClients,
+		log:               log.With().Str("component", "audio_stream").Logger(),
+		keepaliveInterval: defaultKeepaliveInterval,
 	}
 }
 
@@ -101,14 +121,27 @@ func (h *AudioStreamHandler) HandleStream(w http.ResponseWriter, r *http.Request
 	controlCh := make(chan subscribeMsg, 4)
 	doneCh := make(chan struct{})
 
+	// Bound what the client can make the server buffer, and drop a peer
+	// that stops answering pings.
+	conn.SetReadLimit(wsMaxMessageBytes)
+	conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	})
+
 	// Reader goroutine: reads JSON control messages from client
 	go func() {
 		defer close(doneCh)
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
+				if errors.Is(err, websocket.ErrReadLimit) {
+					h.log.Info().Str("remote", r.RemoteAddr).Int("limit", wsMaxMessageBytes).
+						Msg("audio stream closed: client message too large")
+				}
 				return
 			}
+			conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 			var ctrl subscribeMsg
 			if err := json.Unmarshal(msg, &ctrl); err != nil {
 				continue
@@ -120,7 +153,7 @@ func (h *AudioStreamHandler) HandleStream(w http.ResponseWriter, r *http.Request
 		}
 	}()
 
-	keepalive := time.NewTicker(15 * time.Second)
+	keepalive := time.NewTicker(h.keepaliveInterval)
 	defer keepalive.Stop()
 
 	tgSeq := make(map[uint64]uint16) // per-system:TG sequence counter
@@ -212,20 +245,38 @@ func (h *AudioStreamHandler) HandleStream(w http.ResponseWriter, r *http.Request
 			}
 
 		case <-keepalive.C:
-			status := h.streamer.AudioStreamStatus()
-			activeStreams := 0
-			if status != nil {
-				activeStreams = status.ActiveEncoders
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second)); err != nil {
+				return
 			}
 			msg, _ := json.Marshal(map[string]any{
 				"type":           "keepalive",
-				"active_streams": activeStreams,
+				"active_streams": h.activeStreamsFor(guard.principal.Load()),
 			})
 			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 				return
 			}
 		}
 	}
+}
+
+// activeStreamsFor returns the keepalive's active_streams for p: every live
+// talkgroup stream for an unrestricted principal, and only the streams on
+// talkgroups its restrictions allow for a restricted one, which never learns
+// how busy the rest of the engine is (§14.5).
+func (h *AudioStreamHandler) activeStreamsFor(p *auth.Principal) int {
+	if p.Restricted() {
+		n := 0
+		for _, s := range h.streamer.AudioJitterStats() {
+			if audio.PrincipalAllows(p, audio.AudioFrame{SystemID: s.SystemID, TGID: s.TGID}) {
+				n++
+			}
+		}
+		return n
+	}
+	if status := h.streamer.AudioStreamStatus(); status != nil {
+		return status.ActiveEncoders
+	}
+	return 0
 }
 
 // GetJitterStats returns per-stream audio jitter statistics.

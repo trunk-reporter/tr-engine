@@ -120,8 +120,9 @@ func (p *Pipeline) mergeSystem(ctx context.Context, sourceID, targetID int, sysN
 		return
 	}
 
-	// Update identity cache so future lookups resolve to the merged target
-	p.identity.RewriteSystemID(sourceID, targetID)
+	// Update the identity cache so future lookups resolve to the merged
+	// target, and relabel in-memory data (active calls, SSE replay buffer).
+	p.RewriteSystemID(sourceID, targetID)
 
 	p.log.Info().
 		Int("source_system_id", sourceID).

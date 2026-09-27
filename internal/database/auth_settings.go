@@ -23,6 +23,10 @@ const (
 	settingTicketSecret       = "ticket_secret"
 	settingRetiredPublicToken = "retired_public_token"
 	settingWeakLegacyKeys     = "weak_legacy_keys"
+	// settingForgottenPublicTokens keeps the hashes of retired public tokens
+	// after `access forget-retired-token`, only so `keys import` keeps
+	// refusing them (JSON array of HashAPIKey digests).
+	settingForgottenPublicTokens = "forgotten_public_tokens"
 )
 
 // ticketSecretLength is the size of the generated ticket secret, in bytes.
@@ -95,35 +99,175 @@ func (db *DB) GetAnonymousAccess(ctx context.Context) (AnonymousAccess, error) {
 // SetAnonymousAccess validates and stores the anonymous access policy, and
 // bumps the auth generation. access must be AccessOff or AccessListen; a
 // restriction that allows nothing is refused ("use access: off instead").
-// Invalid input is a *FieldError.
+// A restriction naming a merged-away system is rewritten as the merge would
+// have rewritten it (rewriteForMerges). Invalid input is a *FieldError.
 func (db *DB) SetAnonymousAccess(ctx context.Context, access string, r *auth.Restriction) (AnonymousAccess, error) {
-	a, err := setAnonymousAccess(ctx, db.Pool, access, r)
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return AnonymousAccess{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	a, err := setAnonymousAccess(ctx, tx, access, r)
 	if err != nil {
 		return AnonymousAccess{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return AnonymousAccess{}, fmt.Errorf("commit: %w", err)
 	}
 	auth.Bump()
 	return a, nil
 }
 
-func setAnonymousAccess(ctx context.Context, q dbtx, access string, r *auth.Restriction) (AnonymousAccess, error) {
+func setAnonymousAccess(ctx context.Context, tx pgx.Tx, access string, r *auth.Restriction) (AnonymousAccess, error) {
 	if access != AccessOff && access != AccessListen {
 		return AnonymousAccess{}, fieldErr("access", fmt.Errorf("must be %q or %q", AccessOff, AccessListen))
 	}
-	if err := r.Validate(auth.KindAnonymous); err != nil {
+	// The entry limit applies to new input only: the stored restriction,
+	// sent back unchanged (`access set` without restriction flags, the
+	// admin pages saving the policy), may have outgrown it through system
+	// merges (r2-11).
+	validate := r.Validate
+	if r != nil {
+		stored, err := storedAnonymousRestriction(ctx, tx)
+		if err != nil {
+			return AnonymousAccess{}, err
+		}
+		if stored != nil && r.Equal(stored) {
+			validate = r.ValidateStored
+		}
+	}
+	if err := validate(auth.KindAnonymous); err != nil {
 		return AnonymousAccess{}, fieldErr("restriction", err)
 	}
-	v, err := json.Marshal(anonymousAccessValue{Access: access, Restriction: r.Normalize()})
+	r, err := rewriteForMerges(ctx, tx, r.Normalize())
+	if err != nil {
+		return AnonymousAccess{}, err
+	}
+	v, err := json.Marshal(anonymousAccessValue{Access: access, Restriction: r})
 	if err != nil {
 		return AnonymousAccess{}, err
 	}
 	var updated time.Time
-	if err := q.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		INSERT INTO auth_settings (name, value, updated_at) VALUES ($1, $2, now())
 		ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
 		RETURNING updated_at`, settingAnonymousAccess, v).Scan(&updated); err != nil {
 		return AnonymousAccess{}, err
 	}
-	return AnonymousAccess{Access: access, Restriction: r.Normalize(), UpdatedAt: &updated}, nil
+	return AnonymousAccess{Access: access, Restriction: r, UpdatedAt: &updated}, nil
+}
+
+// storedAnonymousRestriction returns the anonymous policy's stored
+// restriction (nil when none is stored).
+func storedAnonymousRestriction(ctx context.Context, tx pgx.Tx) (*auth.Restriction, error) {
+	var raw []byte
+	err := tx.QueryRow(ctx, `SELECT value FROM auth_settings WHERE name = $1`, settingAnonymousAccess).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read anonymous access: %w", err)
+	}
+	a, err := decodeAnonymousAccess(raw)
+	if err != nil {
+		return nil, err
+	}
+	return a.Restriction, nil
+}
+
+// restrictionMergeLockKey is a transaction-level advisory lock serializing
+// the writes of stored restrictions (keys, the anonymous policy) with
+// MergeSystems' restriction rewrite: a restriction written around a merge is
+// either rewritten by it or finds it in system_merge_log (rewriteForMerges).
+// ASCII "tr_restr".
+const restrictionMergeLockKey int64 = 0x74725F7265737472
+
+// lockRestrictions takes restrictionMergeLockKey in tx. Nothing that holds a
+// row lock on api_keys or auth_settings may take it afterwards: MergeSystems
+// takes it before locking those rows.
+func lockRestrictions(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, restrictionMergeLockKey); err != nil {
+		return fmt.Errorf("lock restrictions against system merges: %w", err)
+	}
+	return nil
+}
+
+// rewriteForMerges brings a restriction about to be stored up to date with
+// the system merges already done (§3.2): after taking restrictionMergeLockKey
+// it applies every merge in system_merge_log, oldest first, as MergeSystems
+// would have (auth.Restriction.RewriteSystem). A restriction written with a
+// merged-away system ID (from a page loaded before an automatic merge, or an
+// old ID copied from somewhere) would otherwise exclude nothing, because that
+// system's data now lives under the target ID. r must be normalized; a nil r,
+// or one naming no system, is returned as is without taking the lock.
+func rewriteForMerges(ctx context.Context, tx pgx.Tx, r *auth.Restriction) (*auth.Restriction, error) {
+	if r == nil || len(r.ReferencedSystems()) == 0 {
+		return r, nil
+	}
+	if err := lockRestrictions(ctx, tx); err != nil {
+		return nil, err
+	}
+	merges, err := readSystemMerges(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	out := r.Normalize()
+	applyMerges(out, merges)
+	return out, nil
+}
+
+// systemMerge is one system_merge_log row.
+type systemMerge struct{ source, target int }
+
+// readSystemMerges returns every logged system merge, oldest first.
+func readSystemMerges(ctx context.Context, tx pgx.Tx) ([]systemMerge, error) {
+	rows, err := tx.Query(ctx, `SELECT source_id, target_id FROM system_merge_log ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("read system merges: %w", err)
+	}
+	defer rows.Close()
+	var merges []systemMerge
+	for rows.Next() {
+		var m systemMerge
+		if err := rows.Scan(&m.source, &m.target); err != nil {
+			return nil, err
+		}
+		merges = append(merges, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read system merges: %w", err)
+	}
+	return merges, nil
+}
+
+// applyMerges rewrites r for merges (oldest first) as MergeSystems does
+// (auth.Restriction.RewriteSystem), then mirrors the exclusions over every
+// merge until they stop growing, so that an exclusion naming any system of
+// a chain of merges names all of them: rows can be written under a
+// merged-away ID around its merge and are never moved (r2-07). It reports
+// whether r changed.
+func applyMerges(r *auth.Restriction, merges []systemMerge) bool {
+	changed := false
+	for _, m := range merges {
+		if r.RewriteSystem(m.source, m.target) {
+			changed = true
+		}
+	}
+	// Each pass carries every exclusion at least one merge further along
+	// its chain; no chain is longer than len(merges).
+	for range merges {
+		grew := false
+		for _, m := range merges {
+			if r.MirrorExclusions(m.source, m.target) {
+				grew = true
+			}
+		}
+		if !grew {
+			break
+		}
+		changed = true
+	}
+	return changed
 }
 
 // GetOrCreateTicketSecret returns the ticket signing secret, generating and
@@ -210,15 +354,78 @@ func setRetiredPublicTokenHash(ctx context.Context, q dbtx, hash string) error {
 	return err
 }
 
+// ErrRetiredTokenIsKey: an active API key has the retired public token's
+// hash (imported before imports refused it), so forgetting the token would
+// turn the public value into a working key.
+var ErrRetiredTokenIsKey = errors.New("an active API key holds the retired public token")
+
 // ClearRetiredPublicToken forgets the retired public token
 // (`tr-engine access forget-retired-token`) and reports whether one was
-// stored.
+// stored; a request carrying it then gets 401 invalid_key. Its hash is kept
+// in forgotten_public_tokens so `keys import` still refuses it. If an active
+// API key has that hash it refuses, with an error wrapping
+// ErrRetiredTokenIsKey that names the key: that key must be revoked first.
 func (db *DB) ClearRetiredPublicToken(ctx context.Context) (bool, error) {
-	tag, err := db.Pool.Exec(ctx, `DELETE FROM auth_settings WHERE name = $1`, settingRetiredPublicToken)
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	var raw []byte
+	err = tx.QueryRow(ctx, `SELECT value FROM auth_settings WHERE name = $1 FOR UPDATE`, settingRetiredPublicToken).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
-	return tag.RowsAffected() > 0, nil
+	var hash string
+	if err := json.Unmarshal(raw, &hash); err == nil && validSHA256Hex(hash) {
+		var id int
+		err := tx.QueryRow(ctx, `SELECT id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL`, hash).Scan(&id)
+		if err == nil {
+			return false, fmt.Errorf("%w: key #%d; revoke it first (tr-engine keys revoke %d)", ErrRetiredTokenIsKey, id, id)
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return false, err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO auth_settings (name, value, updated_at) VALUES ($1, jsonb_build_array($2::text), now())
+			ON CONFLICT (name) DO UPDATE SET value = CASE
+				WHEN auth_settings.value @> EXCLUDED.value THEN auth_settings.value
+				ELSE auth_settings.value || EXCLUDED.value END, updated_at = now()`,
+			settingForgottenPublicTokens, hash); err != nil {
+			return false, fmt.Errorf("remember forgotten public token: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM auth_settings WHERE name = $1`, settingRetiredPublicToken); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	return true, nil
+}
+
+// IsRetiredPublicToken reports whether hash (a HashAPIKey digest) is the
+// retired public token's, or one forgotten with ClearRetiredPublicToken.
+func (db *DB) IsRetiredPublicToken(ctx context.Context, hash string) (bool, error) {
+	return isRetiredPublicToken(ctx, db.Pool, hash)
+}
+
+// isRetiredPublicToken reports whether hash is the retired public token's,
+// stored or forgotten: a value the old engine handed to every visitor.
+func isRetiredPublicToken(ctx context.Context, q dbtx, hash string) (bool, error) {
+	var retired bool
+	err := q.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM auth_settings
+			WHERE (name = $1 AND value = to_jsonb($3::text))
+			   OR (name = $2 AND jsonb_typeof(value) = 'array' AND value @> jsonb_build_array($3::text)))`,
+		settingRetiredPublicToken, settingForgottenPublicTokens, hash).Scan(&retired)
+	if err != nil {
+		return false, fmt.Errorf("check retired public token: %w", err)
+	}
+	return retired, nil
 }
 
 // WeakLegacyKey is an imported legacy key whose secret is shorter than
@@ -273,12 +480,25 @@ func (db *DB) WeakLegacyKeys(ctx context.Context) ([]WeakLegacyKey, error) {
 }
 
 // rewriteRestrictionsForMerge rewrites every restriction reference to system
-// source into target (§3.2): all api_keys.restriction values and the
-// anonymous policy's restriction. MergeSystems calls it inside its
-// transaction; the caller bumps the auth generation after commit. A stored
+// source for its merge into target (§3.2, auth.Restriction.RewriteSystem):
+// all api_keys.restriction values and the anonymous policy's restriction.
+// MergeSystems calls it inside its transaction, before it logs the merge; the
+// caller bumps the auth generation after commit. It takes
+// restrictionMergeLockKey first, so restrictions stored concurrently are
+// either rewritten here or rewritten on store (rewriteForMerges). A stored
 // restriction that doesn't decode fails the merge rather than being left
 // pointing at the merged-away system (which would void its exclusions).
 func rewriteRestrictionsForMerge(ctx context.Context, tx pgx.Tx, source, target int) (keysChanged int, anonChanged bool, err error) {
+	if err := lockRestrictions(ctx, tx); err != nil {
+		return 0, false, err
+	}
+	// This merge, after the logged ones: applyMerges also mirrors the
+	// exclusions across earlier merges that this one extends into a chain.
+	merges, err := readSystemMerges(ctx, tx)
+	if err != nil {
+		return 0, false, err
+	}
+	merges = append(merges, systemMerge{source, target})
 	rows, err := tx.Query(ctx,
 		`SELECT id, restriction FROM api_keys WHERE restriction IS NOT NULL ORDER BY id FOR UPDATE`)
 	if err != nil {
@@ -304,7 +524,7 @@ func rewriteRestrictionsForMerge(ctx context.Context, tx pgx.Tx, source, target 
 			rows.Close()
 			return 0, false, fmt.Errorf("api key %d: stored restriction: %w", id, err)
 		}
-		if !r.RewriteSystem(source, target) {
+		if !applyMerges(r, merges) {
 			continue
 		}
 		v, err := json.Marshal(r.Normalize())
@@ -336,7 +556,7 @@ func rewriteRestrictionsForMerge(ctx context.Context, tx pgx.Tx, source, target 
 	if err != nil {
 		return 0, false, err
 	}
-	if !a.Restriction.RewriteSystem(source, target) {
+	if a.Restriction == nil || !applyMerges(a.Restriction, merges) {
 		return len(changes), false, nil
 	}
 	v, err := json.Marshal(anonymousAccessValue{Access: a.Access, Restriction: a.Restriction.Normalize()})

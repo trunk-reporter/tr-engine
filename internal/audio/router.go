@@ -3,6 +3,8 @@ package audio
 import (
 	"context"
 	"fmt"
+	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,12 +17,20 @@ import (
 // systems with duplicate short names across instances).
 type IdentityLookup interface {
 	LookupByShortName(instanceID, shortName string) (systemID, siteID int, ok bool)
-	// LookupByShortNameAny scans all identity cache entries for a matching short name,
-	// skipping entries whose instanceID is in the exclude set. Returns the first
-	// non-excluded match along with its instanceID. Used for auto-learning source IP
+	// InstancesByShortName returns the IDs of every TR instance that has a
+	// system with this short name, sorted. Used for auto-learning source IP
 	// to instance mappings in multi-instance simplestream setups.
-	LookupByShortNameAny(shortName string, exclude map[string]bool) (systemID, siteID int, instanceID string, ok bool)
+	InstancesByShortName(shortName string) []string
 }
+
+// ambiguousWarnInterval is how often the router warns about one sender whose
+// short name matches several instances.
+const ambiguousWarnInterval = 5 * time.Minute
+
+// maxTrackedSenders caps the per-sender maps the router keeps (learned
+// attributions, warning times). Simplestream is unauthenticated UDP, so
+// source addresses can be spoofed; past the cap the maps are cleared.
+const maxTrackedSenders = 4096
 
 // activeStream tracks a live audio stream for a specific talkgroup.
 type activeStream struct {
@@ -49,12 +59,12 @@ type StreamJitterSnapshot struct {
 // AudioRouter receives AudioChunks, resolves identity (shortName to system/site),
 // deduplicates multi-site streams, encodes audio, and publishes AudioFrames to the AudioBus.
 type AudioRouter struct {
-	bus          *AudioBus
-	identity     IdentityLookup
-	instanceID   string        // TR instance ID fallback for scoped identity lookups
-	idleTimeout  time.Duration
-	opusBitrate  int // 0 = PCM passthrough, >0 = Opus requested (falls back to PCM if unavailable)
-	log          zerolog.Logger
+	bus         *AudioBus
+	identity    IdentityLookup
+	instanceID  string // TR instance ID fallback for scoped identity lookups
+	idleTimeout time.Duration
+	opusBitrate int // 0 = PCM passthrough, >0 = Opus requested (falls back to PCM if unavailable)
+	log         zerolog.Logger
 
 	input chan AudioChunk
 
@@ -63,7 +73,20 @@ type AudioRouter struct {
 	encoders      map[string]AudioEncoder  // key: "systemID:tgid"
 
 	sourceMu  sync.RWMutex
-	sourceMap map[string]string // sender IP → instanceID (auto-learned)
+	sourceMap map[string]string // sender IP → instanceID (STREAM_SOURCE_MAP)
+
+	// watchInstanceID and uploadInstanceID are the instances that file
+	// watch / TR_DIR imports and HTTP uploads resolve identities under
+	// (SetIngestOnlyInstances). They never send simplestream audio.
+	watchInstanceID  string
+	uploadInstanceID string
+
+	// Only the Run goroutine uses these. learned is the attribution last
+	// logged per "ip|short name" (it is re-derived for every chunk);
+	// ambiguousWarned is when the router last warned about a sender and
+	// short name it could not attribute.
+	learned         map[string]string
+	ambiguousWarned map[string]time.Time
 }
 
 // NewAudioRouter creates an AudioRouter that resolves identity, deduplicates
@@ -77,17 +100,64 @@ func (r *AudioRouter) SetLogger(l zerolog.Logger) {
 
 func NewAudioRouter(bus *AudioBus, identity IdentityLookup, instanceID string, idleTimeout time.Duration, opusBitrate int) *AudioRouter {
 	return &AudioRouter{
-		bus:           bus,
-		identity:      identity,
-		instanceID:    instanceID,
-		idleTimeout:   idleTimeout,
-		opusBitrate:   opusBitrate,
-		log:           zerolog.Nop(),
-		input:         make(chan AudioChunk, 256),
-		activeStreams: make(map[string]*activeStream),
-		encoders:      make(map[string]AudioEncoder),
-		sourceMap:     make(map[string]string),
+		bus:             bus,
+		identity:        identity,
+		instanceID:      instanceID,
+		idleTimeout:     idleTimeout,
+		opusBitrate:     opusBitrate,
+		log:             zerolog.Nop(),
+		input:           make(chan AudioChunk, 256),
+		activeStreams:   make(map[string]*activeStream),
+		encoders:        make(map[string]AudioEncoder),
+		sourceMap:       make(map[string]string),
+		learned:         make(map[string]string),
+		ambiguousWarned: make(map[string]time.Time),
 	}
+}
+
+// SetIngestOnlyInstances names the instance IDs under which file watch and
+// TR_DIR imports (watchID, WATCH_INSTANCE_ID) and HTTP uploads (uploadID,
+// UPLOAD_INSTANCE_ID) resolve identities. They create systems keyed by
+// (instance, short name) like a trunk-recorder instance does, but never send
+// simplestream audio, so a sender is attributed to them only when no real
+// instance has its short name, and to the upload instance (whose systems any
+// upload key can create) only when nothing else has it. Call before Run.
+func (r *AudioRouter) SetIngestOnlyInstances(watchID, uploadID string) {
+	r.watchInstanceID = watchID
+	r.uploadInstanceID = uploadID
+}
+
+// SetSourceMap configures sender IP → TR instance ID mappings
+// (STREAM_SOURCE_MAP). They take priority over automatic attribution, and
+// the instances they name are not attributed to other senders while any
+// other instance has the short name. Needed when instances share a short
+// name on different systems: the router can't tell their audio apart.
+func (r *AudioRouter) SetSourceMap(m map[string]string) {
+	r.sourceMu.Lock()
+	defer r.sourceMu.Unlock()
+	for ip, inst := range m {
+		r.sourceMap[ip] = inst
+	}
+}
+
+// ParseSourceMap parses STREAM_SOURCE_MAP: comma-separated "ip=instance_id"
+// pairs. IPs are normalized to the form the simplestream listener reports.
+func ParseSourceMap(s string) (map[string]string, error) {
+	out := make(map[string]string)
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		ipStr, inst, ok := strings.Cut(part, "=")
+		ip := net.ParseIP(strings.TrimSpace(ipStr))
+		inst = strings.TrimSpace(inst)
+		if !ok || ip == nil || inst == "" {
+			return nil, fmt.Errorf("invalid entry %q: want ip=instance_id", part)
+		}
+		out[ip.String()] = inst
+	}
+	return out, nil
 }
 
 // Input returns the channel for sending AudioChunks into the router.
@@ -121,48 +191,131 @@ func (r *AudioRouter) Run(ctx context.Context) {
 	}
 }
 
-// resolveInstanceID returns the instance ID to use for this chunk's identity lookup.
-// For chunks with a source address and short name, it checks the auto-learned
-// sourceMap first, then tries LookupByShortNameAny to learn new mappings.
-// Falls back to the configured STREAM_INSTANCE_ID.
-func (r *AudioRouter) resolveInstanceID(chunk AudioChunk) string {
-	// No source address or no short name — can't auto-learn, use fallback
+// resolveInstanceID returns the instance ID to use for this chunk's identity
+// lookup. A sender mapped by STREAM_SOURCE_MAP uses its configured instance.
+// Otherwise the attribution is derived again for every chunk, from the
+// instances that have the chunk's short name now (attributionCandidates):
+// the sender is attributed when they all resolve the short name to one
+// system. When they resolve it to different systems the router can't tell
+// which one sent it, and guessing would label one system's audio with
+// another's ID (which restrictions on live audio rely on), so it returns
+// ok = false and the chunk is dropped, with a WARN, until STREAM_SOURCE_MAP
+// maps the sender. Nothing learned earlier is kept as final: an instance
+// that appears later (a new TR instance, or a watched or uploaded call that
+// creates a file-watch or upload identity) is taken into account at once.
+// Chunks without a source address or short name, and short names no
+// instance has, use the configured STREAM_INSTANCE_ID.
+func (r *AudioRouter) resolveInstanceID(chunk AudioChunk) (string, bool) {
+	// No source address or no short name — can't attribute, use fallback
 	if chunk.SourceAddr == "" || chunk.ShortName == "" {
-		return r.instanceID
+		return r.instanceID, true
 	}
 
-	// Fast path: check if we've already learned this IP's instance
 	r.sourceMu.RLock()
-	if instID, ok := r.sourceMap[chunk.SourceAddr]; ok {
-		r.sourceMu.RUnlock()
-		return instID
+	instID, configured := r.sourceMap[chunk.SourceAddr]
+	// Instances the source map gives to other senders.
+	claimed := make(map[string]bool, len(r.sourceMap))
+	for ip, id := range r.sourceMap {
+		if ip != chunk.SourceAddr {
+			claimed[id] = true
+		}
 	}
 	r.sourceMu.RUnlock()
-
-	// Slow path: try to learn by scanning all identity entries.
-	// Build the exclude set from already-claimed instanceIDs.
-	r.sourceMu.RLock()
-	exclude := make(map[string]bool, len(r.sourceMap))
-	for _, instID := range r.sourceMap {
-		exclude[instID] = true
-	}
-	r.sourceMu.RUnlock()
-
-	_, _, instID, ok := r.identity.LookupByShortNameAny(chunk.ShortName, exclude)
-	if ok {
-		r.sourceMu.Lock()
-		r.sourceMap[chunk.SourceAddr] = instID
-		r.sourceMu.Unlock()
-		r.log.Info().
-			Str("source_ip", chunk.SourceAddr).
-			Str("instance_id", instID).
-			Str("short_name", chunk.ShortName).
-			Msg("auto-learned source IP → instance mapping")
-		return instID
+	if configured {
+		return instID, true
 	}
 
-	// Learning failed — fall back to configured default
-	return r.instanceID
+	candidates := r.attributionCandidates(r.identity.InstancesByShortName(chunk.ShortName), claimed)
+	key := chunk.SourceAddr + "|" + chunk.ShortName
+	switch {
+	case len(candidates) == 0:
+		// No instance has this short name — fall back to configured default
+		return r.instanceID, true
+	case len(candidates) == 1 || r.sameSystem(candidates, chunk.ShortName):
+		// One instance, or several on one system (merged sites): any of
+		// them labels the audio correctly.
+		instID := candidates[0]
+		if prev, ok := r.learned[key]; !ok || prev != instID {
+			if len(r.learned) >= maxTrackedSenders {
+				clear(r.learned)
+			}
+			r.learned[key] = instID
+			ev := r.log.Info()
+			if ok {
+				ev = r.log.Warn().Str("previous_instance_id", prev)
+			}
+			ev.Str("source_ip", chunk.SourceAddr).
+				Str("instance_id", instID).
+				Str("short_name", chunk.ShortName).
+				Msg("auto-learned source IP → instance mapping")
+		}
+		return instID, true
+	default:
+		delete(r.learned, key)
+		if now := time.Now(); now.Sub(r.ambiguousWarned[key]) >= ambiguousWarnInterval {
+			if len(r.ambiguousWarned) >= maxTrackedSenders {
+				clear(r.ambiguousWarned)
+			}
+			r.ambiguousWarned[key] = now
+			r.log.Warn().
+				Str("source_ip", chunk.SourceAddr).
+				Str("short_name", chunk.ShortName).
+				Strs("instances", candidates).
+				Msg("dropping live audio: several trunk-recorder instances use this short name for different systems, so its sender can't be attributed; map the sender with STREAM_SOURCE_MAP=ip=instance_id or give the systems unique short names")
+		}
+		return "", false
+	}
+}
+
+// attributionCandidates narrows the instances that have a chunk's short name
+// to the ones that may have sent it: instances the source map gives to other
+// senders are left out (unless that leaves none), then real trunk-recorder
+// instances win over the file-watch instance, which wins over the upload
+// instance (SetIngestOnlyInstances): neither sends simplestream audio, and
+// upload identities can be created by any upload key.
+func (r *AudioRouter) attributionCandidates(all []string, claimed map[string]bool) []string {
+	cands := all
+	var unclaimed []string
+	for _, id := range all {
+		if !claimed[id] {
+			unclaimed = append(unclaimed, id)
+		}
+	}
+	if len(unclaimed) > 0 {
+		cands = unclaimed
+	}
+	var real, watch, upload []string
+	for _, id := range cands {
+		switch {
+		case id != "" && id == r.watchInstanceID:
+			watch = append(watch, id)
+		case id != "" && id == r.uploadInstanceID:
+			upload = append(upload, id)
+		default:
+			real = append(real, id)
+		}
+	}
+	switch {
+	case len(real) > 0:
+		return real
+	case len(watch) > 0:
+		return watch
+	}
+	return upload
+}
+
+// sameSystem reports whether shortName resolves to one system on every
+// instance in instances.
+func (r *AudioRouter) sameSystem(instances []string, shortName string) bool {
+	first := 0
+	for i, instID := range instances {
+		sys, _, ok := r.identity.LookupByShortName(instID, shortName)
+		if !ok || (i > 0 && sys != first) {
+			return false
+		}
+		first = sys
+	}
+	return true
 }
 
 // processChunk resolves identity, applies dedup logic, and publishes a frame.
@@ -172,8 +325,10 @@ func (r *AudioRouter) processChunk(chunk AudioChunk) {
 
 	// Resolve identity from short name if system ID is not already set.
 	if systemID == 0 && chunk.ShortName != "" {
-		instanceID := r.resolveInstanceID(chunk)
-		var ok bool
+		instanceID, ok := r.resolveInstanceID(chunk)
+		if !ok {
+			return
+		}
 		systemID, siteID, ok = r.identity.LookupByShortName(instanceID, chunk.ShortName)
 		if !ok {
 			r.log.Debug().

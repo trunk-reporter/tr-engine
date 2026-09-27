@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -34,7 +35,7 @@ func setupAuth(ctx context.Context, db *database.DB, cfg *config.Config, freshDa
 	if res.Ran {
 		logLegacyImport(res.Detail, log)
 	}
-	warnLegacyVariables(legacy, res, log)
+	warnLegacyVariables(ctx, db, legacy, res, log)
 	for _, k := range res.WeakKeys {
 		log.Warn().Int("key_id", k.ID).Str("name", k.Name).Str("prefix", k.Prefix).
 			Msgf("legacy key #%d is weak (%d characters) — replace it", k.ID, k.Length)
@@ -61,7 +62,7 @@ func setupAuth(ctx context.Context, db *database.DB, cfg *config.Config, freshDa
 	} else if exists, err := db.ActiveAdminKeyExists(ctx); err != nil {
 		log.Warn().Err(err).Msg("checking for an active admin API key failed")
 	} else if !exists {
-		log.Error().Msg(`no active admin API key exists (all are revoked or expired) — create one on the host with: tr-engine keys create --name "admin" --scopes admin`)
+		log.Error().Msg(`no active admin API key exists (every admin key was revoked, expired or lost the admin scope) — create one on the host with: tr-engine keys create --name "admin" --scopes admin`)
 	}
 
 	anon, err := db.GetAnonymousAccess(ctx)
@@ -107,37 +108,99 @@ func logLegacyImport(d database.LegacyAuthDetail, log zerolog.Logger) {
 }
 
 // warnLegacyVariables logs one WARN per removed auth variable that is still
-// set, on every start (§11.2).
-func warnLegacyVariables(legacy config.LegacyAuthEnv, res database.LegacyAuthResult, log zerolog.Logger) {
+// set, on every start (§11.2). For AUTH_TOKEN and WRITE_TOKEN it first looks
+// up what this process's value is now (checkLegacyValue): the import's record
+// describes the value set when it ran, which another engine on the same
+// database, or a changed .env, may not share.
+func warnLegacyVariables(ctx context.Context, db *database.DB, legacy config.LegacyAuthEnv,
+	res database.LegacyAuthResult, log zerolog.Logger) {
 	for _, v := range legacy.Set() {
-		log.Warn().Str("variable", v.Name).Msg(legacyVariableWarning(v.Name, res))
+		var check *legacyValueCheck
+		if v.Name == "AUTH_TOKEN" || v.Name == "WRITE_TOKEN" {
+			c, err := checkLegacyValue(ctx, db, v.Value)
+			if err != nil {
+				log.Warn().Err(err).Str("variable", v.Name).Msg("looking up the value of a removed auth variable failed")
+			} else {
+				c.value = v.Value
+				check = &c
+			}
+		}
+		log.Warn().Str("variable", v.Name).Msg(legacyVariableWarning(v.Name, res, check))
 	}
 }
 
+// legacyValueCheck is what the engine does with a set AUTH_TOKEN or
+// WRITE_TOKEN value now.
+type legacyValueCheck struct {
+	value   string
+	keyID   int  // the API key whose secret it is; 0 = none
+	retired bool // the retired (or forgotten) public AUTH_TOKEN
+}
+
+func checkLegacyValue(ctx context.Context, db *database.DB, value string) (legacyValueCheck, error) {
+	var c legacyValueCheck
+	hash := database.HashAPIKey(value)
+	k, err := db.ResolveAPIKeyByHash(ctx, hash)
+	switch {
+	case err == nil:
+		c.keyID = k.ID
+	case !errors.Is(err, database.ErrAPIKeyNotFound):
+		return c, err
+	}
+	if c.retired, err = db.IsRetiredPublicToken(ctx, hash); err != nil {
+		return c, err
+	}
+	return c, nil
+}
+
 // legacyVariableWarning is the per-start message for a removed auth variable
-// that is still set.
-func legacyVariableWarning(name string, res database.LegacyAuthResult) string {
+// that is still set. check is what this process's AUTH_TOKEN or WRITE_TOKEN
+// value is now (nil when unknown: the message then follows the import's
+// record alone).
+func legacyVariableWarning(name string, res database.LegacyAuthResult, check *legacyValueCheck) string {
 	const remove = " — remove it from your configuration; see docs/migrating-auth.md"
 	switch name {
 	case "AUTH_TOKEN", "WRITE_TOKEN":
+		// notThisValue: the import's record is about another value.
+		notThisValue := name + " is set to a value the one-time import on " + res.ImportedAt.UTC().Format("2006-01-02") +
+			" did not import (it recorded a different one), so clients sending it get 401 invalid_key: " +
+			"if it is still in use, register it with tr-engine keys import; otherwise remove it. See docs/migrating-auth.md"
 		if k, ok := res.Detail.ImportedKey(name); ok {
+			if check != nil && check.keyID != k.KeyID {
+				return notThisValue
+			}
 			return fmt.Sprintf("%s is no longer used (imported as API key #%d '%s' on %s)%s",
 				name, k.KeyID, k.Name, res.ImportedAt.UTC().Format("2006-01-02"), remove)
 		}
 		reason, _ := res.Detail.SkipReason(name)
 		switch reason {
 		case database.SkipPublicToken:
+			if check != nil && !check.retired {
+				return notThisValue
+			}
 			return name + " is no longer used (it was the public read token, so it was not imported; requests that still carry it are treated as anonymous)" + remove
 		case database.SkipPublishedAsPublic:
+			if check != nil && !check.retired {
+				return notThisValue
+			}
 			return name + " is no longer used (it equalled the public AUTH_TOKEN, so it was not imported)" + remove
 		case database.SkipShellSubstitution:
+			if check != nil && !strings.Contains(check.value, "$(") {
+				return notThisValue
+			}
 			return name + ` is no longer used (it contained "$(", so it was not imported)` + remove
 		case database.SkipFreshDatabase:
 			return name + " is no longer used (not imported into a new database; clients use API keys)" + remove
 		case database.SkipAuthDisabled:
 			return name + " is no longer used (not imported: AUTH_ENABLED=false disabled it)" + remove
 		case database.SkipSameAsWriteToken:
+			if w, ok := res.Detail.ImportedKey("WRITE_TOKEN"); check != nil && (!ok || check.keyID != w.KeyID) {
+				return notThisValue
+			}
 			return name + " is no longer used (it equalled WRITE_TOKEN, imported as that key)" + remove
+		}
+		if check != nil && check.keyID != 0 {
+			return fmt.Sprintf("%s is no longer used (its value is API key #%d)%s", name, check.keyID, remove)
 		}
 		return name + " is no longer used — clients use API keys; register a secret that is still in use with tr-engine keys import. See docs/auth.md"
 	case "ADMIN_PASSWORD", "ADMIN_USERNAME", "JWT_SECRET":

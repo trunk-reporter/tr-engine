@@ -49,8 +49,80 @@
   // Credentials of the old auth modes are never used again.
   for (var i = 0; i < OLD_STORAGE_KEYS.length; i++) storageRemove(OLD_STORAGE_KEYS[i]);
 
+  // ── Pasted keys ──────────────────────────────────────────────────
+  // Same rules as tr-dashboard's cleanPastedKey (src/lib/apiKeyInput.ts).
+  // Invisible formatting characters documents, email and chat apps add to
+  // copied text (soft hyphen, zero-width space/joiners, direction marks, word
+  // joiner, BOM). None can be part of a key, so they are dropped anywhere.
+  var INVISIBLE_CHARS = /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/g;
+  // Typographic quotes a key picks up when copied from a document or email.
+  var TYPO_QUOTES = '\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A';
+  var TYPO_QUOTES_AROUND = new RegExp('^[' + TYPO_QUOTES + ']+|[' + TYPO_QUOTES + ']+$', 'g');
+  var MINTED_KEY = /^tre_[0-9a-f]{64}$/;
+  var CONTROL_CHAR = (function () {
+    try { return new RegExp('[\\p{Cc}\\p{Cf}]', 'u'); } catch (e) { return /[\x00-\x1f\x7f-\x9f]/; }
+  })();
+
+  // What an Authorization header can carry for a key: printable ASCII without
+  // spaces. Browsers refuse to send anything outside ISO-8859-1 (fetch throws
+  // before any request, which looks like a network failure), and the engine
+  // hashes the bytes it receives, so a non-ASCII value could never match.
+  function isSendableKey(key) {
+    return /^[\x21-\x7e]+$/.test(key);
+  }
+
+  function describeChar(ch) {
+    var hex = ch.codePointAt(0).toString(16).toUpperCase();
+    while (hex.length < 4) hex = '0' + hex;
+    var code = 'U+' + hex;
+    if (CONTROL_CHAR.test(ch)) return 'an invisible character (' + code + ')';
+    return '"' + ch + '" (' + code + ')';
+  }
+
+  // Cleans a pasted key before it is sent: drops invisible characters,
+  // surrounding whitespace and typographic quotes, and straight quotes around
+  // a well-formed tre_ key (e.g. copied from KEY="tre_..."). Other straight
+  // quotes are kept, since an imported legacy key may contain them.
+  // Returns {key, error}: error is '' when key can be sent, otherwise a
+  // message saying why the value can't be a key (and key is '').
+  function cleanKey(raw) {
+    var key = String(raw == null ? '' : raw).replace(INVISIBLE_CHARS, '').trim()
+      .replace(TYPO_QUOTES_AROUND, '').trim();
+    var q = key.charAt(0);
+    if (key.length > 2 && (q === '"' || q === "'" || q === '`') && key.charAt(key.length - 1) === q) {
+      var unquoted = key.slice(1, -1).trim();
+      if (MINTED_KEY.test(unquoted)) key = unquoted;
+    }
+    if (!key) return { key: '', error: 'Paste an API key.' };
+    if (/\s/.test(key)) return { key: '', error: 'An API key has no spaces or line breaks.' };
+    if (!isSendableKey(key)) {
+      var bad = Array.from(key).find(function (ch) { return !isSendableKey(ch); });
+      return {
+        key: '',
+        error: 'This doesn’t look like an API key: it contains ' + (bad ? describeChar(bad) : 'a character') +
+          ', which an API key can’t have. Copy the key again from where it was first shown ' +
+          '(curly quotes and invisible characters often come from documents, email or chat).'
+      };
+    }
+    return { key: key, error: '' };
+  }
+
+  // The stored key, cleaned. A value that can't be sent in a header would
+  // make every API request on the page throw, so it is forgotten.
+  function storedKey() {
+    var raw = storageGet(STORAGE_KEY) || '';
+    if (!raw.trim()) return '';
+    var c = cleanKey(raw);
+    if (c.error) {
+      warnOnce('unsendable-key', 'tr-engine: the stored API key contains characters an API key can’t have, so it was forgotten');
+      storageRemove(STORAGE_KEY);
+    }
+    return c.key;
+  }
+
   // ── State ────────────────────────────────────────────────────────
-  var apiKey = (storageGet(STORAGE_KEY) || '').trim();
+  var warned = {};
+  var apiKey = storedKey();
   var whoamiData = null;      // last 200 body of GET /whoami for the current credential
   var keyStatus = apiKey ? 'unknown' : 'none';  // 'none' | 'valid' | 'invalid' | 'unknown'
   var anonymous = null;       // {access, restricted} from the last whoami
@@ -61,7 +133,6 @@
   var ticketTimer = null;
   var modal = null;           // {kind, promise}
   var streams = new Set();    // live EventSource wrappers
-  var warned = {};
 
   // ── Helpers ──────────────────────────────────────────────────────
   function warnOnce(id, msg) {
@@ -139,6 +210,11 @@
       if (params[n] != null && params[n] !== '') parts.push(n + '=' + encodeURIComponent(params[n]));
     });
     return path + (parts.length ? '?' + parts.join('&') : '') + hash;
+  }
+
+  // The first value of a query parameter ('' when absent or unparsable).
+  function queryParam(url, name) {
+    try { return new URL(String(url), location.href).searchParams.get(name) || ''; } catch (e) { return ''; }
   }
 
   var SCOPE_IMPLIES = { admin: ['admin', 'edit', 'listen'], edit: ['edit', 'listen'], listen: ['listen'], upload: ['upload'] };
@@ -413,9 +489,18 @@
     return applyKeyChange('');
   }
 
+  // trAuth.setKey: a value that can't be sent in a header would make every
+  // API request on the page throw, so it is refused, not stored.
+  function setKeyChecked(k) {
+    if (!String(k == null ? '' : k).trim()) return clearKey();
+    var c = cleanKey(k);
+    if (c.error) return Promise.reject(authError('invalid_key_format', c.error));
+    return setKey(c.key);
+  }
+
   // Keep tabs in step when another tab sets or forgets the key.
   window.addEventListener('storage', function (e) {
-    if (e.key === STORAGE_KEY || e.key === null) applyKeyChange(storageGet(STORAGE_KEY) || '');
+    if (e.key === STORAGE_KEY || e.key === null) applyKeyChange(storedKey());
   });
 
   // Resolves after whoami and, when a key is stored, after the first ticket.
@@ -535,7 +620,10 @@
         this._conn = 0;
         this._mode = '';
         this._usedTicket = '';
-        this._lastEventId = '';
+        // Resume from the page's own last_event_id (the documented way to
+        // change filters without a gap) until the stream delivers a newer id;
+        // ticket connects rebuild the URL, so it must not be dropped there.
+        this._lastEventId = queryParam(this._rawUrl, 'last_event_id');
         this._attempt = 0;
         this._timer = null;
         this._pageClosed = false;
@@ -902,8 +990,9 @@
     function showErr(msg) { errLine.textContent = msg; errLine.style.display = 'block'; }
 
     function submit() {
-      var candidate = input.value.trim();
-      if (!candidate) { showErr('Paste a key first.'); return; }
+      var cleaned = cleanKey(input.value);
+      if (cleaned.error) { showErr(cleaned.error); return; }
+      var candidate = cleaned.key;
       save.disabled = true;
       save.textContent = 'Checking…';
       fetchWhoami(candidate).then(function (r) {
@@ -970,8 +1059,12 @@
   window.trAuth = {
     ready: ready,
     getKey: function () { return apiKey; },
-    setKey: function (k) { return setKey(k); },
+    // Stores a key after cleaning it like the key prompt does (cleanKey);
+    // rejects, keeping the current key, when the value can't be a key.
+    setKey: function (k) { return setKeyChecked(k); },
     clearKey: clearKey,
+    // Cleans a pasted key: {key, error}, error '' when it can be sent.
+    cleanKey: cleanKey,
     whoami: function (opts) {
       if (opts && opts.refresh) return loadWhoami().then(function () { return whoamiData; });
       return whoamiReady().then(function () { return whoamiData; });
@@ -991,7 +1084,7 @@
     // POST /pages) keep working.
     getToken: function () { deprecated('getToken', 'mediaUrl(url) or ticketUrl(url)'); return ''; },
     getWriteToken: function () { deprecated('getWriteToken'); return ''; },
-    setToken: function (t) { deprecated('setToken', 'setKey(key)'); return setKey(t); },
+    setToken: function (t) { deprecated('setToken', 'setKey(key)'); return setKeyChecked(t); },
     hasWriteAccess: function () { deprecated('hasWriteAccess', "hasScope('edit')"); return hasScope('edit'); },
     showPrompt: function () { deprecated('showPrompt', 'showKeyPrompt()'); return promptForKey('manual'); },
     getMode: function () { deprecated('getMode', 'whoami()'); return apiKey ? 'key' : 'anonymous'; },

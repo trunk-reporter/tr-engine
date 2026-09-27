@@ -32,6 +32,7 @@ type Config struct {
 	// Live audio streaming (simplestream UDP ingest → WebSocket relay)
 	StreamListen      string        `env:"STREAM_LISTEN"`                              // UDP listen address, e.g. ":9123". Feature disabled if empty.
 	StreamInstanceID  string        `env:"STREAM_INSTANCE_ID" envDefault:"trunk-recorder"` // TR instance ID for identity resolution
+	StreamSourceMap   string        `env:"STREAM_SOURCE_MAP"`                              // "ip=instance_id,..." — attributes simplestream senders explicitly (needed when instances share a short name)
 	StreamSampleRate  int           `env:"STREAM_SAMPLE_RATE" envDefault:"8000"`        // Default PCM sample rate (8000 P25, 16000 analog)
 	StreamOpusBitrate int           `env:"STREAM_OPUS_BITRATE" envDefault:"16000"`      // Opus encoder bitrate in bps
 	StreamMaxClients  int           `env:"STREAM_MAX_CLIENTS" envDefault:"50"`          // Max concurrent WebSocket listeners

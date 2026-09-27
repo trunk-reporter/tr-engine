@@ -12,7 +12,9 @@ import (
 
 // AudioStore abstracts audio file storage backends.
 type AudioStore interface {
-	// Save stores audio data. key format: {sys_name}/{YYYY-MM-DD}/{filename}
+	// Save stores audio data, replacing any file stored under key. Key
+	// formats: {sys_name}/{YYYY-MM-DD}/{filename} (MQTT audio) and
+	// upload/{system_id}/{YYYY-MM-DD}/{call_id}.{ext} (HTTP uploads).
 	Save(ctx context.Context, key string, data []byte, contentType string) error
 
 	// LocalPath returns the local filesystem path if the file exists on disk.

@@ -1,8 +1,13 @@
 package ingest
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
-	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,8 +38,19 @@ type EventBus struct {
 	ringSize int
 	ringHead int
 
+	// idCipher turns sequence numbers into event IDs (eventID).
+	idCipher cipher.Block
+
+	// Evictions since the last eviction warning, and when it was logged
+	// (guarded by mu; the warning itself is logged after mu is released).
+	evicted      uint64
+	evictLogTime time.Time
+
 	log zerolog.Logger
 }
+
+// evictionLogInterval is the least time between two ring-eviction warnings.
+const evictionLogInterval = time.Minute
 
 type subscriber struct {
 	ch     chan api.SSEEvent
@@ -50,12 +66,33 @@ type subscriber struct {
 
 // NewEventBus creates an event bus with the given ring buffer size.
 func NewEventBus(log zerolog.Logger, ringSize int) *EventBus {
+	key := make([]byte, 16)
+	if _, err := rand.Read(key); err != nil {
+		panic("eventbus: no randomness for event IDs: " + err.Error())
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic("eventbus: " + err.Error())
+	}
 	return &EventBus{
 		subscribers: make(map[uint64]*subscriber),
 		ring:        make([]api.SSEEvent, ringSize),
 		ringSize:    ringSize,
+		idCipher:    block,
 		log:         log,
 	}
+}
+
+// eventID returns the SSE event ID of the event with sequence number seq,
+// published at now: "<unix ms>-<32 hex digits>". The hex part is seq
+// encrypted under a per-process key, so IDs are unique but opaque: the
+// sequence is global across talkgroups, and a restricted subscriber must not
+// learn from gaps between its IDs how many events it wasn't shown (§14.5).
+func (eb *EventBus) eventID(now time.Time, seq uint64) string {
+	var block [aes.BlockSize]byte
+	binary.BigEndian.PutUint64(block[:8], seq)
+	eb.idCipher.Encrypt(block[:], block[:])
+	return strconv.FormatInt(now.UnixMilli(), 10) + "-" + hex.EncodeToString(block[:])
 }
 
 // subscriberBuffer is the minimum channel buffer of a subscriber.
@@ -165,14 +202,32 @@ func (eb *EventBus) Publish(e EventData) {
 
 	// Numbering, the ring and distribution happen under one lock, so ring
 	// order is sequence order and SubscribeSince sees a consistent cut.
+	// Logging waits until the lock is released.
+	event, evictedLog, slow, subscribers := eb.publishLocked(e, data)
+
+	if evictedLog > 0 {
+		eb.log.Warn().Uint64("evicted", evictedLog).Int("ring_size", eb.ringSize).
+			Msg("sse: replay buffer full — the oldest events can no longer be replayed to reconnecting clients")
+	}
+	if slow > 0 {
+		eb.log.Warn().Str("event_type", e.Type).Str("event_id", event.ID).Int("slow_subscribers", slow).
+			Int("subscriber_count", subscribers).Msg("sse: dropped event for slow subscribers")
+	}
+}
+
+// publishLocked numbers e, adds it to the ring and sends it to the matching
+// subscribers, under eb.mu. It returns the event, the evictions to warn about
+// now (0: none, or too soon after the last warning), and how many of the
+// subscribers were too slow to take it.
+func (eb *EventBus) publishLocked(e EventData, data []byte) (event api.SSEEvent, evictedLog uint64, slow, subscribers int) {
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
 
 	eb.seq++
 	seq := eb.seq
 	now := time.Now()
-	event := api.SSEEvent{
-		ID:        fmt.Sprintf("%d-%d", now.UnixMilli(), seq),
+	event = api.SSEEvent{
+		ID:        eb.eventID(now, seq),
 		Type:      e.Type,
 		SubType:   e.SubType,
 		Timestamp: now.UTC().Format(time.RFC3339),
@@ -185,10 +240,15 @@ func (eb *EventBus) Publish(e EventData) {
 		Seq:       seq,
 	}
 
-	// Add to ring buffer
+	// Add to ring buffer. Once it is full every publish evicts the oldest
+	// event from replay; that is counted, and warned about at most once per
+	// evictionLogInterval.
 	if eb.ring[eb.ringHead].ID != "" {
 		metrics.SSEEventsDroppedTotal.WithLabelValues("ring_eviction").Inc()
-		eb.log.Warn().Str("evicted_id", eb.ring[eb.ringHead].ID).Str("event_type", e.Type).Msg("sse: ring buffer eviction — event lost from replay")
+		eb.evicted++
+		if now.Sub(eb.evictLogTime) >= evictionLogInterval {
+			evictedLog, eb.evicted, eb.evictLogTime = eb.evicted, 0, now
+		}
 	}
 	eb.ring[eb.ringHead] = event
 	eb.ringHead = (eb.ringHead + 1) % eb.ringSize
@@ -203,7 +263,25 @@ func (eb *EventBus) Publish(e EventData) {
 		default:
 			// Drop if subscriber is slow
 			metrics.SSEEventsDroppedTotal.WithLabelValues("slow_subscriber").Inc()
-			eb.log.Warn().Str("event_type", e.Type).Str("event_id", event.ID).Int("subscriber_count", len(eb.subscribers)).Msg("sse: dropped event for slow subscriber")
+			slow++
+		}
+	}
+	return event, evictedLog, slow, len(eb.subscribers)
+}
+
+// RewriteSystemID relabels the buffered events of system oldID as newID
+// after a merge, so a replay checks them against restrictions (which the
+// merge rewrote) under the ID their data now has. Their payloads keep the ID
+// they were published with.
+func (eb *EventBus) RewriteSystemID(oldID, newID int) {
+	if oldID <= 0 {
+		return
+	}
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+	for i := range eb.ring {
+		if eb.ring[i].ID != "" && eb.ring[i].SystemID == oldID {
+			eb.ring[i].SystemID = newID
 		}
 	}
 }

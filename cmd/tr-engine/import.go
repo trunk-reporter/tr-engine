@@ -23,6 +23,7 @@ func runImport(args []string, overrides config.Overrides) {
 	audioDir := fs.String("audio-dir", "", "Directory to extract audio files to (default: from config AUDIO_DIR)")
 	fs.StringVar(&overrides.EnvFile, "env-file", overrides.EnvFile, "Path to .env file")
 	fs.StringVar(&overrides.DatabaseURL, "database-url", overrides.DatabaseURL, "PostgreSQL connection URL")
+	migrate := fs.Bool("migrate", false, "Also upgrade a database from a tr-engine version before API keys (irreversible; normally the first start of the server does that)")
 	fs.Parse(args)
 
 	if *file == "" {
@@ -33,6 +34,11 @@ func runImport(args []string, overrides config.Overrides) {
 
 	if *mode != "metadata" && *mode != "full" && *mode != "calls" {
 		fmt.Fprintf(os.Stderr, "error: invalid mode %q (valid: full, metadata, calls)\n", *mode)
+		os.Exit(1)
+	}
+
+	if *dryRun && *migrate {
+		fmt.Fprintln(os.Stderr, "error: --migrate can't be combined with --dry-run: a dry run never upgrades a database from before API keys")
 		os.Exit(1)
 	}
 
@@ -52,11 +58,15 @@ func runImport(args []string, overrides config.Overrides) {
 	}
 	defer db.Close()
 
-	// Try to apply migrations (non-fatal — import upserts handle missing columns gracefully)
+	// Try to apply migrations (non-fatal — import upserts handle missing columns gracefully).
+	// Without --migrate (never with --dry-run), the irreversible upgrade of a
+	// database from before API keys is left to the server: import doesn't
+	// need it, and an older engine still running on the database wouldn't
+	// survive it.
 	if err := db.InitSchema(ctx, trengine.SchemaSQL); err != nil {
 		log.Warn().Err(err).Msg("schema initialization failed (continuing anyway)")
 	}
-	if err := db.Migrate(ctx); err != nil {
+	if err := migrateForCLI(ctx, db, *migrate, skipAuthConversion, os.Stderr); err != nil {
 		log.Warn().Err(err).Msg("schema migration failed (some columns may be missing)")
 	}
 

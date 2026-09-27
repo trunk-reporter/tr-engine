@@ -39,6 +39,7 @@ func runExport(args []string, overrides config.Overrides) {
 	fs.StringVar(&overrides.EnvFile, "env-file", overrides.EnvFile, "Path to .env file")
 	fs.StringVar(&overrides.DatabaseURL, "database-url", overrides.DatabaseURL, "PostgreSQL connection URL")
 	fs.StringVar(&overrides.AudioDir, "audio-dir", overrides.AudioDir, "Audio file directory")
+	migrate := fs.Bool("migrate", false, "Also upgrade a database from a tr-engine version before API keys (irreversible; normally the first start of the server does that)")
 	fs.Parse(args)
 
 	if *output == "" {
@@ -72,11 +73,14 @@ func runExport(args []string, overrides config.Overrides) {
 	}
 	defer db.Close()
 
-	// Try to apply migrations (non-fatal for export — read-only operation)
+	// Try to apply migrations (non-fatal for export — read-only operation).
+	// Without --migrate, the irreversible upgrade of a database from before
+	// API keys is left to the server: export doesn't need it, and an older
+	// engine still running on the database wouldn't survive it.
 	if err := db.InitSchema(ctx, trengine.SchemaSQL); err != nil {
 		log.Warn().Err(err).Msg("schema initialization failed (continuing anyway)")
 	}
-	if err := db.Migrate(ctx); err != nil {
+	if err := migrateForCLI(ctx, db, *migrate, skipAuthConversion, os.Stderr); err != nil {
 		log.Warn().Err(err).Msg("schema migration failed (some columns may be missing)")
 	}
 

@@ -107,7 +107,7 @@ Because it makes the server send its configuration to a third party, the endpoin
 |-------|------|-------------|
 | `config` | object | Full config with secrets redacted (see below) |
 | `environment` | object | `{ hostname, in_container, go_version, go_os, go_arch, num_cpu, network_interfaces }` |
-| `mqtt_connected` | bool | MQTT broker connection state |
+| `mqtt_connected` | bool | MQTT broker connection state (`false` on an install without MQTT: no `MQTT_BROKER_URL`; the endpoint works there too) |
 | `tr_instances` | array | `[{ instance_id, status, last_seen }]` |
 | `ingest_metrics` | object | `{ MsgCount, ActiveCalls, HandlerCounts, SSESubscribers }` |
 | `watcher_status` | object | File watcher state (if active) |

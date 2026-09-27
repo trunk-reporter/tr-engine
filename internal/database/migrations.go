@@ -382,7 +382,22 @@ func (db *DB) PendingMigrations(ctx context.Context) ([]PendingMigration, error)
 // It holds schemaLockKey throughout, so a second process starting at the same
 // time waits, then finds the migrations applied.
 func (db *DB) Migrate(ctx context.Context) error {
-	return db.withSchemaLock(ctx, func(conn *pgxpool.Conn) error {
+	_, err := db.migrate(ctx, false)
+	return err
+}
+
+// MigrateReversible is Migrate without the irreversible migrations (the
+// conversion of a database from before API keys, which an older engine still
+// running on it can't survive): it applies the other pending migrations and
+// returns the names of the irreversible ones it left pending. Every
+// migration's check and SQL stands on its own (see migrations), so a later
+// Migrate applies the ones left out.
+func (db *DB) MigrateReversible(ctx context.Context) (skipped []string, err error) {
+	return db.migrate(ctx, true)
+}
+
+func (db *DB) migrate(ctx context.Context, skipIrreversible bool) (skipped []string, err error) {
+	err = db.withSchemaLock(ctx, func(conn *pgxpool.Conn) error {
 		var pending []migration
 		for _, m := range migrations {
 			if m.check != "" {
@@ -390,6 +405,10 @@ func (db *DB) Migrate(ctx context.Context) error {
 				if err := conn.QueryRow(ctx, m.check).Scan(&exists); err == nil && exists {
 					continue
 				}
+			}
+			if skipIrreversible && m.irreversible {
+				skipped = append(skipped, m.name)
+				continue
 			}
 			pending = append(pending, m)
 		}
@@ -414,6 +433,7 @@ func (db *DB) Migrate(ctx context.Context) error {
 		db.log.Info().Int("applied", applied).Msg("schema migrations complete")
 		return nil
 	})
+	return skipped, err
 }
 
 // MigrationError is returned when a migration fails.

@@ -61,7 +61,7 @@ main.go                      config.go
 
 The removed auth variables (`AUTH_ENABLED`, `AUTH_TOKEN`, `WRITE_TOKEN`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `JWT_SECRET`, `CORS_ORIGINS`) configure nothing. They are read only by the one-time legacy import and to log a warning on each start. Access control lives in the database: `api_keys`, and `auth_settings` (anonymous access policy, ticket secret, retired public token).
 
-Subcommands (`export`, `import`, `keys`, `access`) are dispatched from `main.go` before the server starts. `keys` and `access` load the same config, connect, run `InitSchema` + `Migrate`, log to stderr at WARN, and print only their result on stdout.
+Subcommands (`export`, `import`, `keys`, `access`) are dispatched from `main.go` before the server starts. They load the same config, connect, run `InitSchema` and then `migrateForCLI` (`cmd/tr-engine/keys.go`), which names pending migrations on stderr and applies the irreversible ones (the conversion of a database from before API keys, see [Migrate](#migrate)) only with `--migrate`. Without it, `keys` and `access` refuse such a database, and `export` and `import` apply the rest with `database.MigrateReversible` and leave the irreversible ones to the server's first start, with a note on stderr (`import --dry-run` never applies them; `--dry-run --migrate` is refused). `keys` and `access` log to stderr at WARN and print only their result on stdout.
 
 Docker Compose uses `${VAR:-default}` interpolation in `docker-compose.yml` so most settings work without `.env`. Secrets have no defaults: `POSTGRES_PASSWORD` and `MQTT_PASSWORD` use `${VAR:?...}` so compose refuses to start without them.
 
@@ -109,6 +109,8 @@ for each migration in migrations slice:
 ```
 
 Migrations handle post-`schema.sql` changes (new columns, replaced indexes). Fatal on failure since queries depend on the schema being current. The auth migrations read and drop a `users` table only if it is old tr-engine's (`trEngineUsersSQL`: its `trg_users_updated_at` trigger or viewer/editor role CHECK); another application's `users` table in a shared database is left alone.
+
+Two migrations are marked `irreversible` (`convert api_keys to app keys`, `record and drop users`): they convert a database from before API keys, which an older engine still running on it can't survive. `Migrate` applies all pending migrations (the server, and CLI commands given `--migrate`); `MigrateReversible` applies all but the irreversible ones and returns the names it left pending (`export`/`import` without `--migrate`). `PendingMigrations` lists what `Migrate` would apply, with the `Irreversible` flag, for the CLI's stderr notes.
 
 ### Partition Maintenance
 
@@ -435,11 +437,16 @@ POST /api/v1/call-upload
   └── pipeline.ProcessUploadedCall(ctx, data)
         ├── identity.Resolve(uploadInstanceID, sysName)
         ├── Dedup check: FindCallByTgidStartTime
-        ├── InsertCall (status=COMPLETED); a month with no partition outside
-        │     the on-demand window (12 back to 3 ahead) → 400 invalid_body
+        ├── InsertCall (status=COMPLETED); on "no partition" it calls
+        │     ensurePartitionsFor and retries once; a month outside the
+        │     on-demand window (12 back to 3 ahead, errPartitionOutOfRange)
+        │     → 400 invalid_body
         ├── Save audio file (store.Save) as upload/<system_id>/<YYYY-MM-DD>/
         │     <call_id>.<ext> (m4a/mp3/wav/ogg/bin from audioType or the file
-        │     name; never overwrites: an existing file gets a random suffix)
+        │     name). Never overwrites: if a file is already stored under
+        │     that name, the existing file is left untouched and the upload
+        │     is saved as <call_id>-<12 hex>.<ext> instead, with a WARN
+        │     (newUploadAudioKey)
         ├── Assign call_group
         ├── Enqueue transcription
         └── PublishEvent("call_end")
@@ -449,7 +456,7 @@ POST /api/v1/call-upload
 
 ### Middleware Stack
 
-`internal/api/server.go:buildRouter()` — exact order as wired. The code is split across `middleware.go` (RequestID, CORS, Recoverer, Logger, APIHeaders, MaxBodySize, ResponseTimeout), `pipeline.go` (Match, Resolve, Authorize, Audit, UploadAuth), `authn.go` (key and ticket resolution, rate limits), `keycache.go` (key cache, limiter sets) and `streamauth.go` (re-checks of open streams, see [SSE Handler](#sse-handler)).
+`internal/api/server.go:buildRouter()` — exact order as wired. The code is split across `middleware.go` (RequestID, CORS, Logger, Recoverer, APIHeaders, MaxBodySize, ResponseTimeout), `pipeline.go` (Match, Resolve, Authorize, Audit, UploadAuth), `authn.go` (key and ticket resolution, rate limits), `keycache.go` (key cache, limiter sets) and `streamauth.go` (re-checks of open streams, see [SSE Handler](#sse-handler)).
 
 Router construction lives in `buildRouter(opts) *chi.Mux`. Every route is registered flat (no `r.Route(...)` sub-routers), so `chi.Walk` and `Mux.Find` agree on pattern strings, and every route has an entry in the policy table in `internal/api/policy.go`. HEAD requests are served by the GET handler (`middleware.GetHead`).
 
@@ -459,10 +466,13 @@ Root middleware, in order:
   2. CORS        — Access-Control-Allow-Origin: * on every response, never
                    Allow-Credentials; OPTIONS → 204 here, before auth or routing
      GetHead     — HEAD requests are served by the GET handler
-  3. Recoverer   — catch panics → JSON 500
-     Logger      — one access line (zerolog/hlog) for every request, refusals
-                   included; a WebSocket upgrade is logged as 101 when the
-                   socket closes
+  3. Logger      — one access line (zerolog/hlog) for every request, refusals
+                   and recovered panics (500) included; a WebSocket upgrade is
+                   logged as 101 when the socket closes
+     Recoverer   — inside Logger: catch a panic → JSON 500, logged as
+                   "recovered from panic" with its stack, method and path
+                   through the request's logger; http.ErrAbortHandler is
+                   re-raised (net/http aborts the response)
      APIHeaders  — Cache-Control: no-store and Vary: Authorization on /api/v1
   4. Match       — path = URL.RawPath or URL.Path; pattern = root.Find(fresh
                    route context, method, path), HEAD falling back to GET
@@ -484,6 +494,9 @@ Root middleware, in order:
   8. Route-group middleware: MaxBodySize (10 MB API, 50 MB upload),
      [InstrumentHandler if metrics enabled], upload middleware,
      ResponseTimeout (http.TimeoutHandler; skips SSE + audio) → handler
+     (ResponseTimeout wraps the handler in keepPanicStack: TimeoutHandler
+     re-panics in its own goroutine, so the handler's panic travels as a
+     handlerPanic that carries the original stack to Recoverer)
 ```
 
 Rate limiting (step 5): no credential → per-IP limiter (this includes uploads whose key is in the multipart form: Resolve sees no header credential and charges the IP; UploadAuth then resolves the form key, charging a second IP token on a cache miss) (`RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`, IP from `TrustedProxies.ClientIP`). A bearer found in the positive key cache → the key's own `rate_limit_rps` limiter if set, otherwise none (legacy keys: per-IP). A bearer not in the positive cache → take a per-IP token first (429 without touching the database if none), then the negative cache, then the database (2 s timeout; errors → 503, never cached). Tickets: MAC and expiry checked without the database, key resolved through the cache, per-IP limited.
@@ -524,9 +537,11 @@ http.Server{
     ReadTimeout:  cfg.ReadTimeout,    // default 5s
     IdleTimeout:  cfg.IdleTimeout,    // default 120s
     WriteTimeout: 0,                  // disabled for SSE
-    MaxHeaderBytes: 64 << 10,         // request line + headers; larger → 431
+    MaxHeaderBytes: 64 << 10,         // request line + headers; net/http adds 4 KiB of read slack, larger → 431
 }
 ```
+
+`MaxHeaderBytes` is 64 KiB, but net/http reads up to `MaxHeaderBytes` + 4096 bytes before it answers `431 Request Header Fields Too Large`, so requests of 64–68 KiB are still accepted. The documented client limit is 64 KiB.
 
 `WriteTimeout=0` allows long-lived SSE connections. Non-streaming handlers are bounded by `ResponseTimeout` middleware (default 30s) and DB query timeouts.
 

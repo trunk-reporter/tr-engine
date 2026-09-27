@@ -4672,8 +4672,8 @@ paths:
       summary: Reset a retention setting to default
       description: |
         Removes a DB-stored retention override and resets the setting to its
-        environment variable value (if set) or coded default. Returns 409 if
-        the key is locked by an environment variable.
+        coded default. Returns 409 if the key is locked by an environment
+        variable.
         Requires the `admin` scope.
       tags: [admin]
       security:
@@ -4833,9 +4833,9 @@ paths:
         them.
 
         `path` is the request path without the query string, cut at 1024
-        bytes with a "…(truncated, N bytes)" marker. (The request line and
-        headers together are limited to 64 KiB; a larger request gets
-        431.)
+        bytes with a "…(truncated, N bytes)" marker. (Keep the request
+        line and headers under 64 KiB: the server's limit is 64 KiB plus
+        Go's 4 KiB read slack, and a larger request gets 431.)
 
         `actor` is the optional `X-Actor` request header, which a
         multi-user client sends to name the end user it acted for. It is
@@ -8408,7 +8408,7 @@ components:
 
     MaintenanceConfig:
       type: object
-      description: Active retention settings for automatic maintenance. Each setting includes a `_source` ("env", "db", or "default") and a `_locked` flag (true when set by environment variable and immutable through the API).
+      description: Active retention settings for automatic maintenance. Each setting includes a `_source` ("env", "db", or "default") and a `_locked` flag (true when set by environment variable and immutable through the API). `_source` follows `PUT /admin/maintenance/config` and `DELETE /admin/maintenance/config/{key}` at once, without a restart - "db" right after a PUT, "default" right after a DELETE. A setting from an environment variable ("env") is locked, and PUT and DELETE return 409 for it.
       properties:
         retention_raw_messages:
           type: string

@@ -161,10 +161,9 @@ func runCLI(args []string, overrides config.Overrides, usage string, parse cliPa
 
 // openCLIDatabase connects like the server does (config, schema, migrations)
 // with logs on stderr at WARN. A failed migration is an error: the commands
-// write tables that migrations create. Pending migrations are named on
-// stderr before they are applied; the irreversible ones (the conversion of a
-// pre-API-key database, which an old engine still running on it can't
-// survive) are refused unless migrate is set (--migrate).
+// write tables that migrations create. Pending migrations are handled by
+// migrateForCLI: the irreversible ones are refused unless migrate is set
+// (--migrate).
 func openCLIDatabase(ctx context.Context, overrides config.Overrides, migrate bool, stderr io.Writer) (*database.DB, error) {
 	log := zerolog.New(stderr).With().Timestamp().Logger().Level(zerolog.WarnLevel)
 	cfg, err := config.Load(overrides)
@@ -179,35 +178,77 @@ func openCLIDatabase(ctx context.Context, overrides config.Overrides, migrate bo
 		db.Close()
 		return nil, fmt.Errorf("schema initialization: %w", err)
 	}
+	if err := migrateForCLI(ctx, db, migrate, refuseAuthConversion, stderr); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// cliAuthConversion says what a CLI command does, without --migrate, on a
+// database from before API keys, whose upgrade includes irreversible
+// migrations (database.PendingMigration.Irreversible: they convert its API
+// keys and remove its user accounts, which an older engine still running on
+// it can't survive).
+type cliAuthConversion int
+
+const (
+	// refuseAuthConversion: refuse to run (keys, access: they read and write
+	// the new auth tables).
+	refuseAuthConversion cliAuthConversion = iota
+	// skipAuthConversion: apply the other migrations and leave the
+	// irreversible ones to the server's first start (export, import: they
+	// don't touch the auth tables).
+	skipAuthConversion
+)
+
+// migrateForCLI applies a CLI command's pending schema migrations and names
+// them on stderr. The irreversible ones are applied only when migrate is set
+// (--migrate); otherwise onAuthConversion says whether the command is refused
+// or runs without them (with a note on stderr).
+func migrateForCLI(ctx context.Context, db *database.DB, migrate bool, onAuthConversion cliAuthConversion, stderr io.Writer) error {
 	pending, err := db.PendingMigrations(ctx)
 	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("schema migration: %w", err)
+		return fmt.Errorf("schema migration: %w", err)
 	}
 	var names, irreversible []string
 	for _, m := range pending {
-		names = append(names, m.Name)
 		if m.Irreversible {
 			irreversible = append(irreversible, m.Name)
+			if !migrate {
+				continue
+			}
 		}
+		names = append(names, m.Name)
 	}
 	if len(irreversible) > 0 && !migrate {
-		db.Close()
-		return nil, fmt.Errorf("this database is from a tr-engine version before API keys, and upgrading it (%s) "+
-			"converts its API keys and removes its user accounts: an older engine still running on it stops working, "+
-			"and the change can't be undone. Stop the old engine, back up the database and start this version's "+
-			"server once (it also carries AUTH_TOKEN/WRITE_TOKEN over), then run this command again; "+
-			"or run it again with --migrate to upgrade the database now (see docs/migrating-auth.md)",
+		if onAuthConversion == refuseAuthConversion {
+			return fmt.Errorf("this database is from a tr-engine version before API keys, and upgrading it (%s) "+
+				"converts its API keys and removes its user accounts: an older engine still running on it stops working, "+
+				"and the change can't be undone. Stop the old engine, back up the database and start this version's "+
+				"server once (it also carries AUTH_TOKEN/WRITE_TOKEN over), then run this command again; "+
+				"or run it again with --migrate to upgrade the database now (see docs/migrating-auth.md)",
+				strings.Join(irreversible, ", "))
+		}
+		fmt.Fprintf(stderr, "note: this database is from a tr-engine version before API keys; its upgrade (%s) "+
+			"converts its API keys and removes its user accounts, which an older engine still running on it can't survive, "+
+			"so it is left to the first start of this version's server (or run this command with --migrate; see docs/migrating-auth.md)\n",
 			strings.Join(irreversible, ", "))
 	}
 	if len(names) > 0 {
 		fmt.Fprintf(stderr, "applying %d pending schema migration(s): %s\n", len(names), strings.Join(names, ", "))
 	}
-	if err := db.Migrate(ctx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("schema migration: %w", err)
+	if migrate {
+		err = db.Migrate(ctx)
+	} else {
+		// Also leaves out an irreversible migration that became pending
+		// since PendingMigrations.
+		_, err = db.MigrateReversible(ctx)
 	}
-	return db, nil
+	if err != nil {
+		return fmt.Errorf("schema migration: %w", err)
+	}
+	return nil
 }
 
 // stripMigrateFlag removes --migrate (or -migrate, --migrate=true) from

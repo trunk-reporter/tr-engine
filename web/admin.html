@@ -530,7 +530,10 @@
   function cleanKey(raw) {
     if (window.trAuth && typeof trAuth.cleanKey === 'function') return trAuth.cleanKey(raw);
     var k = String(raw == null ? '' : raw).trim();
-    return { key: k, error: k ? '' : 'Paste an API key.' };
+    if (!k) return { key: '', error: 'Paste an API key.' };
+    // Same limit as auth.js: printable ASCII only (inner spaces are allowed).
+    if (!/^[\x20-\x7e]+$/.test(k)) return { key: '', error: 'This value contains characters an API key can’t have.' };
+    return { key: k, error: '' };
   }
 
   async function connect(key, fromSession) {

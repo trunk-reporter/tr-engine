@@ -8,6 +8,8 @@ The fastest way: open the [Page Builder](/playground.html) on your tr-engine ins
 
 Live demo: [tr-engine.luxprimatech.com/playground.html](https://tr-engine.luxprimatech.com/playground.html)
 
+The preview runs in a sandbox with its own, empty origin: it can't read the API key stored in your browser, and its requests reach the engine anonymously, so it shows what the anonymous access policy allows (nothing, if anonymous access is `off`). `location.origin` is `"null"` there, so a page that builds URLs from it (for example a WebSocket URL from `location.host`) won't connect in the preview; relative URLs work. A **saved** page is different: it is served from the engine's origin and runs with the keys stored in the browser, so save only pages whose code you trust.
+
 ## Two Modes
 
 ### Integrated (recommended for tr-engine users)

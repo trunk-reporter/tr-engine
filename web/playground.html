@@ -313,6 +313,7 @@
       placeholder="Paste the HTML that Claude generates..."></textarea>
     <button class="btn" id="renderBtn">Render Preview</button>
     <div class="save-section" id="saveSection">
+      <div class="save-warning" id="saveTrustWarning"><strong>Only save pages you trust.</strong> Saved pages are served from this engine's origin and, unlike the preview, run with access to the API keys stored in this browser (including an admin key entered on the Admin page).</div>
       <div class="save-warning">Saved pages live on disk only — they are not embedded in the binary and will be lost if the web/ directory is removed.</div>
       <div class="save-warning">Saving needs an admin key. Connect on the <a href="admin.html" style="color:inherit">Admin page</a> in this tab first; the key stays in this tab only.</div>
       <div class="save-meta" id="saveMeta" style="display:none">
@@ -334,9 +335,17 @@
         <input type="checkbox" id="saveOverwrite">
         <label for="saveOverwrite">Overwrite if exists</label>
       </div>
+      <div class="option-row">
+        <input type="checkbox" id="saveTrust">
+        <label for="saveTrust">I trust this page's code</label>
+      </div>
       <div class="save-status" id="saveStatus"></div>
     </div>
-    <iframe class="preview-frame" id="previewFrame" sandbox="allow-scripts allow-same-origin"></iframe>
+    <div class="mode-hint" id="previewNote">
+      The preview runs sandboxed and anonymous, without your API key: data that needs a key won't load there. Relative /api/v1 URLs reach this engine.
+    </div>
+    <!-- No allow-same-origin: the preview must never share this origin, or it could read the stored API keys. -->
+    <iframe class="preview-frame" id="previewFrame" sandbox="allow-scripts" title="Page preview"></iframe>
     <div class="scroll-runway"></div>
   </div>
 </div>
@@ -542,6 +551,7 @@ Suggested palette: #0a0a0f background, #e0e0e8 text, #00d4ff accent.
   const saveMeta = document.getElementById('saveMeta');
   const saveTitle = document.getElementById('saveTitle');
   const saveDesc = document.getElementById('saveDesc');
+  const saveTrust = document.getElementById('saveTrust');
 
   var _needsMetaInjection = false;
 
@@ -573,16 +583,71 @@ Suggested palette: #0a0a0f background, #e0e0e8 text, #00d4ff accent.
       _needsMetaInjection = true;
     }
 
+    saveTrust.checked = false;  // every rendered page needs its own confirmation
     saveStatus.textContent = '';
     saveStatus.className = 'save-status';
     saveSection.classList.add('visible');
   }
+
+  // The HTML that would be saved changed since it was confirmed.
+  previewInput.addEventListener('input', function() { saveTrust.checked = false; });
 
   // Auto-update filename when user types a title
   saveTitle.addEventListener('input', function() {
     var val = saveTitle.value.trim();
     saveFilename.value = val ? slugify(val) + '.html' : '';
   });
+
+  // ── Preview sandbox ──
+  // The preview iframe is sandboxed with allow-scripts only, so pasted or
+  // generated HTML runs in an opaque origin: it can't read this origin's
+  // storage (where the API keys live) or reach into this page. Its requests
+  // go straight to the engine, anonymously: the engine answers every origin
+  // with Access-Control-Allow-Origin: *, the preview has no key to send, and
+  // auth.js inside it treats nothing as its own origin, so it adds none.
+  //
+  // What is added in front of the pasted HTML (the saved page is unchanged):
+  // - <base href> at the engine's web root, so relative script and API URLs
+  //   (auth.js, theme-*.js, /api/v1/...) resolve to this engine;
+  // - in-memory localStorage/sessionStorage, empty for every render, because
+  //   the real ones throw in an opaque origin and would stop page scripts
+  //   that use them unguarded.
+  //
+  // previewStorageShim runs inside the preview, before the page's own
+  // scripts. It must not contain a closing script tag (it is inlined).
+  function previewStorageShim() {
+    ['localStorage', 'sessionStorage'].forEach(function (name) {
+      try { window[name].length; return; } catch (e) { /* opaque origin: storage throws */ }
+      var data = new Map();
+      var store = {
+        get length() { return data.size; },
+        key: function (i) { var k = Array.from(data.keys())[i]; return k === undefined ? null : k; },
+        getItem: function (k) { k = String(k); return data.has(k) ? data.get(k) : null; },
+        setItem: function (k, v) { data.set(String(k), String(v)); },
+        removeItem: function (k) { data.delete(String(k)); },
+        clear: function () { data.clear(); }
+      };
+      try {
+        Object.defineProperty(window, name, { value: store, configurable: true, enumerable: true });
+      } catch (e) { /* keep the throwing one */ }
+    });
+  }
+
+  // A leading doctype, <html> and <head> (whitespace and comments between),
+  // so the additions go inside <head> when there is one and never before the
+  // doctype (which would switch the preview to quirks mode).
+  var LEADING_TAGS = /^(?:\s|<!--[\s\S]*?-->)*(?:<!doctype[^>]*>)?(?:\s|<!--[\s\S]*?-->)*(?:<html\b[^>]*>)?(?:\s|<!--[\s\S]*?-->)*(?:<head\b[^>]*>)?/i;
+
+  function previewDocument(html) {
+    var prelude = '';
+    if (!/<base[\s>]/i.test(html)) {
+      var base = new URL('.', location.href).href;
+      prelude += '<base href="' + base.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '">';
+    }
+    prelude += '<script>(' + previewStorageShim.toString() + ')();<\/script>';
+    var lead = LEADING_TAGS.exec(html)[0];
+    return lead + prelude + html.slice(lead.length);
+  }
 
   // ── Render Preview ──
   renderBtn.addEventListener('click', function() {
@@ -592,7 +657,7 @@ Suggested palette: #0a0a0f background, #e0e0e8 text, #00d4ff accent.
       setTimeout(function() { previewInput.classList.remove('error'); }, 600);
       return;
     }
-    previewFrame.srcdoc = html;
+    previewFrame.srcdoc = previewDocument(html);
     previewFrame.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     showSaveSection(html);
   });
@@ -668,6 +733,14 @@ Suggested palette: #0a0a0f background, #e0e0e8 text, #00d4ff accent.
   saveBtn.addEventListener('click', function() {
     var payload = prepareSaveHtml();
     if (!payload) return;
+    // A saved page runs on this origin with the stored API keys: make the
+    // user confirm they trust it (see the warning above the Save button).
+    if (!saveTrust.checked) {
+      saveStatus.textContent = 'Saved pages run with the API keys stored in this browser. Tick "I trust this page\'s code" to save it.';
+      saveStatus.className = 'save-status error';
+      saveTrust.focus();
+      return;
+    }
     doSave(payload);
   });
 

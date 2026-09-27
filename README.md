@@ -256,7 +256,7 @@ Before marking implementation work complete, follow the testing, API contract, a
 | `GET /stats` | System statistics |
 | `GET /talkgroup-directory` | Talkgroup reference directory |
 | `POST /call-upload` | Upload call recording (rdio-scanner/OpenMHz) |
-| `POST /query` | Ad-hoc read-only SQL queries (admin) |
+| `POST /query` | Ad-hoc read-only SQL queries (admin; needs its own read-only login, `QUERY_DATABASE_URL`, see [docs/auth.md](docs/auth.md#ad-hoc-sql-post-apiv1query)) |
 | `POST /admin/systems/merge` | Merge duplicate systems (admin) |
 | `POST /debug-report` | Submit diagnostic report (admin) |
 

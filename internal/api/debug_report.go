@@ -23,6 +23,7 @@ func sanitizeConfig(cfg *config.Config) map[string]any {
 	return map[string]any{
 		// Database & MQTT
 		"DatabaseURL":    sanitizeURL(cfg.DatabaseURL),
+		"QueryDatabaseURL": sanitizeURL(cfg.QueryDatabaseURL),
 		"MQTTBrokerURL":  sanitizeURL(cfg.MQTTBrokerURL),
 		"MQTTTopics":     cfg.MQTTTopics,
 		"MQTTInstanceMap": cfg.MQTTInstanceMap,
@@ -171,17 +172,22 @@ func redact(s string) string {
 	return ""
 }
 
-// sanitizeURL parses a URL and strips user credentials (username/password).
-// Returns the original string if empty or unparseable.
+// sanitizeURL strips user credentials, the query (libpq URLs can carry
+// ?password=) and the fragment from a URL. A value that isn't a URL with a
+// scheme, such as a "host=... password=..." DSN, is redacted entirely.
 func sanitizeURL(raw string) string {
 	if raw == "" {
 		return ""
 	}
 	u, err := url.Parse(raw)
-	if err != nil {
-		return raw
+	if err != nil || u.Scheme == "" {
+		return redact(raw)
 	}
 	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
 	return u.String()
 }
 

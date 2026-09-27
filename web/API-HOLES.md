@@ -146,14 +146,14 @@ const audioSrc = `${API_BASE}/calls/${callId}/audio`;
 
 ---
 
-### GAP 11: /query endpoint needs an admin key
+### GAP 11: /query endpoint needs an admin key (and `QUERY_DATABASE_URL`)
 **Pages**: `stream-graph.html`, `signal-flow-data.js`
 
 ```js
 if (!trAuth.hasScope('admin')) return { columns: [], rows: [] }; // /query unavailable
 ```
 
-**Reason**: `POST /query` needs the `admin` scope (401/403 otherwise). That is deliberate: raw SQL can read every table and can't honour a key's system/talkgroup restriction. Pages check `trAuth.hasScope('admin')` before calling it and degrade on 401/403, but there's no read-only endpoint that provides the same analytical data to `listen` keys or anonymous visitors.
+**Reason**: `POST /query` needs the `admin` scope (401/403 otherwise). That is deliberate: raw SQL can read every table and can't honour a key's system/talkgroup restriction. It is also off (503 `query_disabled`) until the operator gives it its own read-only database login (`QUERY_DATABASE_URL`, docs/auth.md). Pages check `trAuth.hasScope('admin')` before calling it and degrade on 401/403/503, but there's no read-only endpoint that provides the same analytical data to `listen` keys or anonymous visitors.
 
 ---
 

@@ -41,6 +41,7 @@ const (
 	ErrInvalidParameter ErrorCode = "invalid_parameter"
 	ErrInvalidTimeRange ErrorCode = "invalid_time_range"
 	ErrQueryFailed      ErrorCode = "query_failed"
+	ErrQueryDisabled    ErrorCode = "query_disabled" // 503: POST /query has no (safe) QUERY_DATABASE_URL
 	ErrAmbiguousID      ErrorCode = "ambiguous_id"
 	ErrDuplicate        ErrorCode = "duplicate"
 	ErrRequestTimeout   ErrorCode = "request_timeout"
@@ -216,7 +217,6 @@ func QueryInt(r *http.Request, name string) (int, bool) {
 	}
 	return n, true
 }
-
 
 // QueryBool extracts a boolean query parameter.
 func QueryBool(r *http.Request, name string) (bool, bool) {

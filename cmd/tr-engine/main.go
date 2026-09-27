@@ -155,6 +155,12 @@ func main() {
 		log.Fatal().Err(err).Msg("auth setup failed")
 	}
 
+	// POST /query runs on its own database login (QUERY_DATABASE_URL).
+	queryDB := setupQueryDB(ctx, db, cfg, log)
+	if queryDB != nil {
+		defer queryDB.Close()
+	}
+
 	// Audio storage (local disk default, optional S3)
 	store, bgServices, err := storage.New(cfg.S3, cfg.AudioDir, log)
 	if err != nil {
@@ -422,6 +428,7 @@ func main() {
 		Config:         cfg,
 		TrustedProxies: trustedProxies,
 		DB:             db,
+		QueryDB:        queryDB,
 		MQTT:           mqtt,
 		Live:           pipeline,
 		Uploader:       pipeline, // Pipeline implements CallUploader via ProcessUpload

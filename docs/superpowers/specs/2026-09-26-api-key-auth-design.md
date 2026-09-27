@@ -930,7 +930,7 @@ These were found while mapping the code for this design. They are fixed in the s
 **Found but out of scope** (tracked in `docs/roadmap.md`):
 - `GetTalkgroupByComposite`/`GetUnitByComposite` don't exclude soft-deleted systems (sqlc queries).
 - `PATCH /sites/{id}` doesn't invalidate the ingest identity cache.
-- `POST /query` runs as the application DB role, which can `pg_read_file` if that role is privileged. It is now admin-only, and the docs recommend a dedicated read-only role.
+- `POST /query` ran as the application DB role, which can `pg_read_file` (and, as a superuser, `COPY ... TO PROGRAM`) if that role is privileged. Done in a follow-up: it now runs only on its own login (`QUERY_DATABASE_URL`, disabled without it), which tr-engine grants `SELECT` on the data tables and refuses if it could read `api_keys`/`auth_settings` or server files (docs/auth.md, "Ad-hoc SQL").
 - CDN scripts in `web/` have no SRI.
 - `audio-diagnostics.html` posts to a hard-coded external URL.
 - Restriction support for the units, stats and recorder endpoints.

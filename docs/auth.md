@@ -390,6 +390,48 @@ tr-engine records every change made with a key: every request with a key to a re
 - **Actor.** A multi-user client can send an `X-Actor` header naming the end user it acted for ("alice@club"). It is recorded, and shown next to the key name in `unit_tag_suggestions.decided_by` and `system_merge_log.performed_by`, but it is informational only: tr-engine can't verify it.
 - **Retention:** `RETENTION_AUDIT_LOG` (default `8760h`, one year), purged by the daily maintenance run. Without the environment variable, an admin can also change it at runtime with `PUT /api/v1/admin/maintenance/config` and key `retention_audit_log`.
 
+## Ad-hoc SQL: `POST /api/v1/query`
+
+`POST /api/v1/query` runs one read-only SQL statement (admin keys only) and returns the rows. Some `web/` pages use it for historical charts. It is **off until you give it its own database login** with `QUERY_DATABASE_URL`; until then it answers `503 query_disabled`.
+
+It needs its own login because tr-engine's database role can read everything, the key hashes in `api_keys` and the ticket secret in `auth_settings` included. In the bundled Docker setup that role is a PostgreSQL superuser, and a superuser can run programs on the database host with `COPY ... TO PROGRAM`, even in a read-only transaction. Switching roles inside tr-engine's own connection (`SET ROLE`) wouldn't help: one statement can switch back with `set_config('role', ...)`.
+
+**Set it up** (three steps):
+
+1. Create a login role. Only the login: tr-engine grants it `SELECT` itself.
+
+   ```bash
+   # Docker (bundled PostgreSQL; use your POSTGRES_USER/POSTGRES_DB if you changed them)
+   QPASS=$(openssl rand -hex 24)
+   docker compose exec -T postgres psql -U trengine -d trengine \
+     -c "CREATE ROLE tr_engine_query LOGIN PASSWORD '$QPASS'"
+   echo "QUERY_DATABASE_URL=postgres://tr_engine_query:$QPASS@postgres:5432/trengine?sslmode=disable" >> .env
+
+   # Bare metal: as a PostgreSQL superuser (or a role with CREATEROLE)
+   psql -d trengine -c "CREATE ROLE tr_engine_query LOGIN PASSWORD '...'"
+   # .env: QUERY_DATABASE_URL=postgres://tr_engine_query:...@localhost:5432/trengine?sslmode=disable
+   ```
+
+2. Restart tr-engine (`docker compose up -d tr-engine`; `restart` doesn't re-read `.env`).
+3. Check the log for `POST /api/v1/query enabled`.
+
+At every start tr-engine grants the role `SELECT` on every table and view of its schema **except** `api_keys`, `auth_settings` and views that read them, so tables added by upgrades are covered. Partitions aren't granted: query the parent tables (`calls`, not `calls_2026_09`). Every other table is readable, including what trunk-recorder published about itself (`instance_configs`, `mqtt_raw_messages`), which can include its upload server's `instance_key`. If tr-engine's role doesn't own the tables (you applied `schema.sql` as another role), it logs which ones it couldn't grant; grant them yourself as their owner:
+
+```sql
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO tr_engine_query;
+REVOKE SELECT ON api_keys, auth_settings FROM tr_engine_query;
+```
+
+**What tr-engine refuses.** Every new connection of the query pool is checked. tr-engine refuses the role if any of these is true:
+
+- it is a superuser, or can `SET ROLE` to one;
+- it is a member of `pg_read_server_files`, `pg_write_server_files` or `pg_execute_server_program`;
+- it, or a role it can `SET ROLE` to, can read any column of `api_keys` or `auth_settings` (directly, through `PUBLIC` or through `pg_read_all_data`).
+
+A refused role logs an ERROR at startup naming the reasons, and every query gets `503 query_disabled` with the reasons in `detail`. That includes pointing `QUERY_DATABASE_URL` at tr-engine's own role. Fix the role (for example `REVOKE ... FROM tr_engine_query`) and the next query works, without a restart.
+
+Queries run in a `READ ONLY` transaction with a 30-second statement timeout, at most 50 000 rows, one statement (no semicolons). The pool has at most 4 connections. `QUERY_DATABASE_URL` may point at a read replica of the same database: the grants replicate from the primary.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -411,13 +453,15 @@ tr-engine records every change made with a key: every request with a key to a re
 | Uploads rejected; WARN "call upload rejected" with `"reason":"key #N lacks upload"` | The plugin uses a key without `upload`. (Other reasons: `no key`, `unknown key`, `revoked key`, `expired key`, `request body too large`.) | Create an upload key for it. |
 | Uploads get `429 rate_limited` | Keys in the upload form field are rate-limited per client IP, at two tokens per upload for a legacy (imported) key. | Send the key as `Authorization: Bearer`, replace a legacy upload key with a new `upload` key, or raise `RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`. |
 | WARN "dropping live audio: several trunk-recorder instances use this short name" | Two instances use the same short name for different systems, so tr-engine can't tell which one sent a simplestream packet. | Set `STREAM_SOURCE_MAP=ip=instance_id,...`, or give the systems unique short names. |
+| `503 query_disabled` from `POST /api/v1/query` | `QUERY_DATABASE_URL` isn't set, or its role is refused (the reasons are in `detail` and in the startup ERROR "POST /api/v1/query refuses every query"). | Set it up as in [Ad-hoc SQL](#ad-hoc-sql-post-apiv1query), or fix the role as the reasons say. |
+| WARN "could not grant the QUERY_DATABASE_URL role SELECT on the data tables", or the same message with `not_owned` | The role doesn't exist yet, or tr-engine's role doesn't own those tables. | Create the role, or grant `SELECT` as the tables' owner. |
 | Browser shows "This tr-engine doesn't support API keys yet" | tr-dashboard is newer than tr-engine. | Upgrade tr-engine. |
 
 ## Security notes
 
 - Treat keys like passwords: store them in a password manager or a secrets file with tight permissions, not in shell history or in pages that other people load.
 - Use HTTPS for anything beyond localhost. Keys and tickets travel in headers and URLs.
-- `POST /api/v1/query` runs SQL as tr-engine's database role inside a read-only transaction. If that role is a superuser (or can read server files), so can an admin key. Run tr-engine with a dedicated, non-superuser database role.
+- `POST /api/v1/query` runs only on its own read-only login (`QUERY_DATABASE_URL`), never as tr-engine's database role, and tr-engine refuses a login that could read the auth tables or server files ([Ad-hoc SQL](#ad-hoc-sql-post-apiv1query)). An admin key can still read every data table through it.
 - tr-engine never sets cookies and answers every origin with `Access-Control-Allow-Origin: *` without credentials. A malicious website can't use a visitor's key, because browsers never send keys automatically.
 - An `edit` key can set talkgroup and unit names, which web pages display. Pages must render API text as text; the `web/` pages and tr-dashboard do.
 

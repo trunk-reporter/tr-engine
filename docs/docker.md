@@ -219,6 +219,9 @@ LOG_LEVEL=info                  # debug, info, warn, error
 # TRUSTED_PROXIES=loopback,private  # proxies whose X-Forwarded-For is believed
 # TR_DIR=/tr-config             # auto-discover from TR's config.json (see below)
 # WATCH_DIR=/tr-audio           # file watch mode (alternative to MQTT)
+# QUERY_DATABASE_URL=postgres://tr_engine_query:...@postgres:5432/trengine?sslmode=disable
+#                               # enables POST /api/v1/query (ad-hoc SQL) on its own
+#                               # read-only login; setup in auth.md, "Ad-hoc SQL"
 ```
 
 Docker-specific settings (ignored when running the binary directly):

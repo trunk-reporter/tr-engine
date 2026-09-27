@@ -31,6 +31,7 @@ type ServerOptions struct {
 	Config         *config.Config
 	TrustedProxies *TrustedProxies // proxies whose forwarding headers identify the client; nil trusts none
 	DB             *database.DB
+	QueryDB        *database.QueryDB // POST /query's own login (QUERY_DATABASE_URL); nil disables it
 	MQTT           *mqttclient.Client
 	Live           LiveDataSource
 	Uploader       CallUploader       // nil if upload ingest not available
@@ -200,7 +201,12 @@ func buildRouter(opts routerOptions) *chi.Mux {
 		NewTranscriptionsHandler(opts.DB, opts.Live).Routes(api)
 		NewAdminHandler(opts.DB, opts.Live, opts.OnSystemMerge).Routes(api)
 		NewStorageHandler(opts.DB, opts.Log).Routes(api)
-		NewQueryHandler(opts.DB).Routes(api)
+		// A nil *database.QueryDB must be a nil QueryRunner (503 query_disabled).
+		var queryRunner QueryRunner
+		if opts.QueryDB != nil {
+			queryRunner = opts.QueryDB
+		}
+		NewQueryHandler(queryRunner).Routes(api)
 		api.Post("/pages", SavePageHandler(webDir))
 
 		// Debug report (admin): sends server diagnostics to DEBUG_REPORT_URL.

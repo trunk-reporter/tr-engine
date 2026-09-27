@@ -1,21 +1,33 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog/hlog"
 	"github.com/snarg/tr-engine/internal/database"
 )
 
-type QueryHandler struct {
-	db *database.DB
+// QueryRunner runs POST /query SQL (*database.QueryDB).
+type QueryRunner interface {
+	Execute(ctx context.Context, sql string, params []any, maxRows int) (*database.QueryResult, error)
 }
 
-func NewQueryHandler(db *database.DB) *QueryHandler {
-	return &QueryHandler{db: db}
+// QueryHandler serves POST /query on its own database login
+// (QUERY_DATABASE_URL). Without one the route answers 503 query_disabled.
+type QueryHandler struct {
+	q QueryRunner
 }
+
+func NewQueryHandler(q QueryRunner) *QueryHandler {
+	return &QueryHandler{q: q}
+}
+
+const queryDisabledMessage = "POST /query is disabled: set QUERY_DATABASE_URL to a read-only database role (docs/auth.md)"
 
 type queryRequest struct {
 	SQL    string `json:"sql"`
@@ -25,6 +37,11 @@ type queryRequest struct {
 
 func (h *QueryHandler) ExecuteQuery(w http.ResponseWriter, r *http.Request) {
 	log := hlog.FromRequest(r)
+
+	if h.q == nil {
+		WriteErrorWithCode(w, http.StatusServiceUnavailable, ErrQueryDisabled, queryDisabledMessage)
+		return
+	}
 
 	var req queryRequest
 	if err := DecodeJSON(r, &req); err != nil {
@@ -59,8 +76,20 @@ func (h *QueryHandler) ExecuteQuery(w http.ResponseWriter, r *http.Request) {
 
 	log.Info().Str("sql", sql).Int("limit", maxRows).Msg("executing query")
 
-	result, err := h.db.ExecuteReadOnlyQuery(r.Context(), sql, req.Params, maxRows)
-	if err != nil {
+	result, err := h.q.Execute(r.Context(), sql, req.Params, maxRows)
+	var unsafe *database.UnsafeQueryRoleError
+	var connectErr *pgconn.ConnectError
+	switch {
+	case errors.As(err, &unsafe):
+		log.Error().Err(err).Msg("query refused: QUERY_DATABASE_URL role is not safe")
+		WriteErrorWithCodeDetail(w, http.StatusServiceUnavailable, ErrQueryDisabled,
+			"POST /query is disabled: the QUERY_DATABASE_URL role can read more than it should (docs/auth.md)", err.Error())
+		return
+	case errors.As(err, &connectErr):
+		log.Warn().Err(err).Msg("query failed: can't connect with QUERY_DATABASE_URL")
+		WriteErrorWithCode(w, http.StatusServiceUnavailable, ErrServiceUnavail, "can't connect to the query database; retry later")
+		return
+	case err != nil:
 		log.Warn().Err(err).Str("sql", sql).Msg("query failed")
 		WriteErrorWithCodeDetail(w, http.StatusBadRequest, ErrQueryFailed, "query failed", err.Error())
 		return

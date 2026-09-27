@@ -217,8 +217,14 @@ async function query(apiBase, sql, params, limit = 10000) {
     body: JSON.stringify({ sql, params, limit }),
   });
   if (!resp.ok) {
-    // No key, a key without admin, or /query disabled: degrade gracefully
+    // No key, a key without admin, or /query disabled (503 query_disabled:
+    // no QUERY_DATABASE_URL on the engine): degrade gracefully
     if (resp.status === 401 || resp.status === 403) return EMPTY_RESULT;
+    if (resp.status === 503) {
+      const body = await resp.json().catch(() => ({}));
+      if (body.code === 'query_disabled') queryAllowed = Promise.resolve(false);
+      return EMPTY_RESULT;
+    }
     throw new Error(`Query failed: ${resp.status} ${await resp.text()}`);
   }
   return resp.json();

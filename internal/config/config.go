@@ -11,6 +11,10 @@ import (
 
 type Config struct {
 	DatabaseURL   string `env:"DATABASE_URL,required"`
+	// QueryDatabaseURL is the login POST /query runs as: a role that can
+	// read the data tables but not the auth tables, server files or
+	// programs (docs/auth.md). Empty disables POST /query.
+	QueryDatabaseURL string `env:"QUERY_DATABASE_URL"`
 	MQTTBrokerURL string `env:"MQTT_BROKER_URL"`
 	MQTTTopics       string `env:"MQTT_TOPICS" envDefault:"#"`
 	MQTTInstanceMap  string `env:"MQTT_INSTANCE_MAP"` // "prefix:instance_id,prefix:instance_id"

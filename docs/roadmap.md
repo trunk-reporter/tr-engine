@@ -114,7 +114,6 @@ API keys, tickets and the anonymous policy can already be restricted to systems 
 Out of scope for that change (see its spec, §15):
 - `GetTalkgroupByComposite`/`GetUnitByComposite` (sqlc queries) don't exclude soft-deleted systems.
 - `PATCH /sites/{id}` doesn't invalidate the ingest identity cache.
-- `POST /query` runs as the engine's database role, which can `pg_read_file` if that role is privileged. It is admin-only now, and the docs recommend a dedicated non-superuser role; running queries under a separate read-only role would remove the risk.
 - CDN scripts in `web/` have no Subresource Integrity (SRI) hashes.
 - `audio-diagnostics.html` posts to a hard-coded external URL.
 

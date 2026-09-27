@@ -24,6 +24,7 @@ This guide explains the upgrade step by step. For the new model itself, read [au
 | A reverse proxy injecting the read token into anonymous requests | Must be removed |
 | `/debug-report` open to anyone, `/metrics` open to anyone | `/debug-report` needs `admin`; `/metrics` needs a key with `listen` |
 | Editors could run SQL, merge systems, save pages, import CSVs | Those need `admin` now |
+| `POST /query` (SQL) ran as tr-engine's own database role | It runs only on its own read-only login, `QUERY_DATABASE_URL`, and answers `503 query_disabled` without one ([auth.md](auth.md#ad-hoc-sql-post-apiv1query)) |
 
 ## Before you start
 

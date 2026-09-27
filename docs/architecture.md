@@ -16,6 +16,14 @@ How tr-engine works from startup to shutdown. For what exists and how to use it,
 7. Connect to PostgreSQL (database.Connect)
 8. InitSchema — apply schema.sql on fresh DB (no-op if tables exist)
 9. Migrate — run incremental migrations (skip already-applied)
+9a. Auth setup (internal/database + main.go):
+      - one-time legacy import of AUTH_TOKEN/WRITE_TOKEN (data_fixups
+        "import-legacy-auth", once per database)
+      - one WARN per removed auth variable still set
+      - ticket secret: generate 32 random bytes into auth_settings on first start
+      - bootstrap admin key (data_fixups "bootstrap-admin-key", once per
+        database): if no active admin key exists, create one and print it
+        to stderr; on later starts only an ERROR if none is active
 10. Initialize audio storage (storage.New)
 11. Start storage background services (pruner, reconciler)
 12. Start AsyncUploader if S3 async mode (2 workers, 500 queue)
@@ -50,7 +58,10 @@ main.go                      config.go
 1. `godotenv.Load(envFile)` — loads `.env` (silent if missing)
 2. `env.Parse(&cfg)` — struct tags with `envDefault` provide defaults
 3. CLI overrides applied field-by-field (non-empty strings only)
-4. Deprecated compatibility: if `AUTH_ENABLED=false`, clear legacy token values so old open-mode configs stay open
+
+The removed auth variables (`AUTH_ENABLED`, `AUTH_TOKEN`, `WRITE_TOKEN`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `JWT_SECRET`, `CORS_ORIGINS`) configure nothing. They are read only by the one-time legacy import and to log a warning on each start. Access control lives in the database: `api_keys`, and `auth_settings` (anonymous access policy, ticket secret, retired public token).
+
+Subcommands (`export`, `import`, `keys`, `access`) are dispatched from `main.go` before the server starts. `keys` and `access` load the same config, connect, run `InitSchema` + `Migrate`, log to stderr at WARN, and print only their result on stdout.
 
 Docker Compose uses `${VAR:-default}` interpolation in `docker-compose.yml` so most settings work without `.env`. Secrets have no defaults: `POSTGRES_PASSWORD` and `MQTT_PASSWORD` use `${VAR:?...}` so compose refuses to start without them.
 
@@ -401,8 +412,12 @@ Watch mode only produces `call_end` events (files appear after calls complete). 
 ```
 POST /api/v1/call-upload
   │
-  ├── UploadAuth middleware (accepts Bearer token, ?token=, or form key/api_key)
+  ├── Auth pipeline (policy: scope upload, FormKey) — a Bearer header is
+  │     resolved here; without one the request passes to the upload middleware
   ├── MaxBodySize(50 MB)
+  ├── Upload middleware — no header principal: read multipart field "key",
+  │     then "api_key" (body only, never the URL); invalid → 401 invalid_key,
+  │     no upload scope → 403 insufficient_scope; rejections logged per IP
   │
   ├── ParseMultipartForm
   │     auto-detect format from field names:
@@ -427,53 +442,64 @@ POST /api/v1/call-upload
 
 `internal/api/server.go:NewServer()` — exact order as wired:
 
+Router construction lives in `buildRouter(opts) *chi.Mux`. Every route is registered flat (no `r.Route(...)` sub-routers), so `chi.Walk` and `Mux.Find` agree on pattern strings, and every route has an entry in the policy table in `internal/api/policy.go`. HEAD requests are served by the GET handler (`middleware.GetHead`).
+
 ```
-Global middleware (all routes):
-  1. RequestID      — generate/passthrough X-Request-ID header
-  2. CORS           — origin check, preflight handling
-  3. RateLimiter    — per-IP token bucket (default 20 rps / 40 burst)
-  4. Recoverer      — catch panics → JSON 500
-  5. Logger         — structured request logging (zerolog/hlog)
-
-Unauthenticated routes (before auth middleware):
-  GET /api/v1/health
-  GET /metrics (if METRICS_ENABLED)
-  GET /api/v1/auth-init (serves read token for web UI)
-
-Upload route group:
-  6. MaxBodySize(50 MB)
-  7. UploadAuth     — Bearer || ?token= || form key/api_key
-
-Authenticated route group:
-  6. MaxBodySize(10 MB)
-  7. [InstrumentHandler if metrics enabled]
-  8. JWTOrTokenAuth — accepts JWT, API keys, AUTH_TOKEN, or legacy WRITE_TOKEN
-  9. WriteAuth      — POST/PATCH/PUT/DELETE require editor/admin role, API key, or legacy WRITE_TOKEN
-  10. ResponseTimeout — http.TimeoutHandler (skips SSE + audio)
-
-  All /api/v1/* handler routes mounted here
+Root middleware, in order:
+  1. RequestID   — keep a client X-Request-ID only if ≤64 chars of [A-Za-z0-9._-]
+  2. CORS        — Access-Control-Allow-Origin: * on every response, never
+                   Allow-Credentials; OPTIONS → 204 here, before auth or routing
+  3. Recoverer   — catch panics → JSON 500
+     Logger      — structured request logging (zerolog/hlog)
+  4. Match       — path = URL.RawPath or URL.Path; pattern = root.Find(fresh
+                   route context, method, path), HEAD falling back to GET
+                   ├── no pattern → chi answers 404/405, no handler runs
+                   └── pattern without a policy → 403 forbidden + ERROR log
+  5. Resolve     — principal from Authorization: Bearer (non-empty, Bearer only);
+                   ?ticket= only on Ticket routes for GET/HEAD (and it wins);
+                   no credential → anonymous. Invalid credential → 401, never
+                   anonymous. Rate limiting interleaved (see below).
+  6. Authorize   — public: pass
+                   FormKey without a header principal: pass to upload middleware
+                   anonymous and (KeyRequired, policy off, or scope > listen): 401 key_required
+                   lacks scope: 403 insufficient_scope
+                   restricted and Restricted == Deny: 403 restricted_credential
+  7. Audit       — key principals, non-GET/HEAD/OPTIONS, except call-upload and
+                   tickets; records the status the client received
+  8. Route-group middleware: MaxBodySize (10 MB API, 50 MB upload),
+     [InstrumentHandler if metrics enabled], upload middleware,
+     ResponseTimeout (http.TimeoutHandler; skips SSE + audio) → handler
 ```
+
+Rate limiting (step 5): no credential → per-IP limiter (`RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`, IP from `TrustedProxies.ClientIP`). A bearer found in the positive key cache → the key's own `rate_limit_rps` limiter if set, otherwise none (legacy keys: per-IP). A bearer not in the positive cache → take a per-IP token first (429 without touching the database if none), then the negative cache, then the database (2 s timeout; errors → 503, never cached). Tickets: MAC and expiry checked without the database, key resolved through the cache, per-IP limited.
+
+Key cache: separate bounded LRUs for positive and negative results (so guesses can't evict valid keys), 30 s TTL, keyed by SHA-256 of the presented value, positive entries also indexed by key ID for tickets. `expires_at`/`revoked_at` are re-checked on every hit. API PATCH/DELETE invalidates the key's entries; an auth-generation bump clears both caches. `last_used_at` is written at most once a minute per key, asynchronously.
 
 ### Auth Model
 
 ```
-Derived auth modes:
+Principal (internal/auth.Principal) — exactly one per request:
   │
-  ├── Open mode
-  │     no AUTH_TOKEN and no ADMIN_PASSWORD
-  │     requests are unauthenticated
+  ├── key        Authorization: Bearer <key> (or, on /call-upload, form key/api_key)
+  │                scopes: the key's; restrictions: the key's restriction, if any
   │
-  ├── Token mode
-  │     AUTH_TOKEN set, ADMIN_PASSWORD unset
-  │     clients send Authorization: Bearer or ?token=
+  ├── ticket     ?ticket=trt_<payload>.<mac> on /events/stream, /audio/live,
+  │                /calls/{id}/audio (GET/HEAD)
+  │                scopes: listen, if the minting key is still active with listen
+  │                restrictions: key's current restriction ∩ ticket narrowing
   │
-  └── Full mode
-        ADMIN_PASSWORD set
-        JWT sessions and tre_ API keys support role-based access
-        AUTH_TOKEN, when set, acts as public read token from /auth-init
+  └── anonymous  no credential
+                   scopes: listen if auth_settings.anonymous_access is "listen", else none
+                   restrictions: the policy's restriction, if any
 
-WRITE_TOKEN is deprecated but still accepted as a legacy admin-equivalent credential during the transition.
+Scopes: listen < edit < admin (each implies the lower ones); upload is independent.
+Route policy: RoutePolicy{Scope, Restricted (Deny|Enforced), Ticket, KeyRequired, FormKey}.
+Restricted principals only pass Enforced routes; those handlers apply
+Principal.SQL(sysCol, tgCol, $n) in the shared WHERE, or GetCallAccess +
+AllowsTG for single resources (404 outside the restriction).
 ```
+
+The auth generation (`auth.Generation()`, an `atomic.Uint64`) is bumped by key PATCH/DELETE, anonymous-policy PUT and system merges. Caches and long-lived connections watch it. See [auth.md](auth.md) for the operator and client view.
 
 ### HTTP Server Config
 
@@ -533,9 +559,18 @@ EventBus.Subscribe(filter)
 
 ### Filter Logic
 
-`matchesFilter()` — all filter dimensions AND-ed:
+`matchesFilter()` first applies the subscriber's **principal** (stored on the subscriber at subscribe time, separately from the client's `EventFilter`, and swappable atomically), then the client's own filters:
 
 ```
+0. access (fail closed; zero values never pass):
+   console                                         → needs admin
+   call_start, call_update, call_end, transcription → needs listen; restricted
+       principals only if SystemID != 0, Tgid != 0 and AllowsTG
+   unit_event                                      → same (so on/off/registration
+       events, which have no talkgroup, are dropped for restricted principals)
+   recorder_update, rate_update, trunking_message  → needs listen; dropped for
+       restricted principals
+   any other type                                  → admin until classified
 1. emergency_only: skip non-emergency events
 2. types: match event Type (or Type:SubType for compound filters)
    "unit_event" matches all unit events
@@ -546,35 +581,49 @@ EventBus.Subscribe(filter)
 6. units: match UnitID (zero UnitID passes through)
 ```
 
-Zero-value fields pass through their filter dimension. This lets events like `recorder_update` (no SystemID) reach subscribers filtering by system.
+In the client's own filters (steps 3–6), zero-value fields pass through their filter dimension, so events like `recorder_update` (no SystemID) reach subscribers filtering by system. That convenience never applies to step 0: a restriction only lets through events whose system and talkgroup it allows. The per-type map lives next to the route table in `policy.go` and is documented on `SSEEventType` in `openapi.yaml`.
 
 ### Replay (Last-Event-ID)
 
 ```
-ReplaySince(lastEventID, filter)
+SubscribeSince(lastID, filter, principal) → (replay, ch, cancel)
   │
-  ├── Scan ring buffer from oldest to newest
-  │     find lastEventID → return filtered events after it
+  ├── Under the same lock Publish holds while appending to the ring and
+  │   distributing: register the subscriber and snapshot the ring
+  │     find lastID → replay = filtered events after it
+  │     lastID not found (ring wrapped)? → replay = ALL available filtered events
+  │     (better to replay duplicates than miss events)
   │
-  └── lastEventID not found (ring wrapped)?
-        → return ALL available filtered events
-        (better to replay duplicates than miss events)
+  └── Live events are deduplicated by sequence: only those newer than the
+      highest replayed sequence are sent. Channel buffer max(64, len(replay)+64).
 ```
+
+This replaces replay-then-subscribe, which lost events published in between. The last event ID comes from the `Last-Event-ID` header or, for clients that re-create an `EventSource` with a fresh ticket, the `last_event_id` query parameter (the header wins).
 
 ### SSE Handler
 
 `GET /api/v1/events/stream`:
 
 ```
-1. Parse filter params from query string
-2. ReplaySince(Last-Event-ID header) → send missed events
-3. Subscribe(filter) → channel
+1. Principal already resolved by the auth pipeline (key, ticket or anonymous)
+2. Parse filter params from query string
+3. SubscribeSince(Last-Event-ID header || last_event_id param, filter, principal)
+   → send replay, then stream from the channel
 4. Loop:
    ├── event from channel → write SSE frame
    ├── 15s ticker → write ": keepalive" comment
+   ├── 60s ticker, or auth generation changed → re-resolve the principal
+   │     (key re-read by ID bypassing the cache; ticket: key + narrowing + expiry;
+   │      anonymous: current policy)
+   │     ├── still has listen → swap the subscriber's principal atomically
+   │     └── lost listen, or ticket expired →
+   │           "event: auth" / data {"code": invalid_key|key_required|
+   │           insufficient_scope|ticket_expired}, then end the response
    └── client disconnect → cancel subscription
 Headers: Content-Type: text/event-stream, X-Accel-Buffering: no
 ```
+
+`GET /api/v1/audio/live` (WebSocket) does the same re-check. Its principal is stored on the audio subscriber separately from the client-updatable `AudioFilter`; for a restricted principal `matchesAudioFilter` also requires `AllowsTG(frame.SystemID, frame.TGID)`. On auth loss it closes with code 4401 (`invalid_key`, `key_required`, `ticket_expired`) or 4403 (`insufficient_scope`), the code string as the reason. CLI changes (another process) reach open connections through the 60 s re-check, which reads the database directly.
 
 ## 11. Shutdown
 

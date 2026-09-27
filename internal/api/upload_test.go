@@ -302,3 +302,60 @@ func TestDetectUploadFormat(t *testing.T) {
 		})
 	}
 }
+
+// An error caused by the upload's own fields is the client's fault: 400, not
+// 500.
+func TestUpload_InvalidFieldsIsBadRequest(t *testing.T) {
+	mock := &mockCallUploader{
+		err: fmt.Errorf("%w: parse rdio-scanner fields: missing required field: talkgroup", ErrInvalidUpload),
+	}
+	handler := newTestUploadHandler(mock)
+
+	body, ct := buildMultipartForm(t, map[string]string{
+		"systemLabel": "butco",
+	}, "audio", []byte("fake-audio"), "test.m4a")
+
+	req := httptest.NewRequest("POST", "/api/v1/call-upload", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+
+	handler.Upload(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	var resp ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Code != ErrInvalidBody {
+		t.Errorf("code = %q, want %q", resp.Code, ErrInvalidBody)
+	}
+}
+
+// A body over the route's limit is 413, whether the key came from the header
+// (the handler parses the form) or from the form (the upload middleware
+// does).
+func TestUpload_BodyTooLargeIs413(t *testing.T) {
+	mock := &mockCallUploader{}
+	handler := MaxBodySize(1024)(http.HandlerFunc(newTestUploadHandler(mock).Upload))
+
+	body, ct := buildMultipartForm(t, map[string]string{
+		"talkgroup":   "9044",
+		"dateTime":    "1708881234",
+		"systemLabel": "butco",
+	}, "audio", bytes.Repeat([]byte("x"), 4096), "test.m4a")
+
+	req := httptest.NewRequest("POST", "/api/v1/call-upload", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusRequestEntityTooLarge, rec.Body.String())
+	}
+	if mock.lastFormat != "" {
+		t.Error("the uploader was called for a rejected body")
+	}
+}

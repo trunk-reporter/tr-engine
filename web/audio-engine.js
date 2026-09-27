@@ -19,6 +19,9 @@ class AudioEngine {
     this.lastSubscription = null;
     this.listeners = {};
     this._intentionalClose = false;
+    this._connGen = 0;          // bumps on every connect/stop; stale sockets are ignored
+    this._authClosed = false;   // closed by the server for an auth reason (4401/4403)
+    this._freshTicket = false;  // the last attempt never opened: mint a new ticket
     this._serverAudioFormat = null; // set by server 'config' message; null = auto-detect
     this._autoPan = true; // auto-distribute channels across stereo field
     this._jitterTracking = new Map();  // key -> jitter entry
@@ -93,11 +96,14 @@ class AudioEngine {
 
     this._loadSettings();
     this._intentionalClose = false;
+    this._authClosed = false;
+    this._watchKeyChanges();
     this._connect();
   }
 
   stop() {
     this._intentionalClose = true;
+    this._connGen++;
     if (this.ws) {
       this.ws.close(1000);
       this.ws = null;
@@ -351,16 +357,57 @@ class AudioEngine {
     document.addEventListener('touchstart', resume, true);
   }
 
-  _connect() {
+  // When the API key is set, replaced or forgotten (trAuth), reconnect with
+  // the new credential; this also revives a stream closed for auth reasons.
+  _watchKeyChanges() {
+    if (this._keyWatch) return;
     var self = this;
+    this._keyWatch = function () {
+      if (self._intentionalClose || !self.audioCtx) return;
+      self._authClosed = false;
+      self._freshTicket = true;
+      self.reconnectDelay = 1000;
+      self._connect();
+    };
+    window.addEventListener('trauth:change', this._keyWatch);
+  }
+
+  // Connects to wsPath on this page's origin. Browsers can't send headers on
+  // a WebSocket, so with a stored API key the URL carries a short-lived ticket
+  // (trAuth.ticketUrl). The server closes with 4401 (invalid_key, key_required,
+  // ticket_expired) or 4403 (insufficient_scope) when access ends: only
+  // ticket_expired reconnects, at once, with a new ticket.
+  async _connect() {
+    var self = this;
+    if (this._intentionalClose) return;
+    var gen = ++this._connGen;
+    if (this.ws) {
+      var old = this.ws;
+      this.ws = null;
+      try { old.close(1000); } catch (e) { /* already closed */ }
+    }
+
+    var path = this.wsPath;
+    if (window.trAuth) {
+      try {
+        path = await window.trAuth.ticketUrl(this.wsPath, { fresh: this._freshTicket });
+      } catch (e) {
+        path = this.wsPath;
+      }
+    }
+    if (gen !== this._connGen || this._intentionalClose) return;
+    this._freshTicket = false;
+
     var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    var token = (window.trAuth && window.trAuth.getToken()) || window._authToken || '';
-    var url = protocol + '//' + location.host + this.wsPath + '?token=' + encodeURIComponent(token);
+    var url = protocol + '//' + location.host + path;
+    var opened = false;
 
     this.ws = new WebSocket(url);
     this.ws.binaryType = 'arraybuffer';
 
     this.ws.onopen = function () {
+      if (gen !== self._connGen) return;
+      opened = true;
       self.reconnectDelay = 1000;
       self.emit('status', { connected: true });
       if (self.lastSubscription) {
@@ -381,16 +428,56 @@ class AudioEngine {
     };
 
     this.ws.onclose = function (event) {
-      self.emit('status', { connected: false, code: event.code });
-      if (!self._intentionalClose && event.code !== 1000) {
-        setTimeout(function () { self._connect(); }, self.reconnectDelay);
-        self.reconnectDelay = Math.min(self.reconnectDelay * 2, self.options.reconnectMaxMs);
+      if (gen !== self._connGen) return;
+      self.ws = null;
+      if (event.code === 4401 || event.code === 4403) {
+        var code = event.reason || (event.code === 4403 ? 'insufficient_scope' : 'invalid_key');
+        if (code === 'ticket_expired' && !self._intentionalClose) {
+          self.emit('status', { connected: false, code: event.code, reason: code, reconnecting: true });
+          self._freshTicket = true;
+          self._connect();
+          return;
+        }
+        // Auth loss: no automatic reconnect. A new key (trauth:change) reconnects.
+        self._authClosed = true;
+        self.emit('status', { connected: false, code: event.code, reason: code });
+        self.emit('auth_error', { code: code, closeCode: event.code });
+        if (window.trAuth && window.trAuth.handleAuthLoss) window.trAuth.handleAuthLoss(code);
+        return;
       }
+      self.emit('status', { connected: false, code: event.code });
+      if (self._intentionalClose || event.code === 1000) return;
+      if (!opened) self._freshTicket = true;   // the ticket may have been the problem
+      self._scheduleReconnect(opened);
     };
 
     this.ws.onerror = function () {
+      if (gen !== self._connGen) return;
       self.emit('error', { message: 'WebSocket error' });
     };
+  }
+
+  // A handshake the server refused (e.g. 401 without a key while anonymous
+  // access is off) looks like any network failure to a WebSocket. Before
+  // retrying one that never opened, check whether a key is simply required.
+  async _scheduleReconnect(opened) {
+    var self = this;
+    var gen = this._connGen;
+    if (!opened && window.trAuth && !window.trAuth.getKey()) {
+      var who = null;
+      try { who = await window.trAuth.whoami({ refresh: true }); } catch (e) { who = null; }
+      if (gen !== this._connGen || this._intentionalClose) return;
+      if (who && who.anonymous && who.anonymous.access === 'off') {
+        this._authClosed = true;
+        this.emit('auth_error', { code: 'key_required', closeCode: 0 });
+        if (window.trAuth.handleAuthLoss) window.trAuth.handleAuthLoss('key_required');
+        return;
+      }
+    }
+    setTimeout(function () {
+      if (gen === self._connGen) self._connect();
+    }, this.reconnectDelay);
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.options.reconnectMaxMs);
   }
 
   _handleTextMessage(msg) {

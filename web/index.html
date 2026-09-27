@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="auth.js?v=1"></script>
+<script src="auth.js?v=3"></script>
 <meta name="card-title" content="Event Horizon">
 <meta name="card-description" content="System overview — live stats, health, and navigation — built on tr-engine">
 <meta name="card-order" content="1">
@@ -433,7 +433,7 @@ body::after {
 (function() {
   const sub = document.querySelector('.eh-header-sub');
   if (sub && sub.textContent.includes('tr-engine')) {
-    sub.innerHTML = sub.textContent.replace(/tr-engine/, '<a href="https://github.com/LumenPrima/tr-engine" style="color:inherit;text-decoration:none;border-bottom:1px solid currentColor" target="_blank">tr-engine</a>');
+    sub.innerHTML = trAuth.escapeHTML(sub.textContent).replace(/tr-engine/, '<a href="https://github.com/LumenPrima/tr-engine" style="color:inherit;text-decoration:none;border-bottom:1px solid currentColor" target="_blank">tr-engine</a>');
   }
 })();
 </script>
@@ -446,7 +446,7 @@ const API = '/api/v1';
 const $ = id => document.getElementById(id);
 const tip = $('tip');
 
-function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function esc(s) { return trAuth.escapeHTML(s); }
 function fmt(n) { if (n == null) return '—'; if (n >= 1e6) return (n/1e6).toFixed(1)+'M'; if (n >= 1e3) return (n/1e3).toFixed(1)+'K'; return n.toLocaleString(); }
 function fmtH(h) { return h == null ? '—' : h >= 1000 ? (h/1000).toFixed(1)+'K' : h.toFixed(0); }
 function fmtUp(s) { const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60); return d>0?`${d}d ${h}h ${m}m`:h>0?`${h}h ${m}m`:`${m}m`; }
@@ -467,7 +467,7 @@ async function loadHealth() {
     if (d.update_available && d.latest_version) {
       const cur = d.version ? (d.version.match(/v?\d+[\d.]+/) || [''])[0] : '';
       const a = document.createElement('a');
-      a.href = d.release_url || '#';
+      a.href = /^https?:\/\//i.test(d.release_url || '') ? d.release_url : '#';
       a.target = '_blank';
       a.rel = 'noopener';
       a.style.cssText = 'color:var(--accent);text-decoration:none;border-bottom:1px solid currentColor';
@@ -484,10 +484,10 @@ async function loadHealth() {
     $('subsys-list').innerHTML = h;
     const el = $('instances-list');
     if (d.trunk_recorders?.length)
-      el.innerHTML = d.trunk_recorders.map(t => `<div class="instance-row"><div class="instance-dot ${t.status==='connected'?'ok':'err'}"></div><span class="instance-name">${esc(t.instance_id)}</span><span class="instance-time">${t.last_seen?ago(t.last_seen):''}</span></div>`).join('');
+      el.innerHTML = d.trunk_recorders.map(t => `<div class="instance-row"><div class="instance-dot ${t.status==='connected'?'ok':'err'}"></div><span class="instance-name">${esc(t.instance_id)}</span><span class="instance-time">${t.last_seen?esc(ago(t.last_seen)):''}</span></div>`).join('');
     else el.innerHTML = '<div class="placeholder">no instances</div>';
     const footerParts = ['Event Horizon · built on <a href="https://github.com/LumenPrima/tr-engine" style="color:inherit;text-decoration:none;border-bottom:1px solid currentColor">tr-engine</a>'];
-    if (d.version) { const m = d.version.match(/v?\d+\.\d+\.\d+/); if (m) footerParts.push(m[0]); }
+    if (d.version) { const m = String(d.version).match(/v?\d+\.\d+\.\d+/); if (m) footerParts.push(m[0]); }
     if (d.uptime_seconds) footerParts.push('uptime ' + fmtUp(d.uptime_seconds));
     $('footer').innerHTML = footerParts.join(' · ');
   } catch { $('health-dot').className = 'health-dot-lg unknown'; $('health-label').textContent = 'unreachable'; }
@@ -526,9 +526,9 @@ async function loadTalkgroups() {
     if (tgs.length) {
       const mx = Math.max(...tgs.map(t => t.calls_1h || 0), 1);
       tb.innerHTML = tgs.map(t => {
-        const p = Math.round(((t.calls_1h||0)/mx)*100), name = esc(t.alpha_tag) || ('TG '+t.tgid);
+        const p = Math.round(((t.calls_1h||0)/mx)*100) || 0, name = esc(t.alpha_tag) || esc('TG '+t.tgid);
         const grp = t.group || t.tag || '', cls = grpClass(grp);
-        return `<tr><td class="sys-name-cell">${name}</td><td>${grp?`<span class="tg-group ${cls}">${esc(grp)}</span>`:''}</td><td><span class="num-accent">${fmt(t.calls_1h)}</span><div class="activity-bar-wrap"><div class="activity-bar-fill" style="width:${p}%"></div></div></td><td class="num-dim">${fmt(t.calls_24h)}</td><td class="num-dim">${t.unit_count??'—'}</td></tr>`;
+        return `<tr><td class="sys-name-cell">${name}</td><td>${grp?`<span class="tg-group ${cls}">${esc(grp)}</span>`:''}</td><td><span class="num-accent">${esc(fmt(t.calls_1h))}</span><div class="activity-bar-wrap"><div class="activity-bar-fill" style="width:${p}%"></div></div></td><td class="num-dim">${esc(fmt(t.calls_24h))}</td><td class="num-dim">${esc(t.unit_count??'—')}</td></tr>`;
       }).join('');
     } else tb.innerHTML = '<tr><td colspan="5" class="placeholder">no talkgroup data</td></tr>';
   } catch {}

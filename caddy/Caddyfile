@@ -1,20 +1,20 @@
-# Direct API access (no auth injection — caller provides their own token)
+# Direct API access. Callers send their own API key (Authorization: Bearer),
+# or none, in which case tr-engine's anonymous access policy applies.
 tr-engine.luxprimatech.com {
 	reverse_proxy tr-engine:8080
 }
 
-# Dashboard frontend + API proxy
-# Caddy injects the read token for unauthenticated requests so the web UI
-# works without manual token entry. When the browser sends its own
-# Authorization header (e.g. write token), Caddy passes it through.
+# Dashboard frontend + API proxy.
+# The dashboard calls /api/v1 on its own origin, so /api/* goes to tr-engine
+# unchanged. Never add an Authorization header here: a key injected into
+# visitors' requests is a key every visitor has. Public read access is set
+# with the anonymous access policy instead (tr-engine access set; docs/auth.md).
 tr-dashboard.luxprimatech.com {
 	handle /api/* {
-		@no_auth not header Authorization *
-		request_header @no_auth Authorization "Bearer {$AUTH_TOKEN}"
 		reverse_proxy tr-engine:8080
 	}
 
 	handle {
-		reverse_proxy tr-dashboard:80
+		reverse_proxy tr-dashboard:3000
 	}
 }

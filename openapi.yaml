@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: tr-engine API
-  version: 0.9.1
+  version: 0.10.0
   contact:
     name: tr-engine
     url: https://github.com/LumenPrima/tr-engine
@@ -15,18 +15,117 @@ info:
 
     ## Authentication
 
-    tr-engine supports three auth modes derived from configuration:
+    tr-engine authenticates **client software, not people**. Every client
+    (a dashboard deployment, a script, an upload plugin, a website's
+    backend, a phone app) holds its own **API key** and sends it as:
 
-    - **Open mode**: no `AUTH_TOKEN` and no `ADMIN_PASSWORD`; requests do not
-      require authentication.
-    - **Token mode**: `AUTH_TOKEN` set and `ADMIN_PASSWORD` unset; clients use
-      `Authorization: Bearer <token>` or `?token=`.
-    - **Full mode**: `ADMIN_PASSWORD` set; browser users authenticate with JWT
-      sessions and service clients can use `tre_...` API keys. If `AUTH_TOKEN`
-      is also set, it acts as a public read token returned by `/auth-init`.
+    ```
+    Authorization: Bearer tre_<64 hex characters>
+    ```
 
-    Mutating operations (POST, PATCH, PUT, DELETE) require editor/admin JWT
-    role, a suitable API key, or the deprecated legacy `WRITE_TOKEN`.
+    There are no user accounts, logins, sessions or cookies. How a client
+    authenticates its own users, if it has any, is up to the client. The
+    operator guide and the client-developer guide are in `docs/auth.md`.
+
+    **Scopes.** A key has one of `listen`, `edit` or `admin`, optionally
+    plus `upload`, or only `upload`:
+
+    | Scope | Grants | Implies |
+    |---|---|---|
+    | `listen` | Read radio data, stream events and audio, mint tickets | |
+    | `edit` | Change radio metadata (tags, transcription corrections and reviews, unit-tag suggestions) | `listen` |
+    | `admin` | Everything else: keys, anonymous access, identity edits, merges, maintenance, storage, SQL query, pages, imports, console logs, audit log | `edit`, `listen` |
+    | `upload` | `POST /call-upload` only | |
+
+    **Anonymous access.** A request with no credential is governed by the
+    operator's *anonymous access policy*: `off` (the default; 401
+    `key_required` everywhere but the public operations) or `listen`,
+    optionally restricted to some systems or talkgroups. Anonymous callers
+    can never edit, administer or upload. `GET /whoami` tells any client
+    what applies to it.
+
+    **Restrictions.** A `["listen"]` key, the anonymous policy and a
+    ticket can be restricted to some systems and talkgroups (see the
+    `Restriction` schema). A restricted credential only gets data it is
+    allowed to see, and is refused (403 `restricted_credential`) by
+    operations that cannot enforce a restriction.
+
+    **Tickets.** Browsers cannot attach headers to `EventSource`,
+    `<audio src>` or `WebSocket`. For those, a client with a key mints a
+    short-lived (60 s to 1 h), listen-only **ticket** with
+    `POST /tickets` and passes it as `?ticket=` to
+    `GET /events/stream`, `GET /audio/live` or `GET /calls/{id}/audio`
+    (GET and HEAD only). `?ticket=` is ignored everywhere else, and a key
+    is never accepted from the URL. A stream opened with a ticket is
+    closed when the ticket expires.
+
+    **Presenting credentials.**
+    - Only the `Bearer` scheme counts, with a non-empty token. Any other
+      `Authorization` scheme (for example `Basic` from a proxy) is treated
+      as no credential.
+    - On the ticket-enabled operations, `?ticket=` takes precedence over
+      an `Authorization` header.
+    - A presented but invalid credential (unknown, revoked or expired key;
+      bad, expired or orphaned ticket) is always 401 and never falls back
+      to anonymous access.
+    - `POST /call-upload` also reads the key from the multipart form
+      fields `key` or `api_key`, for trunk-recorder's upload plugins.
+
+    **Per-operation policy.** Every operation carries machine-readable
+    extensions, so clients do not need to hard-code who may call what:
+
+    - `x-scope`: `public` (no credential needed), `listen`, `edit`,
+      `admin` or `upload`.
+    - `x-restricted`: `enforced` (a restricted credential may call it and
+      only sees allowed data; a specific resource outside the restriction
+      is 404) or `deny` (a restricted credential gets 403
+      `restricted_credential`).
+    - `x-key-required: true`: needs an API key even when anonymous access
+      is `listen` (`POST /tickets`, `GET /metrics`).
+
+    Operations with `x-scope: listen` also work with no credential when
+    the anonymous policy is `listen`, unless they are `x-key-required`.
+
+    **Auth errors.** Error bodies are `{"code","error","detail?"}`:
+
+    | Status | `code` | Meaning |
+    |---|---|---|
+    | 401 | `key_required` | No credential, and anonymous access doesn't allow this |
+    | 401 | `invalid_key` | Unknown, revoked or expired key |
+    | 401 | `invalid_ticket` | Malformed, expired or orphaned ticket, or one for a merged system |
+    | 403 | `insufficient_scope` | The key lacks the scope the operation needs (named in the message) |
+    | 403 | `restricted_credential` | The credential is restricted and this operation can't enforce that |
+    | 404 | `not_found` | Also for a resource outside a restricted credential's restriction |
+    | 429 | `rate_limited` | Rate limit exceeded; see `Retry-After` |
+    | 503 | `service_unavailable` | The credential lookup failed; retry later |
+
+    Every 401 carries `WWW-Authenticate: Bearer realm="tr-engine"`.
+
+    **Rate limits.** Requests without a key, with a ticket, with a legacy
+    key, or with a key not yet known to the server are limited per client
+    IP (`RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`). A key with `rate_limit_rps`
+    set is limited per key; other keys are not limited.
+
+    **CORS.** No credential is ever sent automatically (no cookies), so
+    every response carries `Access-Control-Allow-Origin: *` and never
+    `Access-Control-Allow-Credentials`. Preflight `OPTIONS` requests are
+    answered with 204 and allow the `Authorization`, `Content-Type`,
+    `Last-Event-ID`, `X-Actor` and `X-Request-ID` headers. `X-Request-ID`,
+    `Retry-After` and `WWW-Authenticate` are exposed to scripts.
+
+    **Caching.** `/api/v1` JSON responses carry `Cache-Control: no-store`
+    and `Vary: Authorization`; call audio carries `Cache-Control: private`.
+
+    **Request headers.**
+    - `X-Actor` (optional): free text naming the end user a multi-user
+      client acts for. Recorded in the audit log, never used for
+      authorization.
+    - `X-Request-ID` (optional): kept when it is at most 64 characters of
+      `[A-Za-z0-9._-]`, otherwise replaced; echoed in the response.
+
+    **Removed.** `/auth-init`, `/auth/*`, `/users`, JWT login and the
+    `?token=` query parameter no longer exist (404). See
+    `docs/migrating-auth.md`.
 
     ## Data Model: Systems and Sites
 
@@ -140,9 +239,9 @@ tags:
   - name: transcriptions
     description: Transcription access, search, and management
   - name: auth
-    description: Authentication, user management, and API key operations
+    description: Credential introspection, API keys, the anonymous access policy and tickets
   - name: admin
-    description: Administrative operations (system merge, cleanup)
+    description: Administrative operations (system merge, maintenance, storage, SQL query, audit log). All need the `admin` scope.
 
 # ============================================================
 # PATHS
@@ -155,8 +254,17 @@ paths:
   /health:
     get:
       operationId: getHealth
+      x-scope: public
+      x-restricted: enforced
       summary: Health check
-      description: Returns service health status. No authentication required.
+      description: |
+        Returns service health status. Public: no credential needed.
+
+        Callers without an unrestricted key get a summary: `status`,
+        `version` and each check's status (`checks`). The full body (TR
+        instance list, audio stream details including the listen address,
+        uptime and the update check) is returned only to a key with
+        unrestricted `listen` or better.
       tags: [health]
       security: []
       responses:
@@ -176,482 +284,444 @@ paths:
                 $ref: "#/components/schemas/HealthResponse"
 
   # ----------------------------------------------------------
-  # Auth
+  # Auth: credential introspection, API keys, anonymous access, tickets
   # ----------------------------------------------------------
-  /auth-init:
+  /whoami:
     get:
-      summary: Auth mode discovery
+      operationId: getWhoami
+      x-scope: public
+      x-restricted: enforced
+      summary: Describe the caller's credential
       description: |
-        Returns the engine's auth mode and any public read token.
-        Always available without authentication. Clients use this to
-        determine whether to prompt for a token, show a login form,
-        or skip auth entirely.
-      operationId: getAuthInit
-      tags: [auth]
-      security: []
-      responses:
-        "200":
-          description: Auth mode info
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [mode, jwt_enabled]
-                properties:
-                  mode:
-                    type: string
-                    enum: [open, token, full]
-                    description: |
-                      - open: no auth required
-                      - token: shared API token required (not returned here)
-                      - full: JWT login available, optional public read token
-                  read_token:
-                    type: string
-                    nullable: true
-                    description: Public read token (only in full mode with AUTH_TOKEN set)
-                  jwt_enabled:
-                    type: boolean
-                    description: Whether JWT login endpoints are available
+        Tells any client what its credential can do. Public: it needs no
+        credential, but it reads the `Authorization: Bearer` header when one
+        is sent and describes that key. It is not ticket-enabled
+        (`?ticket=` is ignored here).
 
-  /auth/setup:
-    get:
-      operationId: checkAuthSetup
-      summary: Check whether first-run setup is needed
-      description: |
-        Returns whether the instance has completed first-run admin setup.
-        Unauthenticated — always available when JWT auth is configured.
-        The dashboard calls this endpoint to decide whether to show the
-        admin setup flow or the regular login page.
+        - With a valid key: `credential: "key"`, the key's own record in
+          `key`, and the effective scopes in `scopes`.
+        - With no credential: `credential: "anonymous"`, `key: null`, and
+          `scopes` from the anonymous access policy. Under policy `off` the
+          response is still 200, with `scopes: []`.
+        - With an unknown, revoked or expired key: 401 `invalid_key`, so a
+          client learns at once that its key is bad. It never falls back
+          to anonymous.
+
+        `anonymous` shows every caller only whether anonymous access is on
+        and whether it is restricted. The anonymous restriction itself
+        (which names talkgroups the operator considers sensitive) is only
+        available through the admin `GET /anonymous-access`.
+
+        Replaces the removed `GET /auth-init` and `GET /auth/me`.
       tags: [auth]
       security: []
       responses:
         "200":
-          description: Setup status
+          description: The caller's credential and effective access
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  needs_setup:
-                    type: boolean
-                    description: true when zero users exist (first-run setup pending)
-                  user_count:
-                    type: integer
-                    description: Total number of users in the database
-        "500":
-          description: Database error
+                $ref: "#/components/schemas/Whoami"
+              examples:
+                key:
+                  summary: An edit key
+                  value:
+                    credential: key
+                    key:
+                      id: 7
+                      name: tr-dashboard at home
+                      prefix: tre_1a2b3c4d
+                      scopes: [edit]
+                      restriction: null
+                      expires_at: null
+                      legacy: false
+                    scopes: [edit, listen]
+                    restricted: false
+                    anonymous:
+                      access: listen
+                      restricted: false
+                    version: "0.10.0"
+                anonymous_off:
+                  summary: No credential, anonymous access off
+                  value:
+                    credential: anonymous
+                    key: null
+                    scopes: []
+                    restricted: false
+                    anonymous:
+                      access: "off"
+                      restricted: false
+                    version: "0.10.0"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/AuthUnavailable"
+
+  /keys:
+    get:
+      operationId: listKeys
+      x-scope: admin
+      x-restricted: deny
+      summary: List API keys
+      description: |
+        Returns every API key, ordered by id. Revoked keys are left out
+        unless `include_revoked=true`. Plaintext keys are never returned;
+        only the display `prefix`.
+      tags: [auth]
+      parameters:
+        - name: include_revoked
+          in: query
+          description: Also return revoked keys
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: API keys
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKeyListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      operationId: createKey
+      x-scope: admin
+      x-restricted: deny
+      summary: Create an API key
+      description: |
+        Creates a key and returns it, including the plaintext `key`, which
+        is shown **exactly once** and cannot be retrieved again. Only its
+        SHA-256 hash is stored.
+
+        `scopes` holds at most one of `listen`/`edit`/`admin`, optionally
+        plus `upload` (for example `["listen"]`, `["edit"]`,
+        `["admin","upload"]`, `["upload"]`). `edit` implies `listen` and
+        `admin` implies both, so `["listen","edit"]` is rejected. Unknown
+        scope strings are rejected.
+
+        `restriction` is only allowed when `scopes` is exactly `["listen"]`,
+        and a key restriction that allows nothing is rejected
+        ("restriction allows nothing").
+
+        **A key that reaches other people's browsers is public.** Only put
+        a key into a web page that other people load if you would give
+        its access to every visitor.
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/APIKeyCreate"
+            examples:
+              dashboard:
+                summary: A key for a tr-dashboard you use yourself
+                value:
+                  name: tr-dashboard at home
+                  scopes: [edit]
+              upload:
+                summary: A trunk-recorder upload plugin
+                value:
+                  name: trunk-recorder butco uploads
+                  scopes: [upload]
+              restricted:
+                summary: A listen key restricted to one system, minus one talkgroup
+                value:
+                  name: club website backend
+                  scopes: [listen]
+                  restriction:
+                    systems: [1]
+                    exclude_talkgroups: ["1:5001"]
+                  expires_at: "2027-01-01T00:00:00Z"
+                  rate_limit_rps: 10
+      responses:
+        "201":
+          description: Key created; `key` holds the plaintext, shown once
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKeyCreated"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /keys/{id}:
+    parameters:
+      - $ref: "#/components/parameters/keyId"
+    get:
+      operationId: getKey
+      x-scope: admin
+      x-restricted: deny
+      summary: Get an API key
+      description: Returns one key, including a revoked one.
+      tags: [auth]
+      responses:
+        "200":
+          description: The key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKey"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      operationId: updateKey
+      x-scope: admin
+      x-restricted: deny
+      summary: Change an API key
+      description: |
+        Partially updates a key. An **absent** field is left unchanged; an
+        explicit `null` clears `restriction`, `expires_at` or
+        `rate_limit_rps`. The plaintext never changes; to rotate a key,
+        create a new one and revoke the old one.
+
+        - Scopes and restriction are validated together, as on create. To
+          change the scopes of a restricted `["listen"]` key, send
+          `"restriction": null` in the same request.
+        - `expires_at` must be in the future.
+        - A revoked key cannot be changed (409).
+        - **Last-admin guard:** removing `admin` from the last active admin
+          key is refused with 409 `conflict`.
+
+        The change takes effect on the key's next request, and on open
+        event streams and audio WebSockets at once: they either pick up the
+        new scopes and restriction, or close with a signal when the key no
+        longer has `listen`. Outstanding tickets minted by the key are
+        verified against its new state.
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/APIKeyPatch"
+      responses:
+        "200":
+          description: The updated key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKey"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The key is revoked, or the last-admin guard applies
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      operationId: revokeKey
+      x-scope: admin
+      x-restricted: deny
+      summary: Revoke an API key
+      description: |
+        Revokes the key (sets `revoked_at`; the record is kept for the
+        audit trail). Idempotent: revoking a revoked key is also 204.
+        Requests with the key fail with 401 `invalid_key` from then on, its
+        tickets stop verifying, and its open streams close with the
+        `invalid_key` signal.
+
+        **Last-admin guard:** revoking the last active admin key is refused
+        with 409 `conflict`. (The `tr-engine keys revoke` CLI is not
+        subject to the guard.)
+      tags: [auth]
+      responses:
+        "204":
+          description: Revoked
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The last-admin guard applies
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
 
-    post:
-      operationId: authSetup
-      summary: First-run admin creation
+  /anonymous-access:
+    get:
+      operationId: getAnonymousAccess
+      x-scope: admin
+      x-restricted: deny
+      summary: Get the anonymous access policy
       description: |
-        Creates the first admin user. Only works when zero users exist in the
-        database. Rate-limited to 5 attempts per minute per IP. Only available
-        when JWT auth is configured (JWT_SECRET or ADMIN_PASSWORD set).
-
-        Uses an atomic INSERT to prevent race conditions where two concurrent
-        requests could both create admin users.
+        Returns the policy that decides what a request with **no
+        credential** may do, including its restriction lists. Other
+        callers only see `{access, restricted}` in `GET /whoami`.
       tags: [auth]
-      security: []
+      responses:
+        "200":
+          description: The anonymous access policy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnonymousAccess"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    put:
+      operationId: putAnonymousAccess
+      x-scope: admin
+      x-restricted: deny
+      summary: Set the anonymous access policy
+      description: |
+        Replaces the anonymous access policy. **Both keys are required**: a
+        missing `restriction` is 400, and an explicit `"restriction": null`
+        clears it (unrestricted listening).
+
+        - `access: "off"` (the default on a fresh install): requests
+          without a credential get 401 `key_required` everywhere except
+          the public operations.
+        - `access: "listen"`: requests without a credential may use the
+          `listen` operations (never `x-key-required` ones), limited by
+          `restriction` when it is set.
+
+        A restriction that allows nothing is rejected ("use access: off
+        instead"). The restriction is stored even with `access: "off"`, so
+        it can be prepared in advance.
+
+        The change applies to new requests at once. Open anonymous event
+        streams and audio WebSockets pick it up at once too: they close
+        with the `key_required` signal when access is now `off`, and
+        otherwise continue under the new restriction.
+      tags: [auth]
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [username, password]
-              properties:
-                username:
-                  type: string
-                  description: Admin username (normalized to lowercase)
-                password:
-                  type: string
-                  minLength: 8
+              $ref: "#/components/schemas/AnonymousAccessUpdate"
+            examples:
+              access_off:
+                summary: No anonymous access
+                value:
+                  access: "off"
+                  restriction: null
+              public_listening:
+                summary: Public listening, minus two sensitive talkgroups
+                value:
+                  access: listen
+                  restriction:
+                    allow_all: true
+                    exclude_talkgroups: ["1:5001", "1:5002"]
       responses:
-        "201":
-          description: Admin user created
+        "200":
+          description: The new policy
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  message:
-                    type: string
-                  user:
-                    $ref: "#/components/schemas/UserSummary"
+                $ref: "#/components/schemas/AnonymousAccess"
         "400":
           $ref: "#/components/responses/BadRequest"
-        "409":
-          description: Setup already completed — users exist
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /tickets:
+    post:
+      operationId: createTicket
+      x-scope: listen
+      x-restricted: enforced
+      x-key-required: true
+      summary: Mint a ticket for a URL
+      description: |
+        Mints a short-lived, listen-only, signed **ticket** for the places
+        where a browser cannot send an `Authorization` header:
+        `EventSource`, `<audio src>` and `WebSocket`. Pass it as
+        `?ticket=<ticket>` on the three ticket-enabled operations:
+        `GET /events/stream`, `GET /audio/live` and
+        `GET /calls/{id}/audio` (and `HEAD` on the same paths). It is
+        ignored everywhere else.
+
+        Requires a **key** with `listen` (via `listen`, `edit` or `admin`):
+        anonymous callers get 401 `key_required` whatever the anonymous
+        policy says, and upload-only keys get 403 `insufficient_scope`.
+        Tickets cannot mint tickets.
+
+        - `ttl_seconds` is clamped to 60–3600 (default 600).
+        - `restriction` optionally **narrows** the ticket below the key's
+          own access, for example per end user in a multi-user backend.
+          It may hold at most 100 entries in total, and the encoded ticket
+          must fit in 2048 bytes; otherwise 400 `invalid_body` "ticket
+          restriction too large — narrow by system or mint several
+          tickets". A narrowing that allows nothing is accepted: the
+          ticket then sees nothing.
+        - The ticket stores only the narrowing. Every use applies the
+          minting key's **current** state: a revoked, expired or re-scoped
+          key invalidates its tickets, and a changed key restriction
+          applies to them at once.
+
+        Tickets are not single-use (audio elements make repeated Range
+        requests); a ticket is valid until it expires. An event stream or
+        audio WebSocket opened with a ticket is closed when the ticket
+        expires, with the `ticket_expired` signal; mint a new ticket and
+        reconnect. A single ticket cannot be revoked; stop minting, wait
+        for it to expire, or revoke the key.
+
+        The body is optional; an empty body mints a 600-second ticket with
+        no narrowing.
+      tags: [auth]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TicketRequest"
+            examples:
+              default:
+                summary: Default lifetime, no narrowing
+                value: {}
+              narrowed:
+                summary: Narrowed to two talkgroups for one end user
+                value:
+                  ttl_seconds: 900
+                  restriction:
+                    talkgroups: ["2:9178", "2:9179"]
+      responses:
+        "200":
+          description: The ticket
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ticket"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "429":
           $ref: "#/components/responses/RateLimited"
-
-  /auth/login:
-    post:
-      operationId: authLogin
-      summary: User login
-      description: |
-        Validates credentials and returns a JWT access token. Also sets an
-        httpOnly refresh cookie (`tr_refresh_token`). Rate-limited to 5
-        attempts per minute per IP.
-      tags: [auth]
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [username, password]
-              properties:
-                username:
-                  type: string
-                password:
-                  type: string
-      responses:
-        "200":
-          description: Login successful
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  access_token:
-                    type: string
-                    description: JWT access token (1 hour expiry)
-                  user:
-                    $ref: "#/components/schemas/UserSummary"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "401":
-          description: Invalid credentials or account disabled
-        "429":
-          $ref: "#/components/responses/RateLimited"
-
-  /auth/refresh:
-    post:
-      operationId: authRefresh
-      summary: Refresh access token
-      description: |
-        Validates the httpOnly refresh cookie and returns a new JWT access token.
-        The refresh token has a 7-day expiry.
-      tags: [auth]
-      security: []
-      responses:
-        "200":
-          description: New access token
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  access_token:
-                    type: string
-                  user:
-                    $ref: "#/components/schemas/UserSummary"
-        "401":
-          description: No refresh token or invalid/expired token
-
-  /auth/logout:
-    post:
-      operationId: authLogout
-      summary: Logout
-      description: Clears the refresh cookie. Returns 200 regardless of session state.
-      tags: [auth]
-      security: []
-      responses:
-        "200":
-          description: Logged out
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-
-  /auth/me:
-    get:
-      operationId: authMe
-      summary: Current user info
-      description: Returns the authenticated user's profile from the database.
-      tags: [auth]
-      responses:
-        "200":
-          description: Current user
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/User"
-        "401":
-          description: Not authenticated
-
-  /auth/keys:
-    get:
-      operationId: listOwnKeys
-      summary: List own API keys
-      description: Returns API keys owned by the authenticated user. Requires editor or admin role.
-      tags: [auth]
-      responses:
-        "200":
-          description: List of API keys
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/APIKey"
-        "401":
-          description: User authentication required (API keys cannot list keys)
-    post:
-      operationId: createKey
-      summary: Create API key
-      description: |
-        Creates a new API key. The plaintext key is returned once in the response
-        and cannot be retrieved again. The key's role is capped at the caller's
-        own role level — an editor cannot create an admin key.
-        Requires editor or admin role.
-      tags: [auth]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [label]
-              properties:
-                label:
-                  type: string
-                  description: Human-readable name for the key
-                role:
-                  type: string
-                  enum: [viewer, editor, admin]
-                  default: viewer
-      responses:
-        "201":
-          description: API key created (plaintext shown once)
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/APIKeyWithPlaintext"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "403":
-          description: Cannot create key with higher role than your own
-
-  /auth/keys/{id}:
-    delete:
-      operationId: deleteOwnKey
-      summary: Revoke own API key
-      description: Deletes an API key owned by the authenticated user. Requires editor or admin role.
-      tags: [auth]
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: integer
-      responses:
-        "204":
-          description: Key revoked
-        "404":
-          description: Key not found or not owned by you
-
-  /auth/keys/all:
-    get:
-      operationId: listAllKeys
-      summary: List all API keys
-      description: Returns all API keys across all users and service accounts. Admin only.
-      tags: [auth]
-      responses:
-        "200":
-          description: List of all API keys
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/APIKey"
-        "403":
-          description: Admin access required
-
-  /auth/keys/service:
-    post:
-      operationId: createServiceAccountKey
-      summary: Create service account key
-      description: |
-        Creates an API key that acts as its own identity, not linked to any user.
-        Used for frontend apps, bots, and integrations. Admin only.
-      tags: [auth]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [label]
-              properties:
-                label:
-                  type: string
-                role:
-                  type: string
-                  enum: [viewer, editor, admin]
-                  default: viewer
-      responses:
-        "201":
-          description: Service account key created
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/APIKeyWithPlaintext"
-        "403":
-          description: Admin access required
-
-  /auth/keys/{id}/any:
-    delete:
-      operationId: deleteAnyKey
-      summary: Revoke any API key
-      description: Deletes any API key by ID regardless of ownership. Admin only.
-      tags: [auth]
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: integer
-      responses:
-        "204":
-          description: Key revoked
-        "403":
-          description: Admin access required
-        "404":
-          description: Key not found
-
-  /users:
-    get:
-      operationId: listUsers
-      summary: List all users
-      description: Returns all user accounts. Admin only.
-      tags: [auth]
-      responses:
-        "200":
-          description: User list
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  users:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/User"
-                  total:
-                    type: integer
-        "403":
-          description: Admin access required
-    post:
-      operationId: createUser
-      summary: Create user
-      description: Creates a new user account. Admin only.
-      tags: [auth]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [username, password]
-              properties:
-                username:
-                  type: string
-                password:
-                  type: string
-                  minLength: 8
-                role:
-                  type: string
-                  enum: [viewer, editor, admin]
-                  default: viewer
-      responses:
-        "201":
-          description: User created
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/User"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "403":
-          description: Admin access required
-        "409":
-          description: Username already exists
-
-  /users/{id}:
-    patch:
-      operationId: updateUser
-      summary: Update user
-      description: |
-        Partially update a user account (role, password, enabled status).
-        Admin only. Cannot demote or disable the last admin user.
-        Cannot demote or disable your own account.
-      tags: [auth]
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: integer
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                role:
-                  type: string
-                  enum: [viewer, editor, admin]
-                password:
-                  type: string
-                  minLength: 8
-                enabled:
-                  type: boolean
-      responses:
-        "200":
-          description: User updated
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/User"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "403":
-          description: Admin access required, or last admin protection
-        "404":
-          description: User not found
-    delete:
-      operationId: deleteUser
-      summary: Delete user
-      description: |
-        Deletes a user and cascades to their sessions and API keys.
-        Admin only. Cannot delete yourself or the last admin user.
-      tags: [auth]
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: integer
-      responses:
-        "200":
-          description: User deleted
-        "403":
-          description: Admin access required, or last admin / self-delete protection
-        "404":
-          description: User not found
+        "503":
+          $ref: "#/components/responses/AuthUnavailable"
 
   # ----------------------------------------------------------
   # Systems
@@ -659,6 +729,8 @@ paths:
   /systems:
     get:
       operationId: listSystems
+      x-scope: listen
+      x-restricted: enforced
       summary: List systems
       description: |
         Returns all logical radio systems. Each system contains its
@@ -675,12 +747,18 @@ paths:
                 $ref: "#/components/schemas/SystemListResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /systems/{id}:
     get:
       operationId: getSystem
+      x-scope: listen
+      x-restricted: enforced
       summary: Get a system
       description: Returns a single system by its database ID, with embedded sites.
       tags: [systems]
@@ -698,6 +776,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/System"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -705,6 +787,8 @@ paths:
 
     patch:
       operationId: updateSystem
+      x-scope: admin
+      x-restricted: deny
       summary: Update system metadata
       description: |
         Updates system-level fields. For P25, this includes the network
@@ -733,6 +817,8 @@ paths:
                 $ref: "#/components/schemas/System"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -743,6 +829,8 @@ paths:
   /sites/{id}:
     get:
       operationId: getSite
+      x-scope: listen
+      x-restricted: enforced
       summary: Get a recording site
       description: Returns a single recording site by its database ID.
       tags: [systems]
@@ -760,6 +848,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Site"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -767,6 +859,8 @@ paths:
 
     patch:
       operationId: updateSite
+      x-scope: admin
+      x-restricted: deny
       summary: Update site metadata
       description: |
         Updates site-level fields. Changing `short_name` or `instance_id`
@@ -797,6 +891,8 @@ paths:
                 $ref: "#/components/schemas/Site"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -813,6 +909,8 @@ paths:
   /p25-systems:
     get:
       operationId: listP25Systems
+      x-scope: listen
+      x-restricted: deny
       summary: List P25 systems (grouped by network)
       description: |
         Returns P25 systems grouped by sysid + wacn. Each P25 system may have
@@ -829,6 +927,10 @@ paths:
                 $ref: "#/components/schemas/P25SystemListResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -838,6 +940,8 @@ paths:
   /talkgroups:
     get:
       operationId: listTalkgroups
+      x-scope: listen
+      x-restricted: enforced
       summary: List talkgroups
       description: |
         Returns talkgroups with cached stats (call_count, calls_1h, calls_24h,
@@ -890,12 +994,18 @@ paths:
                 $ref: "#/components/schemas/TalkgroupListResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /talkgroups/{id}:
     get:
       operationId: getTalkgroup
+      x-scope: listen
+      x-restricted: enforced
       summary: Get a talkgroup
       description: |
         Returns a single talkgroup with real-time stats computed at request time.
@@ -911,6 +1021,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Talkgroup"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -920,6 +1034,8 @@ paths:
 
     patch:
       operationId: updateTalkgroup
+      x-scope: edit
+      x-restricted: deny
       summary: Update talkgroup metadata
       description: >-
         Updates mutable talkgroup fields (alpha_tag, description, group,
@@ -951,6 +1067,8 @@ paths:
                 $ref: "#/components/schemas/Talkgroup"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -963,6 +1081,8 @@ paths:
   /talkgroups/{id}/calls:
     get:
       operationId: listTalkgroupCalls
+      x-scope: listen
+      x-restricted: enforced
       summary: List calls for a talkgroup
       description: |
         Returns calls for a specific talkgroup. Accepts composite `system_id:tgid`
@@ -981,6 +1101,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CallListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -991,6 +1115,8 @@ paths:
   /talkgroups/{id}/units:
     get:
       operationId: listTalkgroupUnits
+      x-scope: listen
+      x-restricted: deny
       summary: List units affiliated with a talkgroup
       description: |
         Returns units that have recent activity on this talkgroup, based on
@@ -1013,6 +1139,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UnitListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -1023,6 +1153,8 @@ paths:
   /talkgroups/encryption-stats:
     get:
       operationId: getTalkgroupEncryptionStats
+      x-scope: listen
+      x-restricted: deny
       summary: Get encryption stats per talkgroup
       description: |
         Returns counts of encrypted vs clear calls per talkgroup from recent
@@ -1049,6 +1181,10 @@ paths:
                 $ref: "#/components/schemas/EncryptionStatsResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -1058,6 +1194,8 @@ paths:
   /talkgroup-directory:
     get:
       operationId: listTalkgroupDirectory
+      x-scope: listen
+      x-restricted: enforced
       summary: Search talkgroup reference directory
       description: |
         Searches the talkgroup directory — a reference table imported from
@@ -1098,6 +1236,7 @@ paths:
                 properties:
                   talkgroups:
                     type: array
+                    description: Empty array (never null) when nothing matches
                     items:
                       $ref: "#/components/schemas/TalkgroupDirectoryEntry"
                   total:
@@ -1108,12 +1247,18 @@ paths:
                     type: integer
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /talkgroup-directory/import:
     post:
       operationId: importTalkgroupDirectory
+      x-scope: admin
+      x-restricted: deny
       summary: Upload talkgroup CSV
       description: |
         Imports a trunk-recorder talkgroup CSV file into the talkgroup directory.
@@ -1192,6 +1337,8 @@ paths:
                     description: Rows repeating a tgid seen earlier in the file; the last one wins (omitted when 0)
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -1207,6 +1354,8 @@ paths:
   /unit-tags/import:
     post:
       operationId: importUnitTags
+      x-scope: admin
+      x-restricted: deny
       summary: Upload unit tags CSV
       description: |
         Imports a trunk-recorder unit tags CSV (the `unitTagsFile` format) into
@@ -1284,6 +1433,8 @@ paths:
                     description: Rows repeating a unit ID seen earlier in the file; the last one wins (omitted when 0)
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -1296,6 +1447,8 @@ paths:
   /units:
     get:
       operationId: listUnits
+      x-scope: listen
+      x-restricted: deny
       summary: List radio units
       description: |
         Returns radio units with optional filters. When searching, results
@@ -1339,12 +1492,18 @@ paths:
                 $ref: "#/components/schemas/UnitListResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /units/{id}:
     get:
       operationId: getUnit
+      x-scope: listen
+      x-restricted: deny
       summary: Get a unit
       description: |
         Returns a single unit. Accepts composite `system_id:unit_id` (e.g.,
@@ -1359,6 +1518,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Unit"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -1368,6 +1531,8 @@ paths:
 
     patch:
       operationId: updateUnit
+      x-scope: edit
+      x-restricted: deny
       summary: Update unit metadata
       description: >-
         Updates mutable unit fields (alpha_tag, alpha_tag_source).
@@ -1396,6 +1561,8 @@ paths:
                 $ref: "#/components/schemas/Unit"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -1408,6 +1575,8 @@ paths:
   /units/{id}/calls:
     get:
       operationId: listUnitCalls
+      x-scope: listen
+      x-restricted: deny
       summary: List calls for a unit
       description: |
         Returns calls that include transmissions from a specific unit.
@@ -1426,6 +1595,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CallListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -1436,6 +1609,8 @@ paths:
   /units/{id}/events:
     get:
       operationId: listUnitEvents
+      x-scope: listen
+      x-restricted: deny
       summary: List unit events
       description: |
         Returns events (affiliations, registrations, calls, etc.) for a
@@ -1464,6 +1639,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UnitEventListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -1477,6 +1656,8 @@ paths:
   /unit-tag-suggestions:
     get:
       operationId: listUnitTagSuggestions
+      x-scope: listen
+      x-restricted: deny
       summary: List unit alpha tag suggestions
       description: |
         Returns candidate unit alpha tags extracted from transcriptions where
@@ -1534,12 +1715,18 @@ paths:
                 $ref: "#/components/schemas/UnitTagSuggestionListResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /unit-tag-suggestions/{id}:
     get:
       operationId: getUnitTagSuggestion
+      x-scope: listen
+      x-restricted: deny
       summary: Get a unit alpha tag suggestion
       description: Returns one suggestion by ID regardless of status or review gate.
       tags: [unit-tag-suggestions]
@@ -1554,6 +1741,10 @@ paths:
                 $ref: "#/components/schemas/UnitTagSuggestion"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -1562,6 +1753,8 @@ paths:
   /unit-tag-suggestions/{id}/approve:
     post:
       operationId: approveUnitTagSuggestion
+      x-scope: edit
+      x-restricted: deny
       summary: Approve a unit alpha tag suggestion
       description: |
         Applies a **pending** suggestion to its unit and marks it `approved`.
@@ -1574,8 +1767,8 @@ paths:
         best-effort CSV writeback when `CSV_WRITEBACK` is enabled. The unit's
         previous tag and source are recorded on the suggestion
         (`previous_tag`, `previous_tag_source`) with `decided_by`/`decided_at`.
-        Other suggestions for the same unit are left untouched. Requires write
-        access (same as `PATCH /units/{id}`).
+        Other suggestions for the same unit are left untouched. Requires the
+        `edit` scope (same as `PATCH /units/{id}`).
       tags: [unit-tag-suggestions]
       parameters:
         - $ref: "#/components/parameters/suggestionId"
@@ -1612,12 +1805,14 @@ paths:
   /unit-tag-suggestions/{id}/dismiss:
     post:
       operationId: dismissUnitTagSuggestion
+      x-scope: edit
+      x-restricted: deny
       summary: Dismiss a unit alpha tag suggestion
       description: |
         Marks a **pending** suggestion `dismissed` without touching the unit.
         A dismissed candidate keeps accumulating evidence when seen again but
-        never returns to the pending queue. No request body. Requires write
-        access (same as `PATCH /units/{id}`).
+        never returns to the pending queue. No request body. Requires the
+        `edit` scope (same as `PATCH /units/{id}`).
       tags: [unit-tag-suggestions]
       parameters:
         - $ref: "#/components/parameters/suggestionId"
@@ -1647,6 +1842,8 @@ paths:
   /unit-events:
     get:
       operationId: listUnitEventsGlobal
+      x-scope: listen
+      x-restricted: deny
       summary: List unit events (system-wide)
       description: |
         Returns unit events across an entire system with JOINs for display
@@ -1717,6 +1914,10 @@ paths:
                 $ref: "#/components/schemas/UnitEventListResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -1726,6 +1927,8 @@ paths:
   /unit-affiliations:
     get:
       operationId: listUnitAffiliations
+      x-scope: listen
+      x-restricted: deny
       summary: List live talkgroup affiliations
       description: |
         Returns current talkgroup affiliation state for units, derived from
@@ -1789,6 +1992,10 @@ paths:
                 $ref: "#/components/schemas/AffiliationListResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -1798,6 +2005,8 @@ paths:
   /calls:
     get:
       operationId: listCalls
+      x-scope: listen
+      x-restricted: enforced
       summary: List calls
       description: |
         Returns call recordings with comprehensive filters. This is the
@@ -1878,12 +2087,18 @@ paths:
                 $ref: "#/components/schemas/CallListResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /calls/active:
     get:
       operationId: listActiveCalls
+      x-scope: listen
+      x-restricted: enforced
       summary: List active calls (real-time)
       description: |
         Returns currently active calls from the in-memory MQTT tracker.
@@ -1925,12 +2140,18 @@ paths:
                 $ref: "#/components/schemas/ActiveCallListResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /calls/{id}:
     get:
       operationId: getCall
+      x-scope: listen
+      x-restricted: enforced
       summary: Get a call
       description: |
         Returns a single call recording by its database ID.
@@ -1944,6 +2165,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Call"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -1952,14 +2177,41 @@ paths:
   /calls/{id}/audio:
     get:
       operationId: getCallAudio
+      x-scope: listen
+      x-restricted: enforced
       summary: Stream call audio
-      description: Streams the audio file for a call. Content-Type varies by source format.
+      description: |
+        Streams the audio file for a call. Content-Type varies by source
+        format. Responses carry `Cache-Control: private`.
+
+        **Authentication:** `Authorization: Bearer <key>` when the client
+        can send headers, `?ticket=<ticket>` from `POST /tickets` for an
+        `<audio src>` element (which cannot), or no credential when the
+        anonymous access policy is `listen`. An audio element makes
+        repeated (Range) requests with the same URL; a ticket stays valid
+        for all of them until it expires, so mint one with some lifetime
+        left (for example at least 5 minutes) and mint a new one if
+        playback fails with an error.
+
+        A call outside a restricted credential's restriction is 404.
+
+        `audio_url` fields in API responses hold this path and never a
+        credential; see `Call.audio_url`.
       tags: [calls]
+      security:
+        - bearerAuth: []
+        - ticketAuth: []
       parameters:
         - $ref: "#/components/parameters/callId"
+        - $ref: "#/components/parameters/ticket"
       responses:
         "200":
           description: Audio stream
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: private
           content:
             audio/mp4:
               schema:
@@ -1977,6 +2229,10 @@ paths:
               schema:
                 type: string
                 format: binary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           description: Not Found
           content:
@@ -1993,6 +2249,8 @@ paths:
   /calls/{id}/frequencies:
     get:
       operationId: getCallFrequencies
+      x-scope: listen
+      x-restricted: enforced
       summary: Get call frequency list
       description: |
         Returns the frequency entries (freqList) within a call, ordered by
@@ -2007,6 +2265,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CallFrequencyListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -2015,6 +2279,8 @@ paths:
   /calls/{id}/transmissions:
     get:
       operationId: getCallTransmissions
+      x-scope: listen
+      x-restricted: enforced
       summary: Get call transmission list
       description: |
         Returns the unit transmissions (srcList) within a call, ordered by
@@ -2030,6 +2296,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CallTransmissionListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -2041,6 +2313,8 @@ paths:
   /calls/{id}/transcription:
     get:
       operationId: getCallTranscription
+      x-scope: listen
+      x-restricted: enforced
       summary: Get primary transcription for a call
       description: Returns the current primary transcription with unit-attributed word timestamps and segments.
       tags: [transcriptions]
@@ -2053,11 +2327,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Transcription"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
 
     put:
       operationId: submitTranscriptionCorrection
+      x-scope: edit
+      x-restricted: deny
       summary: Submit transcription
       description: |
         Creates a new primary transcription variant for a call. Defaults to
@@ -2113,6 +2393,8 @@ paths:
                     example: human
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -2121,6 +2403,8 @@ paths:
   /calls/{id}/transcriptions:
     get:
       operationId: listCallTranscriptions
+      x-scope: listen
+      x-restricted: enforced
       summary: List all transcription variants for a call
       description: |
         Returns all transcription variants (auto, human, LLM) for a call.
@@ -2142,12 +2426,18 @@ paths:
                       $ref: "#/components/schemas/Transcription"
                   total:
                     type: integer
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
 
   /calls/{id}/transcribe:
     post:
       operationId: transcribeCall
+      x-scope: edit
+      x-restricted: deny
       summary: Queue call for transcription
       description: Queues a call for transcription (or re-transcription). Returns 202 if accepted.
       tags: [transcriptions]
@@ -2166,6 +2456,8 @@ paths:
                   status:
                     type: string
                     enum: [queued]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -2180,6 +2472,8 @@ paths:
   /calls/{id}/transcription/verify:
     post:
       operationId: verifyTranscription
+      x-scope: edit
+      x-restricted: deny
       summary: Verify a transcription
       description: Marks the call's current transcription as human-verified.
       tags: [transcriptions]
@@ -2192,6 +2486,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatusChangeResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -2200,6 +2496,8 @@ paths:
   /calls/{id}/transcription/reject:
     post:
       operationId: rejectTranscription
+      x-scope: edit
+      x-restricted: deny
       summary: Reject a transcription
       description: Resets the call's transcription_status to "reviewed" (unverified).
       tags: [transcriptions]
@@ -2212,6 +2510,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatusChangeResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -2220,6 +2520,8 @@ paths:
   /calls/{id}/transcription/exclude:
     post:
       operationId: excludeFromDataset
+      x-scope: edit
+      x-restricted: deny
       summary: Exclude call from training dataset
       description: Marks a call as permanently excluded from the training dataset.
       tags: [transcriptions]
@@ -2232,6 +2534,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatusChangeResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -2240,6 +2544,8 @@ paths:
   /transcriptions/search:
     get:
       operationId: searchTranscriptions
+      x-scope: listen
+      x-restricted: enforced
       summary: Full-text search across transcriptions
       description: |
         Searches transcription text using PostgreSQL full-text search.
@@ -2296,10 +2602,16 @@ paths:
                 $ref: "#/components/schemas/TranscriptionSearchResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
   /transcriptions/batch:
     get:
       operationId: getBatchTranscriptions
+      x-scope: listen
+      x-restricted: enforced
       summary: Batch-fetch primary transcriptions for multiple calls
       description: |
         Returns the primary transcription text and segments for up to 500 call IDs
@@ -2325,10 +2637,16 @@ paths:
                 $ref: "#/components/schemas/BatchTranscriptionResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
   /transcriptions/queue:
     get:
       operationId: getTranscriptionQueueStatus
+      x-scope: listen
+      x-restricted: deny
       summary: Get transcription queue status
       description: Returns statistics about the transcription processing queue.
       tags: [transcriptions]
@@ -2341,6 +2659,10 @@ paths:
                 $ref: "#/components/schemas/TranscriptionQueueStats"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
   # ----------------------------------------------------------
   # Call Upload
@@ -2348,7 +2670,11 @@ paths:
   /call-upload:
     post:
       operationId: uploadCall
+      x-scope: upload
+      x-restricted: deny
       summary: Upload a call recording
+      security:
+        - bearerAuth: []
       description: |
         Accepts multipart/form-data uploads compatible with trunk-recorder's
         rdio-scanner and OpenMHz upload plugins. Auto-detects format from form
@@ -2358,14 +2684,21 @@ paths:
         trunk-recorder's upload plugin at `POST /api/v1/call-upload` and it
         works out of the box.
 
-        **Authentication:** Uploads are write operations. In full auth mode,
-        use an API key (`tre_...`) or an editor/admin JWT. In token mode,
-        use `AUTH_TOKEN`. The deprecated `WRITE_TOKEN` is still accepted for
-        legacy deployments. In addition to the standard `Authorization: Bearer`
-        header and `?token=` query parameter, this endpoint also accepts auth
-        via the `key` (rdio-scanner) or `api_key` (OpenMHz) multipart form
-        fields. This allows trunk-recorder upload plugins to authenticate
-        without custom header configuration.
+        **Authentication:** needs an API key with the `upload` scope
+        (create one with `tr-engine keys create --name "tr butco uploads"
+        --scopes upload`). Anonymous access never allows uploads, and
+        `listen`/`edit`/`admin` keys without `upload` are refused with 403
+        `insufficient_scope`. The key is read from, in order:
+
+        1. the `Authorization: Bearer <key>` header;
+        2. the multipart form field `key` (rdio-scanner plugin);
+        3. the multipart form field `api_key` (OpenMHz plugin).
+
+        Form fields are read from the multipart body only (never from the
+        URL), after the 50 MB upload size limit. A field that is present
+        but holds an unknown, revoked or expired key is 401 `invalid_key`;
+        the other field is not tried. Rejected uploads are logged with the
+        client IP, the form's system name and the reason.
 
         **Format detection:** The endpoint inspects form field names to
         determine the upload format:
@@ -2391,7 +2724,7 @@ paths:
         | `audioName` | string | No | Original filename |
         | `emergency` | boolean | No | Emergency flag |
         | `encrypted` | boolean | No | Encrypted flag |
-        | `key` | string | No | Auth token (alternative to Bearer header) |
+        | `key` | string | No | API key with the `upload` scope (alternative to the Bearer header) |
 
         **OpenMHz format fields:**
 
@@ -2406,7 +2739,7 @@ paths:
         | `source_list` | JSON string | No | Array of source items |
         | `emergency` | integer | No | Emergency flag (0/1) |
         | `error_count` | integer | No | Decode error count |
-        | `api_key` | string | No | Auth token (alternative to Bearer header) |
+        | `api_key` | string | No | API key with the `upload` scope (alternative to the Bearer header) |
       tags: [calls]
       requestBody:
         required: true
@@ -2494,10 +2827,10 @@ paths:
                   description: Call duration in seconds (OpenMHz format)
                 key:
                   type: string
-                  description: Auth token (rdio-scanner format, alternative to Bearer header)
+                  description: API key with the `upload` scope (rdio-scanner format; alternative to the Bearer header)
                 api_key:
                   type: string
-                  description: Auth token (OpenMHz format, alternative to Bearer header)
+                  description: API key with the `upload` scope (OpenMHz format; alternative to the Bearer header)
       responses:
         "201":
           description: Created — call record created and audio saved
@@ -2552,6 +2885,8 @@ paths:
   /call-groups:
     get:
       operationId: listCallGroups
+      x-scope: listen
+      x-restricted: enforced
       summary: List call groups
       description: |
         Returns deduplicated call groups (calls from multiple recorders
@@ -2583,12 +2918,18 @@ paths:
                 $ref: "#/components/schemas/CallGroupListResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /call-groups/{id}:
     get:
       operationId: getCallGroup
+      x-scope: listen
+      x-restricted: enforced
       summary: Get a call group
       description: Returns a call group with all its individual call recordings.
       tags: [call-groups]
@@ -2606,6 +2947,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CallGroupDetailResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -2617,6 +2962,8 @@ paths:
   /stats:
     get:
       operationId: getStats
+      x-scope: listen
+      x-restricted: deny
       summary: Get system statistics
       description: |
         Returns overall system statistics including entity counts, call
@@ -2631,12 +2978,18 @@ paths:
                 $ref: "#/components/schemas/StatsResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /stats/rates:
     get:
       operationId: getDecodeRates
+      x-scope: listen
+      x-restricted: deny
       summary: Get decode rates
       description: Returns system decode rate measurements over time.
       tags: [stats]
@@ -2665,12 +3018,18 @@ paths:
                 $ref: "#/components/schemas/DecodeRatesResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /stats/talkgroup-activity:
     get:
       operationId: getTalkgroupActivity
+      x-scope: listen
+      x-restricted: deny
       summary: Talkgroup activity summary
       description: |
         Returns call counts grouped by talkgroup for a time range.
@@ -2738,12 +3097,18 @@ paths:
                     description: Total number of distinct talkgroups matching the filter
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /stats/call-volume:
     get:
       operationId: getCallVolume
+      x-scope: listen
+      x-restricted: deny
       summary: Hourly or daily call volume
       description: Returns call counts bucketed by hour or day over a time range.
       tags: [stats]
@@ -2782,12 +3147,18 @@ paths:
                       $ref: "#/components/schemas/CallVolumeBucket"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /stats/daily-overview:
     get:
       operationId: getDailyOverview
+      x-scope: listen
+      x-restricted: deny
       summary: Daily call overview
       description: Returns daily call aggregates with distinct talkgroup counts.
       tags: [stats]
@@ -2819,12 +3190,18 @@ paths:
                       $ref: "#/components/schemas/DailyOverviewRow"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /stats/category-breakdown:
     get:
       operationId: getCategoryBreakdown
+      x-scope: listen
+      x-restricted: deny
       summary: Calls by talkgroup tag
       description: Returns call counts grouped by talkgroup tag (category).
       tags: [stats]
@@ -2864,12 +3241,18 @@ paths:
                       $ref: "#/components/schemas/CategoryBreakdownRow"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /stats/call-heatmap:
     get:
       operationId: getCallHeatmap
+      x-scope: listen
+      x-restricted: deny
       summary: Activity heatmap
       description: |
         Returns day-of-week × hour-of-day call counts for building
@@ -2913,6 +3296,10 @@ paths:
                     description: The timezone used for bucketing.
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -2922,6 +3309,8 @@ paths:
   /analytics/recorder-utilization:
     get:
       operationId: getRecorderUtilization
+      x-scope: listen
+      x-restricted: deny
       summary: Recorder utilization over time
       description: |
         Returns recorder state percentages (recording, idle, available, ignore)
@@ -2971,12 +3360,18 @@ paths:
                     type: integer
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /analytics/decode-rates:
     get:
       operationId: getDecodeRateBuckets
+      x-scope: listen
+      x-restricted: deny
       summary: Decode rates over time (bucketed)
       description: |
         Returns decode rates aggregated into time buckets with avg/min/max.
@@ -3021,6 +3416,10 @@ paths:
                     type: integer
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -3030,6 +3429,8 @@ paths:
   /recorders:
     get:
       operationId: listRecorders
+      x-scope: listen
+      x-restricted: deny
       summary: List recorder states
       description: |
         Returns all known recorder states from in-memory cache (populated
@@ -3049,6 +3450,10 @@ paths:
                 $ref: "#/components/schemas/RecorderListResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -3058,6 +3463,8 @@ paths:
   /trunking-messages:
     get:
       operationId: listTrunkingMessages
+      x-scope: listen
+      x-restricted: deny
       summary: List trunking messages
       description: |
         Returns P25 control channel trunking messages. These are high-volume;
@@ -3094,6 +3501,10 @@ paths:
                 $ref: "#/components/schemas/TrunkingMessageListResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -3103,6 +3514,8 @@ paths:
   /console-messages:
     get:
       operationId: listConsoleMessages
+      x-scope: admin
+      x-restricted: deny
       summary: List console messages
       description: |
         Returns trunk-recorder console log messages. Defaults to the last
@@ -3132,6 +3545,10 @@ paths:
                 $ref: "#/components/schemas/ConsoleMessageListResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -3142,6 +3559,8 @@ paths:
   /events/stream:
     get:
       operationId: streamEvents
+      x-scope: listen
+      x-restricted: enforced
       summary: Real-time event stream (SSE)
       description: |
         Opens a Server-Sent Events (SSE) connection that pushes real-time
@@ -3153,13 +3572,51 @@ paths:
         > Use the [Live Events](/events.html) page or connect with
         > `curl` / `EventSource` instead.
 
+        **Authentication:** one of
+        - `Authorization: Bearer <key>`, for clients that can send headers
+          (servers, scripts, `fetch`-based stream readers);
+        - `?ticket=<ticket>` from `POST /tickets`, for the browser
+          `EventSource`, which cannot send headers (mint the ticket right
+          before each connect; it takes precedence over a header);
+        - no credential, when the anonymous access policy is `listen`.
+
         **Connection behavior:**
         - Response uses `Content-Type: text/event-stream`
         - The server sends `X-Accel-Buffering: no` for nginx compatibility
         - A keepalive comment (`: keepalive`) is sent every 15 seconds
         - Each event includes a unique `id` field for gap recovery
-        - On reconnect, pass the last received ID via the `Last-Event-ID`
-          header to resume without missing events (buffered for 60 seconds)
+        - On reconnect, pass the last received ID to resume without missing
+          events (buffered for 60 seconds): in the `Last-Event-ID` header,
+          or, when re-creating an `EventSource` with a fresh ticket (which
+          cannot set that header), in the `last_event_id` query parameter.
+          The header wins when both are sent.
+        - A 429 (rate limited) ends a browser `EventSource` for good; back
+          off and reconnect yourself.
+
+        **Access re-checks and the `auth` signal:** the server re-checks
+        the stream's credential every 60 seconds and at once when a key,
+        the anonymous policy or a system merge changes. If the credential
+        changed but still has `listen`, the stream continues under the new
+        scopes and restriction. Otherwise, and when a ticket expires, the
+        server sends one final message and closes the stream:
+
+        ```
+        event: auth
+        data: {"code":"ticket_expired"}
+        ```
+
+        `code` is `invalid_key`, `key_required`, `insufficient_scope` or
+        `ticket_expired` (see `SSEAuthSignal`). On `ticket_expired`, mint a
+        new ticket and reconnect with `last_event_id`. On any other code,
+        do **not** reconnect automatically: call `GET /whoami` and ask for
+        a key or explain what changed. The `auth` message is always sent,
+        whatever the `types` filter says.
+
+        **Per-type access:** each event type needs a minimum scope, and
+        restricted credentials only receive events for talkgroups their
+        restriction allows (see `SSEEventType`). This is applied before the
+        filters below. Anonymous listeners and `listen`/`edit` keys never
+        receive `console` events.
 
         **Event format:**
         ```
@@ -3181,15 +3638,35 @@ paths:
         |-------|-------------|---------|
         | `call_start` | New call recording started | Call object (partial — no audio/transcription yet) |
         | `call_update` | Call updated (new transmission, freq change) | Call object (partial delta) |
-        | `call_end` | Call recording completed | Full Call object with audio_url |
+        | `call_end` | Call recording completed | Call summary: `call_id`, `system_id`, `tgid`, `tg_alpha_tag`, `unit`, `unit_alpha_tag`, `freq`, `start_time`, `stop_time`, `duration`, `emergency`, `encrypted`, plus ingest-path-specific fields. **No `audio_url`**: fetch `GET /calls/{call_id}` for the full call, or use `/api/v1/calls/{call_id}/audio` |
+        | `transcription` | Transcription finished | `call_id`, `system_id`, `tgid`, `text`, `word_count`, plus provider statistics |
         | `unit_event` | Unit lifecycle event | UnitEvent object |
         | `recorder_update` | Recorder state changed | Recorder object |
         | `rate_update` | Decode rate update | DecodeRate object |
         | `trunking_message` | P25 control channel message | TrunkingMessage object |
-        | `console` | TR console log message | ConsoleMessage object |
+        | `console` | TR console log message (`admin` keys only) | ConsoleMessage object |
+        | `auth` | Credential no longer allows the stream; the stream closes | SSEAuthSignal object |
 
       tags: [events]
+      security:
+        - bearerAuth: []
+        - ticketAuth: []
       parameters:
+        - $ref: "#/components/parameters/ticket"
+        - name: last_event_id
+          in: query
+          description: |
+            Resume after this event ID, like the `Last-Event-ID` header
+            (which wins when both are sent). For clients that re-create an
+            `EventSource` with a fresh ticket and so cannot set the header.
+          schema:
+            type: string
+            example: 1707912345000-42
+        - name: Last-Event-ID
+          in: header
+          description: Resume after this event ID (sent automatically by `EventSource` on its own reconnects)
+          schema:
+            type: string
         - name: systems
           in: query
           description: |
@@ -3226,9 +3703,12 @@ paths:
           in: query
           description: |
             Comma-separated event types to subscribe to. Omit for all
-            event types. Valid values: `call_start`, `call_update`,
-            `call_end`, `unit_event`, `recorder_update`, `rate_update`,
-            `trunking_message`, `console`.
+            event types the credential may receive. Valid values:
+            `call_start`, `call_update`, `call_end`, `transcription`,
+            `unit_event`, `recorder_update`, `rate_update`,
+            `trunking_message`, `console`. Asking for a type the credential
+            may not receive is not an error; those events are simply not
+            sent.
 
             Supports compound syntax with `:` to filter on event
             subtypes. For example, `unit_event:call` matches only unit
@@ -3269,13 +3749,15 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/AuthUnavailable"
 
   # ----------------------------------------------------------
   # Live Audio (WebSocket)
@@ -3283,6 +3765,8 @@ paths:
   /audio/live:
     get:
       operationId: streamAudioLive
+      x-scope: listen
+      x-restricted: enforced
       summary: Live audio stream (WebSocket)
       description: |
         WebSocket upgrade endpoint for real-time audio streaming. Clients
@@ -3319,31 +3803,47 @@ paths:
         - Subscribe: `{"type": "subscribe", "tgids": [1001, 1002], "systems": [1]}`
         - Unsubscribe: `{"type": "unsubscribe"}`
 
+        **Authentication:** `Authorization: Bearer <key>` for clients that
+        can set headers on the upgrade request, `?ticket=<ticket>` from
+        `POST /tickets` for the browser `WebSocket` (which cannot), or no
+        credential when the anonymous access policy is `listen`. Any
+        `Origin` is accepted: there are no ambient credentials to protect.
+
+        **Restricted credentials** only ever receive audio for talkgroups
+        their restriction allows, whatever the subscribe message asks for.
+
+        **Close codes:** the server re-checks the connection's credential
+        every 60 seconds and at once when keys or the anonymous policy
+        change, and closes the socket when it no longer allows listening
+        or when its ticket expires:
+
+        | Close code | Reason (the code string) | What to do |
+        |---|---|---|
+        | 4401 | `ticket_expired` | Mint a new ticket and reconnect |
+        | 4401 | `invalid_key`, `key_required` | Don't reconnect automatically; call `GET /whoami` |
+        | 4403 | `insufficient_scope` | Don't reconnect automatically; call `GET /whoami` |
+
       tags: [events]
+      security:
+        - bearerAuth: []
+        - ticketAuth: []
       parameters:
-        - name: token
-          in: query
-          description: |
-            Authentication token. Alternative to the `Authorization: Bearer`
-            header for WebSocket connections where custom headers are not
-            supported.
-          schema:
-            type: string
+        - $ref: "#/components/parameters/ticket"
       responses:
         "101":
           description: WebSocket upgrade successful
         "401":
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           description: Live audio streaming not enabled (STREAM_LISTEN not configured)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "503":
           description: Maximum audio stream clients reached
           content:
@@ -3357,6 +3857,8 @@ paths:
   /audio/jitter:
     get:
       operationId: getAudioJitter
+      x-scope: listen
+      x-restricted: deny
       summary: Get audio jitter stats
       description: |
         Returns per-stream inter-packet arrival jitter statistics for all
@@ -3379,6 +3881,10 @@ paths:
                     type: object
                     additionalProperties:
                       $ref: "#/components/schemas/StreamJitterSnapshot"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           description: Live audio streaming is not enabled
           content:
@@ -3392,6 +3898,8 @@ paths:
   /pages:
     get:
       operationId: listPages
+      x-scope: public
+      x-restricted: enforced
       summary: List web UI pages
       description: |
         Scans the web directory for HTML pages with `card-title` meta tags
@@ -3431,6 +3939,8 @@ paths:
           $ref: "#/components/responses/InternalError"
     post:
       operationId: savePage
+      x-scope: admin
+      x-restricted: deny
       summary: Save an HTML page to the web directory
       description: |
         Writes an HTML file to the server's disk `web/` directory, where
@@ -3484,8 +3994,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
-          description: Attempted to overwrite a protected core file
+          description: |
+            `insufficient_scope` (the key is not an admin key), or an
+            attempt to overwrite a protected core file (`forbidden`)
           content:
             application/json:
               schema:
@@ -3509,8 +4023,10 @@ paths:
   /openapi.yaml:
     get:
       operationId: getOpenAPISpec
+      x-scope: public
+      x-restricted: enforced
       summary: OpenAPI specification
-      description: Returns the OpenAPI 3.0.3 YAML specification for this API. No authentication required.
+      description: Returns the OpenAPI 3.0.3 YAML specification for this API. Public; no credential needed.
       tags: [health]
       security: []
       responses:
@@ -3527,6 +4043,8 @@ paths:
   /query:
     post:
       operationId: executeQuery
+      x-scope: admin
+      x-restricted: deny
       summary: Execute a read-only SQL query
       description: |
         Executes an ad-hoc read-only SQL query against the database and
@@ -3543,6 +4061,12 @@ paths:
 
         Use `$1`, `$2`, etc. as parameter placeholders with the `params`
         array for safe value interpolation.
+
+        Needs the `admin` scope: raw SQL can read every table and cannot
+        honour a restriction. The query runs as the engine's own database
+        role; if that role is a superuser (or can read server files), a
+        query can too. Run the engine with a dedicated, non-superuser
+        database role.
       tags: [admin]
       requestBody:
         required: true
@@ -3584,6 +4108,8 @@ paths:
   /admin/systems/merge:
     post:
       operationId: mergeSystems
+      x-scope: admin
+      x-restricted: deny
       summary: Merge two systems
       description: |
         Merges all data from `source_id` into `target_id`, then deletes
@@ -3602,6 +4128,13 @@ paths:
         - Call groups may be consolidated (recordings that now share
           system_id + tgid + start_time get grouped)
         - Source system is deleted
+
+        - Restrictions on API keys and the anonymous access policy that
+          name the source system (in `systems`, `talkgroups` or
+          `exclude_talkgroups`) are rewritten to the target in the same
+          transaction, so a merge never widens access. Tickets whose
+          narrowing names the source system stop verifying
+          (`invalid_ticket`); clients mint new ones.
 
         **Implications:**
         - Call IDs (database PKs) are stable — bookmarks don't break
@@ -3627,6 +4160,8 @@ paths:
                 $ref: "#/components/schemas/SystemMergeResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -3647,6 +4182,8 @@ paths:
   /admin/maintenance:
     get:
       operationId: getMaintenanceStatus
+      x-scope: admin
+      x-restricted: deny
       summary: Get maintenance status and config
       description: |
         Returns the current maintenance configuration (retention periods)
@@ -3662,6 +4199,8 @@ paths:
                 $ref: "#/components/schemas/MaintenanceStatus"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "503":
           description: Pipeline not running
           content:
@@ -3670,6 +4209,8 @@ paths:
                 $ref: "#/components/schemas/Error"
     post:
       operationId: runMaintenance
+      x-scope: admin
+      x-restricted: deny
       summary: Trigger immediate maintenance run
       description: |
         Triggers an immediate maintenance run (partition creation,
@@ -3703,6 +4244,8 @@ paths:
   /admin/transcribe-backfill:
     post:
       operationId: submitTranscribeBackfill
+      x-scope: admin
+      x-restricted: deny
       summary: Submit transcription backfill job
       description: |
         Queues a background job to find untranscribed calls matching the
@@ -3763,6 +4306,8 @@ paths:
                 $ref: "#/components/schemas/Error"
     get:
       operationId: getTranscribeBackfillStatus
+      x-scope: admin
+      x-restricted: deny
       summary: Get transcription backfill status
       description: |
         Returns the active and queued backfill jobs. The `active` field
@@ -3780,6 +4325,8 @@ paths:
                 $ref: "#/components/schemas/BackfillStatus"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "503":
           description: Pipeline not running
           content:
@@ -3788,6 +4335,8 @@ paths:
                 $ref: "#/components/schemas/Error"
     delete:
       operationId: cancelAllTranscribeBackfill
+      x-scope: admin
+      x-restricted: deny
       summary: Cancel all backfill jobs
       description: Cancels the active backfill job (if any) and all queued jobs.
       tags: [admin]
@@ -3821,9 +4370,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /admin/transcribe-backfill/{job_id}:
+  /admin/transcribe-backfill/{id}:
     delete:
       operationId: cancelTranscribeBackfill
+      x-scope: admin
+      x-restricted: deny
       summary: Cancel a specific backfill job
       description: |
         Cancels a specific backfill job by ID. If the job is currently
@@ -3832,7 +4383,7 @@ paths:
       security:
         - bearerAuth: []
       parameters:
-        - name: job_id
+        - name: id
           in: path
           required: true
           description: Backfill job ID
@@ -3872,12 +4423,14 @@ paths:
   /admin/maintenance/config:
     put:
       operationId: setMaintenanceConfig
+      x-scope: admin
+      x-restricted: deny
       summary: Update a retention setting
       description: |
         Updates a single retention setting. The value is persisted to the
         `config_overrides` table and applied immediately to the live pipeline.
         Returns 409 if the key is locked by an environment variable.
-        Requires admin role.
+        Requires the `admin` scope.
       tags: [admin]
       security:
         - bearerAuth: []
@@ -3923,12 +4476,14 @@ paths:
   /admin/maintenance/config/{key}:
     delete:
       operationId: deleteMaintenanceConfig
+      x-scope: admin
+      x-restricted: deny
       summary: Reset a retention setting to default
       description: |
         Removes a DB-stored retention override and resets the setting to its
         environment variable value (if set) or coded default. Returns 409 if
         the key is locked by an environment variable.
-        Requires admin role.
+        Requires the `admin` scope.
       tags: [admin]
       security:
         - bearerAuth: []
@@ -3976,6 +4531,8 @@ paths:
   /admin/storage/stats:
     get:
       operationId: getStorageStats
+      x-scope: admin
+      x-restricted: deny
       summary: Get database storage statistics
       description: |
         Returns per-table row counts and sizes from `pg_stat_user_tables`,
@@ -3983,7 +4540,7 @@ paths:
         database size is included. If a per-table stat fails, the table is
         omitted and an entry is added to `errors[]` — the rest of the
         response still returns.
-        Requires admin role.
+        Requires the `admin` scope.
       tags: [admin, storage]
       security:
         - bearerAuth: []
@@ -4004,6 +4561,8 @@ paths:
   /admin/storage/purge/{table}:
     post:
       operationId: purgeTable
+      x-scope: admin
+      x-restricted: deny
       summary: Manually purge old data from a table
       description: |
         Triggers an immediate purge of rows (or partitions) older than the
@@ -4013,7 +4572,7 @@ paths:
         a partial count.
 
         This action is irreversible.
-        Requires admin role.
+        Requires the `admin` scope.
       tags: [admin, storage]
       security:
         - bearerAuth: []
@@ -4059,6 +4618,181 @@ paths:
               schema:
                 $ref: "#/components/schemas/PurgeResponse"
 
+  # ----------------------------------------------------------
+  # Audit log
+  # ----------------------------------------------------------
+  /admin/audit-log:
+    get:
+      operationId: listAuditLog
+      x-scope: admin
+      x-restricted: deny
+      summary: List audit log entries
+      description: |
+        Returns the audit log, newest first. One entry is recorded for
+        every request made with an API key to a matched route whose method
+        is not GET, HEAD or OPTIONS, including requests the handler itself
+        refused (the status is the one the client received). Requests
+        without a key, failed authentication, `POST /call-upload` and
+        `POST /tickets` are not recorded; they stay in the access log.
+
+        `actor` is the optional `X-Actor` request header, which a
+        multi-user client sends to name the end user it acted for. It is
+        recorded as given (control and format characters removed, at most
+        200 characters) and is never used for authorization. Render
+        `actor`, `key_name`, `path` and `request_id` as text only.
+
+        Entries are kept for `RETENTION_AUDIT_LOG` (default `8760h`, one
+        year) and purged by the daily maintenance run.
+      tags: [admin]
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/offset"
+        - name: key_id
+          in: query
+          description: Only entries made with this key
+          schema:
+            type: integer
+        - name: since
+          in: query
+          description: Only entries at or after this time (RFC 3339)
+          schema:
+            type: string
+            format: date-time
+        - name: until
+          in: query
+          description: Only entries before this time (RFC 3339)
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Audit log entries, newest first
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditLogResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ----------------------------------------------------------
+  # Debug report
+  # ----------------------------------------------------------
+  /debug-report:
+    post:
+      operationId: submitDebugReport
+      x-scope: admin
+      x-restricted: deny
+      summary: Send a diagnostic report to the debug receiver
+      description: |
+        Combines the JSON body sent by the client (browser diagnostics)
+        with server-side diagnostics (version, uptime, sanitized
+        configuration, trunk-recorder `config.json` with secrets removed,
+        recent console logs, ingest and stream state) and forwards the
+        result to `DEBUG_REPORT_URL`. Secrets are redacted: values of keys
+        whose names contain `key`, `token`, `pass`, `secret`, `auth` or
+        `credential` (case-insensitive), and user info and query strings
+        of every URL-valued string, at any depth.
+
+        Because it makes the server send data to a third party, it needs
+        the `admin` scope. Returns 503 when `DEBUG_REPORT_DISABLE=true` or
+        no `DEBUG_REPORT_URL` is set. See `docs/debug-reports.md`.
+      tags: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              description: Client-side diagnostics; any JSON object (at most 1 MB)
+      responses:
+        "200":
+          description: Report forwarded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+        "400":
+          description: The body could not be read or is not a JSON object
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          description: The debug receiver could not be reached or rejected the report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Debug reports are disabled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  # ----------------------------------------------------------
+  # Prometheus metrics (root path, not under /api/v1)
+  # ----------------------------------------------------------
+  /metrics:
+    servers:
+      - url: /
+        description: Served at the root of the engine, not under /api/v1
+    get:
+      operationId: getMetrics
+      x-scope: listen
+      x-restricted: deny
+      x-key-required: true
+      summary: Prometheus metrics
+      description: |
+        Prometheus exposition format. Served at **`/metrics`** on the
+        engine's root (not under `/api/v1`), when `METRICS_ENABLED` is true
+        (the default); otherwise 404.
+
+        Requires an **API key** with `listen` in the `Authorization`
+        header: it is never public, whatever the anonymous access policy
+        says, and restricted keys are refused. Create a scrape key with
+        `tr-engine keys create --name prometheus --scopes listen` and set
+        it as the scrape job's bearer token (`authorization.credentials`
+        or `credentials_file` in `prometheus.yml`).
+      tags: [health]
+      responses:
+        "200":
+          description: Metrics in the Prometheus text exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Metrics are not enabled (`METRICS_ENABLED` is false)
+
 # ============================================================
 # COMPONENTS
 # ============================================================
@@ -4071,14 +4805,51 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
+      bearerFormat: tre_<64 hex characters>
       description: |
-        Bearer token authentication. Pass token in the Authorization header:
-        `Authorization: Bearer <token>`
+        An API key in the `Authorization` header:
+        `Authorization: Bearer tre_...`. Keys are created by an admin
+        (`POST /keys` or `tr-engine keys create`). Keys are never accepted
+        from the URL.
+    ticketAuth:
+      type: apiKey
+      in: query
+      name: ticket
+      description: |
+        A short-lived, listen-only ticket from `POST /tickets`, passed as
+        `?ticket=trt_...`. Accepted only by `GET`/`HEAD` on
+        `/events/stream`, `/audio/live` and `/calls/{id}/audio`, for
+        browser APIs that cannot send headers (`EventSource`,
+        `<audio src>`, `WebSocket`). Takes precedence over an
+        `Authorization` header on those operations.
 
   # ----------------------------------------------------------
   # Reusable Parameters
   # ----------------------------------------------------------
   parameters:
+    keyId:
+      name: id
+      in: path
+      required: true
+      description: API key ID
+      schema:
+        type: integer
+        minimum: 1
+        example: 7
+
+    ticket:
+      name: ticket
+      in: query
+      required: false
+      description: |
+        A ticket from `POST /tickets`, for clients that cannot send an
+        `Authorization` header (browser `EventSource`, `<audio>`,
+        `WebSocket`). Takes precedence over the header. A key is never
+        accepted here.
+      schema:
+        type: string
+        example: trt_eyJrIjo3LCJlIjoxNzkwMDAwMDAwfQ.bWFjLWJ5dGVzLWhlcmU
+
     callId:
       name: id
       in: path
@@ -4198,14 +4969,55 @@ components:
             $ref: "#/components/schemas/AmbiguousError"
 
     Unauthorized:
-      description: Unauthorized — missing or invalid auth token
+      description: |
+        No usable credential. `code` is `key_required` (no credential, and
+        the anonymous access policy doesn't allow this operation),
+        `invalid_key` (unknown, revoked or expired key) or `invalid_ticket`
+        (malformed, expired or orphaned ticket).
+      headers:
+        WWW-Authenticate:
+          description: Always `Bearer realm="tr-engine"`
+          schema:
+            type: string
+            example: Bearer realm="tr-engine"
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+          examples:
+            key_required:
+              value:
+                code: key_required
+                error: an API key is required
+            invalid_key:
+              value:
+                code: invalid_key
+                error: API key has been revoked
 
     Forbidden:
-      description: Forbidden — valid read token but write token required for this operation
+      description: |
+        The credential is valid but not allowed here. `code` is
+        `insufficient_scope` (the message names the scope the operation
+        needs) or `restricted_credential` (the credential is restricted to
+        some systems or talkgroups, and this operation can't enforce that).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            insufficient_scope:
+              value:
+                code: insufficient_scope
+                error: this operation needs the edit scope
+            restricted_credential:
+              value:
+                code: restricted_credential
+                error: this operation is not available to restricted credentials
+
+    AuthUnavailable:
+      description: |
+        `service_unavailable`: the credential could not be checked (database
+        error or timeout). Never treated as anonymous; retry later.
       content:
         application/json:
           schema:
@@ -4225,7 +5037,12 @@ components:
             detail: "status: approved"
 
     RateLimited:
-      description: Too many requests — rate limit exceeded
+      description: Too many requests — rate limit exceeded (`rate_limited`)
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying
+          schema:
+            type: integer
       content:
         application/json:
           schema:
@@ -4308,61 +5125,136 @@ components:
 
     # ========== Auth Models ==========
 
-    UserSummary:
-      type: object
-      properties:
-        id:
-          type: integer
-        username:
-          type: string
-        role:
-          type: string
-          enum: [viewer, editor, admin]
+    Scope:
+      type: string
+      enum: [listen, edit, admin, upload]
+      description: |
+        What an API key may do:
+        - **listen**: read radio data (all data GETs), stream events and
+          audio, mint tickets
+        - **edit**: change radio metadata (talkgroup/unit tags,
+          transcription corrections and review states, re-transcription,
+          unit-tag-suggestion approve/dismiss); implies `listen`
+        - **admin**: everything else (keys, anonymous policy, system/site
+          identity edits, merges, maintenance, backfill, storage, SQL
+          query, page saving, CSV imports, debug report, console logs,
+          audit log); implies `edit` and `listen`
+        - **upload**: `POST /call-upload` only; implies nothing
 
-    User:
+    Restriction:
       type: object
+      nullable: true
+      additionalProperties: false
+      description: |
+        Limits which radio data a `listen` credential can see. Only
+        `null` (or an omitted field) means unrestricted; a restriction
+        object is never treated as unrestricted.
+
+        A (system, talkgroup) pair is allowed when its talkgroup is set and
+        non-zero, **and** (`allow_all`, or the system is in `systems`, or
+        the pair is in `talkgroups`), **and** the pair is not in
+        `exclude_talkgroups`. Data without a talkgroup is never allowed to
+        a restricted credential. With `allow_all` false and `systems` and
+        `talkgroups` both empty, the restriction **allows nothing** (`{}`
+        is such a restriction): that is rejected on keys and on the
+        anonymous policy, and accepted on a ticket narrowing.
+
+        A system's metadata is visible when `allow_all` is true, the
+        system is in `systems`, or an entry of `talkgroups` belongs to it.
+
+        IDs need not exist yet. Duplicates are removed and arrays are
+        returned sorted. Each array holds at most 1000 entries (a ticket
+        narrowing at most 100 in total). Unknown fields are rejected. When
+        systems are merged, references to the merged-away system are
+        rewritten to the surviving one.
+
+        Operations marked `x-restricted: deny` refuse restricted
+        credentials with 403 `restricted_credential`; operations marked
+        `x-restricted: enforced` apply the restriction to what they return.
       properties:
-        id:
-          type: integer
-        username:
-          type: string
-        role:
-          type: string
-          enum: [viewer, editor, admin]
-        enabled:
+        allow_all:
           type: boolean
-        display_name:
-          type: string
-        last_login:
-          type: string
-          format: date-time
-          nullable: true
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
+          description: |
+            Every talkgroup is a candidate (subject to
+            `exclude_talkgroups`). Cannot be combined with non-empty
+            `systems` or `talkgroups`. Default false.
+        systems:
+          type: array
+          maxItems: 1000
+          description: Systems whose talkgroups are allowed
+          items:
+            type: integer
+            minimum: 1
+            maximum: 2147483647
+        talkgroups:
+          type: array
+          maxItems: 1000
+          description: Individually allowed talkgroups, as `system_id:tgid`
+          items:
+            $ref: "#/components/schemas/CompositeTalkgroupID"
+        exclude_talkgroups:
+          type: array
+          maxItems: 1000
+          description: Talkgroups that are never allowed, even when their system is
+          items:
+            $ref: "#/components/schemas/CompositeTalkgroupID"
+      example:
+        systems: [1, 3]
+        talkgroups: ["2:9178", "2:9179"]
+        exclude_talkgroups: ["1:5001"]
+
+    CompositeTalkgroupID:
+      type: string
+      pattern: "^[1-9][0-9]*:[1-9][0-9]*$"
+      description: "`system_id:tgid`, both positive integers"
+      example: "1:9178"
 
     APIKey:
       type: object
+      required: [id, name, prefix, scopes, restriction, expires_at, rate_limit_rps, legacy, created_at, last_used_at, revoked_at, status]
       properties:
         id:
           type: integer
-        key_prefix:
+          example: 7
+        name:
           type: string
-          description: First 12 characters of the key for identification
-        user_id:
-          type: integer
+          minLength: 1
+          maxLength: 100
+          description: What the key is for, e.g. "tr-dashboard at home" or "trunk-recorder butco uploads"
+          example: tr-dashboard at home
+        prefix:
+          type: string
+          description: |
+            For display. `tre_` plus the next 8 characters of the key.
+            Legacy keys imported from an old `AUTH_TOKEN`/`WRITE_TOKEN`
+            show `legacy_` plus 6 hex characters of the key's hash, so no
+            character of the old secret is stored.
+          example: tre_1a2b3c4d
+        scopes:
+          type: array
+          description: The key's scopes as granted (not expanded), sorted
+          items:
+            $ref: "#/components/schemas/Scope"
+          example: [edit]
+        restriction:
+          description: Only on keys whose scopes are exactly `["listen"]`; `null` means unrestricted
+          allOf:
+            - $ref: "#/components/schemas/Restriction"
+        expires_at:
+          type: string
+          format: date-time
           nullable: true
-          description: Null for service accounts
-        role:
-          type: string
-          enum: [viewer, editor, admin]
-        label:
-          type: string
-        is_service_account:
+          description: When the key stops working; `null` means never
+        rate_limit_rps:
+          type: number
+          nullable: true
+          description: |
+            Per-key rate limit in requests per second (burst twice that,
+            at least 1). `null` means no per-key limit. Legacy keys are
+            always limited per client IP instead.
+        legacy:
           type: boolean
+          description: True for keys imported from an old `AUTH_TOKEN`/`WRITE_TOKEN` or with `tr-engine keys import`
         created_at:
           type: string
           format: date-time
@@ -4370,17 +5262,304 @@ components:
           type: string
           format: date-time
           nullable: true
+          description: Last use, updated at most once a minute
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        status:
+          type: string
+          enum: [active, expired, revoked]
+          description: Computed from `revoked_at` and `expires_at`
 
-    APIKeyWithPlaintext:
+    APIKeyCreated:
+      description: A newly created key, with its plaintext
       allOf:
         - $ref: "#/components/schemas/APIKey"
         - type: object
+          required: [key]
           properties:
             key:
               type: string
+              pattern: "^tre_[0-9a-f]{64}$"
               description: |
-                The full API key plaintext. Shown exactly once at creation —
-                cannot be retrieved again. Store it securely.
+                The full key. Shown exactly once, here; it cannot be
+                retrieved again. Store it now. Send it as
+                `Authorization: Bearer <key>`.
+
+    APIKeyCreate:
+      type: object
+      required: [name, scopes]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        scopes:
+          type: array
+          minItems: 1
+          description: |
+            At most one of `listen`/`edit`/`admin`, optionally plus
+            `upload`. `["listen","edit"]` and unknown strings are rejected.
+          items:
+            $ref: "#/components/schemas/Scope"
+        restriction:
+          description: Only allowed when `scopes` is exactly `["listen"]`; must allow something
+          allOf:
+            - $ref: "#/components/schemas/Restriction"
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Must be in the future when set
+        rate_limit_rps:
+          type: number
+          nullable: true
+          description: Must be greater than 0 when set
+          exclusiveMinimum: true
+          minimum: 0
+
+    APIKeyPatch:
+      type: object
+      description: |
+        Absent fields are left unchanged. An explicit `null` clears
+        `restriction`, `expires_at` or `rate_limit_rps`.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        scopes:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/Scope"
+        restriction:
+          $ref: "#/components/schemas/Restriction"
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        rate_limit_rps:
+          type: number
+          nullable: true
+          exclusiveMinimum: true
+          minimum: 0
+
+    APIKeyListResponse:
+      type: object
+      required: [keys, total]
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/APIKey"
+        total:
+          type: integer
+
+    AnonymousAccessLevel:
+      type: string
+      enum: ["off", listen]
+      description: |
+        What a request with no credential may do: nothing (`off`, the
+        default on a fresh install) or use the `listen` operations that
+        are not `x-key-required`. It can never edit, administer or upload.
+
+    AnonymousAccess:
+      type: object
+      required: [access, restriction, updated_at]
+      properties:
+        access:
+          $ref: "#/components/schemas/AnonymousAccessLevel"
+        restriction:
+          description: Applies to anonymous requests; `null` means unrestricted. Kept even when `access` is `off`.
+          allOf:
+            - $ref: "#/components/schemas/Restriction"
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Last change; `null` if the policy was never set
+      example:
+        access: listen
+        restriction:
+          allow_all: true
+          systems: []
+          talkgroups: []
+          exclude_talkgroups: ["1:5001", "1:5002"]
+        updated_at: "2026-09-26T12:00:00Z"
+
+    AnonymousAccessUpdate:
+      type: object
+      required: [access, restriction]
+      description: |
+        Both keys are required. `"restriction": null` clears the restriction.
+      properties:
+        access:
+          $ref: "#/components/schemas/AnonymousAccessLevel"
+        restriction:
+          $ref: "#/components/schemas/Restriction"
+
+    Whoami:
+      type: object
+      required: [credential, key, scopes, restricted, anonymous, version]
+      properties:
+        credential:
+          type: string
+          enum: [key, anonymous]
+          description: What the request presented. `whoami` is not ticket-enabled, so never `ticket`.
+        key:
+          description: The caller's key; `null` for anonymous callers
+          allOf:
+            - $ref: "#/components/schemas/WhoamiKey"
+        scopes:
+          type: array
+          description: |
+            Effective scopes, implications expanded, sorted: an `edit` key
+            shows `["edit","listen"]`. For an anonymous caller, `["listen"]`
+            when the anonymous policy is `listen`, otherwise `[]`.
+          items:
+            $ref: "#/components/schemas/Scope"
+        restricted:
+          type: boolean
+          description: |
+            True if any restriction applies to this caller. When true,
+            operations marked `x-restricted: deny` answer 403
+            `restricted_credential`.
+        anonymous:
+          type: object
+          required: [access, restricted]
+          description: The anonymous access policy, without its lists
+          properties:
+            access:
+              $ref: "#/components/schemas/AnonymousAccessLevel"
+            restricted:
+              type: boolean
+        version:
+          type: string
+          description: Engine version
+          example: "0.10.0"
+
+    WhoamiKey:
+      type: object
+      nullable: true
+      description: The caller's key; `null` for anonymous callers
+      required: [id, name, prefix, scopes, restriction, expires_at, legacy]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        prefix:
+          type: string
+        scopes:
+          type: array
+          description: The key's scopes as granted (not expanded)
+          items:
+            $ref: "#/components/schemas/Scope"
+        restriction:
+          description: The key's own restriction
+          allOf:
+            - $ref: "#/components/schemas/Restriction"
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        legacy:
+          type: boolean
+
+    TicketRequest:
+      type: object
+      properties:
+        ttl_seconds:
+          type: integer
+          description: Lifetime in seconds, clamped to 60–3600. Default 600.
+          example: 600
+        restriction:
+          description: |
+            Optional narrowing, intersected with the minting key's current
+            restriction at every use. At most 100 entries in total. May
+            allow nothing. Omitted or `null`: no narrowing.
+          allOf:
+            - $ref: "#/components/schemas/Restriction"
+
+    Ticket:
+      type: object
+      required: [ticket, expires_at]
+      properties:
+        ticket:
+          type: string
+          maxLength: 2048
+          description: |
+            `trt_<payload>.<mac>`. Treat it as opaque: pass it as
+            `?ticket=` (URL-encode it like any query value). It grants
+            `listen` only, and only on the ticket-enabled operations.
+          example: trt_eyJrIjo3LCJlIjoxNzkwMDAwMDAwfQ.bWFjLWJ5dGVzLWhlcmU
+        expires_at:
+          type: string
+          format: date-time
+
+    SSEAuthSignal:
+      type: object
+      required: [code]
+      description: |
+        Payload of the `event: auth` message that `GET /events/stream`
+        sends right before it closes a stream because its credential no
+        longer allows it. On `ticket_expired`, mint a new ticket and
+        reconnect with `last_event_id`. On any other code, do **not**
+        reconnect automatically: call `GET /whoami` and ask for a key or
+        explain what changed.
+      properties:
+        code:
+          type: string
+          enum: [invalid_key, key_required, insufficient_scope, ticket_expired]
+      example:
+        code: ticket_expired
+
+    AuditLogEntry:
+      type: object
+      required: [id, time, key_id, key_name, actor, method, path, status, request_id]
+      properties:
+        id:
+          type: integer
+          format: int64
+        time:
+          type: string
+          format: date-time
+        key_id:
+          type: integer
+        key_name:
+          type: string
+          description: The key's name when the request was made
+        actor:
+          type: string
+          nullable: true
+          description: The sanitized `X-Actor` header, if the client sent one. Informational only.
+        method:
+          type: string
+          example: PATCH
+        path:
+          type: string
+          description: Request path, without the query string
+          example: /api/v1/talkgroups/1:9178
+        status:
+          type: integer
+          description: HTTP status the client received
+          example: 200
+        request_id:
+          type: string
+          description: The request's `X-Request-ID`
+
+    AuditLogResponse:
+      type: object
+      required: [entries, total]
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditLogEntry"
+        total:
+          type: integer
 
     # ========== Error Models ==========
 
@@ -4390,7 +5569,6 @@ components:
       properties:
         code:
           type: string
-          description: Machine-readable error code for programmatic handling
           example: not_found
           enum:
             - bad_request
@@ -4408,6 +5586,25 @@ components:
             - ambiguous_id
             - duplicate
             - request_timeout
+            - key_required
+            - invalid_key
+            - invalid_ticket
+            - insufficient_scope
+            - restricted_credential
+          description: |
+            Machine-readable error code for programmatic handling. Auth codes:
+            - `key_required` (401): no credential, and the anonymous access
+              policy doesn't allow this operation
+            - `invalid_key` (401): unknown, revoked or expired key
+            - `invalid_ticket` (401): malformed, expired or orphaned ticket,
+              or one that references a merged-away system
+            - `insufficient_scope` (403): the key lacks the needed scope
+            - `restricted_credential` (403): the credential is restricted and
+              this operation can't enforce that
+            - `service_unavailable` (503): also when the credential lookup
+              failed
+            - `forbidden` (403): from the auth layer, only for a route with no
+              auth policy (a server bug)
         error:
           type: string
           example: Resource not found
@@ -4826,7 +6023,14 @@ components:
         audio_url:
           type: string
           nullable: true
-          description: "Relative URL to audio endpoint. Null for active calls."
+          description: |
+            Path of this call's audio on the engine origin
+            (`/api/v1/calls/{id}/audio`), or null when there is no audio yet.
+            It never contains a credential. Resolve it against the engine's
+            base URL (not the page's origin, if the client is served from
+            elsewhere), and, when the client authenticates with a key and
+            cannot send headers (an `<audio>` element), append
+            `?ticket=<ticket>` from `POST /tickets`.
           example: /api/v1/calls/48531/audio
         audio_type:
           type: string
@@ -5795,7 +6999,10 @@ components:
           description: Seconds into the call audio where the unit's transmission ends
         audio_url:
           type: string
-          description: Call audio URL (same as `GET /calls/{id}/audio`; 404 if the call has no audio)
+          description: |
+            Path of the call's audio on the engine origin (same as
+            `GET /calls/{id}/audio`; 404 if the call has no audio). Never
+            contains a credential; see `Call.audio_url` for how to use it.
           example: /api/v1/calls/48531/audio
 
     UnitTagSuggestion:
@@ -5905,7 +7112,10 @@ components:
         decided_by:
           type: string
           nullable: true
-          description: Username or API key label of the reviewer (null in open/token mode)
+          description: |
+            Who decided: the name of the API key used, followed by
+            ` / <actor>` when the client sent an `X-Actor` header. Decisions
+            recorded by versions before API keys hold a username, or null.
         created_at:
           type: string
           format: date-time
@@ -5962,6 +7172,9 @@ components:
     HealthResponse:
       type: object
       required: [status]
+      description: |
+        Without an unrestricted `listen` (or better) key, only `status`,
+        `version` and `checks` are present.
       properties:
         status:
           type: string
@@ -6229,8 +7442,9 @@ components:
               additionalProperties:
                 type: integer
               description: |
-                Map of tgid → count of affiliated (non-off) units on that
-                talkgroup. Computed over the full filtered set before pagination.
+                Map of `system_id:tgid` → count of affiliated (non-off) units
+                on that talkgroup. Computed over the full filtered set before
+                pagination.
 
     CallListResponse:
       type: object
@@ -6692,6 +7906,7 @@ components:
       properties:
         recorders:
           type: array
+          description: Empty array (never null) when no recorder has reported yet
           items:
             $ref: "#/components/schemas/Recorder"
         total:
@@ -6706,6 +7921,7 @@ components:
         - call_start
         - call_update
         - call_end
+        - transcription
         - unit_event
         - recorder_update
         - rate_update
@@ -6715,12 +7931,36 @@ components:
         SSE event types pushed to clients:
         - **call_start**: new call recording began
         - **call_update**: call updated (new transmission, freq change)
-        - **call_end**: call recording completed, audio available
+        - **call_end**: call recording completed, audio available (the
+          payload is a call summary without `audio_url`)
+        - **transcription**: a call's transcription finished
         - **unit_event**: unit lifecycle event (on/off/join/call/end/signal/etc.)
         - **recorder_update**: recorder hardware state changed
         - **rate_update**: decode rate update from a system
         - **trunking_message**: P25 control channel message
         - **console**: trunk-recorder console log message
+
+        **Who receives each type.** Every event type needs a minimum scope,
+        and restricted credentials (restricted keys, restricted tickets, a
+        restricted anonymous policy) only receive events whose system and
+        talkgroup their restriction allows:
+
+        | Event type | Needs | Restricted credentials receive it |
+        |---|---|---|
+        | `console` | `admin` | never (admin keys are never restricted) |
+        | `call_start`, `call_update`, `call_end`, `transcription` | `listen` | only if the event has a system and a non-zero talkgroup that the restriction allows |
+        | `unit_event` | `listen` | only if the event has a system and a non-zero talkgroup that the restriction allows (so on/off and other events without a talkgroup are dropped) |
+        | `recorder_update`, `rate_update`, `trunking_message` | `listen` | never |
+        | any type added later | `admin` until classified | never |
+
+        These rules apply to live events and to events replayed on
+        reconnect, before the stream's own filters (`systems`, `tgids`,
+        `types`, ...). The anonymous access policy grants at most `listen`,
+        so anonymous listeners never receive `console` events.
+
+        The `auth` event (see `SSEAuthSignal`) is not a subscribable type;
+        it is sent to any stream that is about to be closed for auth
+        reasons.
 
     SSEEvent:
       type: object
@@ -6738,19 +7978,29 @@ components:
 
         The SSE fields map to the browser's `EventSource` API:
         - `id` → `event.lastEventId` — unique event ID (`{unix_ms}-{seq}`),
-          pass as `Last-Event-ID` header on reconnect for gapless recovery
+          pass as the `Last-Event-ID` header or the `last_event_id` query
+          parameter on reconnect for gapless recovery
         - `event` → selects the `addEventListener` handler — one of the
           SSEEventType values (call_start, call_end, unit_event, etc.)
         - `data` → `event.data` — the JSON payload described below
 
         The `data` field contains the **domain object directly**, not a
         wrapper. Its structure depends on the event type:
-        - `call_start` / `call_update` / `call_end`: Call object
+        - `call_start` / `call_update`: Call object (partial)
+        - `call_end`: call summary (`call_id`, `system_id`, `tgid`,
+          `tg_alpha_tag`, `unit`, `unit_alpha_tag`, `freq`, `start_time`,
+          `stop_time`, `duration`, `emergency`, `encrypted`, and fields
+          specific to the ingest path). It has **no `audio_url`**: fetch
+          `GET /calls/{call_id}`, or use `/api/v1/calls/{call_id}/audio`
+          (with `?ticket=` from a browser that holds a key).
+        - `transcription`: `call_id`, `system_id`, `tgid`, `text`,
+          `word_count`, plus provider statistics
         - `unit_event`: UnitEvent object
         - `recorder_update`: Recorder object
         - `rate_update`: DecodeRate object
         - `trunking_message`: TrunkingMessage object
         - `console`: ConsoleMessage object
+        - `auth`: SSEAuthSignal object (then the stream closes)
 
         Server-side filtering metadata (system_id, site_id, tgid, unit_id)
         is used internally to match events against query params but is not
@@ -6889,6 +8139,7 @@ components:
           $ref: "#/components/schemas/MaintenanceConfig"
         last_run:
           nullable: true
+          type: object
           allOf:
             - $ref: "#/components/schemas/MaintenanceRun"
           description: Results of the last maintenance run. Null if no run has completed since startup.
@@ -7097,6 +8348,7 @@ components:
       properties:
         active:
           nullable: true
+          type: object
           allOf:
             - $ref: "#/components/schemas/BackfillJob"
           description: Currently running backfill job, or null if idle
@@ -7240,7 +8492,10 @@ components:
       properties:
         older_than:
           type: string
-          description: "Rows/partitions older than this duration will be deleted (Go duration, e.g. 48h, 7d)"
+          description: |
+            Rows/partitions older than this will be deleted. A Go duration
+            (`48h`) or a whole number of days (`7d`); at least `1h`. Zero,
+            negative or shorter values are rejected with 400.
           example: "48h"
 
     PurgeResponse:

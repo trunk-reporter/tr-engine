@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="auth.js?v=1"></script>
+<script src="auth.js?v=3"></script>
 <meta name="card-title" content="Traffic & Patterns">
 <meta name="card-description" content="Network traffic patterns, peak hours, and top talkgroup analysis">
 <meta name="card-order" content="5">
@@ -289,8 +289,10 @@ body::after {
     return MONTHS[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
   }
 
+  var esc = function(s) { return trAuth.escapeHTML(s); };
+
   function loadError(msg) {
-    errorPanel.innerHTML = '<div class="error-card">Failed to load data: ' + msg + '</div>';
+    errorPanel.innerHTML = '<div class="error-card">Failed to load data: ' + esc(msg) + '</div>';
   }
 
   function loadHeatmapData(hours) {
@@ -348,7 +350,7 @@ body::after {
         position: 'top',
         formatter: function(p) {
           var d = DAYS_FULL[p.value[1]];
-          return d + ' at ' + p.value[0] + ':00 — <b>' + formatNum(p.value[2]) + '</b> calls';
+          return esc(d) + ' at ' + esc(p.value[0]) + ':00 — <b>' + esc(formatNum(p.value[2])) + '</b> calls';
         }
       },
       grid: { left: 50, right: 30, top: 10, bottom: 40 },
@@ -390,8 +392,8 @@ body::after {
       tooltip: {
         trigger: 'axis',
         formatter: function(params) {
-          var s = '<b>' + params[0].name + '</b><br/>';
-          params.forEach(function(p) { s += p.marker + p.seriesName + ': ' + formatNum(p.value) + '<br/>'; });
+          var s = '<b>' + esc(params[0].name) + '</b><br/>';
+          params.forEach(function(p) { s += p.marker + esc(p.seriesName) + ': ' + esc(formatNum(p.value)) + '<br/>'; });
           return s;
         }
       },
@@ -430,14 +432,14 @@ body::after {
     var html = '';
     rows.forEach(function(row, i) {
       var pillHtml = row.emergency_count > 0
-        ? '<span class="pill pill-danger">⚠ ' + row.emergency_count + '</span>'
+        ? '<span class="pill pill-danger">⚠ ' + esc(row.emergency_count) + '</span>'
         : '<span class="pill pill-default">—</span>';
-      html += '<tr><td class="num">' + (i + 1) + '</td><td>' + row.tgid + '</td>';
-      html += '<td>' + (row.tg_alpha_tag || '—') + '</td>';
-      html += '<td>' + (row.tg_tag || '—') + '</td>';
-      html += '<td>' + (row.tg_group || '—') + '</td>';
-      html += '<td class="num">' + formatNum(row.call_count) + '</td>';
-      html += '<td class="num">' + formatDurationHours(row.total_duration / 60) + '</td>';
+      html += '<tr><td class="num">' + (i + 1) + '</td><td>' + esc(row.tgid) + '</td>';
+      html += '<td>' + esc(row.tg_alpha_tag || '—') + '</td>';
+      html += '<td>' + esc(row.tg_tag || '—') + '</td>';
+      html += '<td>' + esc(row.tg_group || '—') + '</td>';
+      html += '<td class="num">' + esc(formatNum(row.call_count)) + '</td>';
+      html += '<td class="num">' + esc(formatDurationHours(row.total_duration / 60)) + '</td>';
       html += '<td>' + pillHtml + '</td></tr>';
     });
     tbody.innerHTML = html;

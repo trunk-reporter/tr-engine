@@ -2,7 +2,7 @@
 
 Internal priority tracker across the trunk-reporter organization. Items are selected from here for the public roadmap.
 
-Last updated: 2026-03-28
+Last updated: 2026-09-26
 
 ## Organization Repos
 
@@ -41,14 +41,12 @@ Items that must ship before tr-engine and tr-dashboard can be tagged 1.0.
 
 ### Test coverage gaps
 **Repo:** tr-engine
-**Why:** Unit-events and affiliations endpoints have no tests. Auth system has tests but coverage is thin on edge cases. Can't confidently tag 1.0 without this.
-**Scope:** Test files for unit-events, affiliations, and auth edge cases.
+**Why:** Unit-events and affiliations endpoints have no tests. Can't confidently tag 1.0 without this.
+**Scope:** Test files for unit-events and affiliations. (API-key auth ships with route-policy coverage, OpenAPI-agreement and per-route restriction tests.)
 
 ### Dashboard guest + auth UX
-**Repo:** tr-dashboard
-**Why:** Auth flow is fragile — `guest_access` field was a band-aid. Dashboard needs a clean auth state machine: detect open/guest/login-required, handle gracefully without Caddy workarounds.
-**Scope:** Refactor RequireAuth component, test against all tr-engine auth configurations.
-**Depends on:** tr-engine auth-init contract (stable as of v0.9.7).
+**Status:** Addressed by the API-key auth redesign ([spec](superpowers/specs/2026-09-26-api-key-auth-design.md), [auth.md](auth.md)): the dashboard is a single-user app with one API key, detects its state with `GET /whoami` (`needs-key`, `invalid-key`, `engine-too-old`, `ready`), shows anonymous visitors a read-only view when the anonymous access policy allows it, and needs no proxy workarounds.
+**Remaining:** Playwright coverage with anonymous access off, listen and restricted.
 
 ### Documentation for users
 **Repo:** tr-engine, tr-stack
@@ -109,8 +107,16 @@ System utilization, busiest talkgroups, response time metrics, unit activity pat
 ### Multi-instance dashboard
 tr-dashboard pointing at multiple tr-engine backends (different counties/systems). Unified view with per-instance filtering.
 
-### User roles and permissions
-Beyond admin + guest: per-user access control, API key scoping by system/talkgroup. Foundation exists in JWT auth system.
+### Restriction support for more endpoints
+API keys, tickets and the anonymous policy can already be restricted to systems and talkgroups, but restricted credentials get 403 `restricted_credential` from endpoints whose data has no talkgroup dimension or leaks other talkgroups' activity through aggregates and `last_event_*` fields: units, unit events, affiliations, unit-tag suggestions, P25 systems, encryption stats, talkgroup units, stats and analytics, recorders, trunking messages, transcription queue, audio jitter and `/metrics`. Supporting them means defining what a restricted view of each one is (e.g. units seen on allowed talkgroups only, stats computed over allowed talkgroups).
+
+### Auth follow-ups found during the API-key redesign
+Out of scope for that change (see its spec, §15):
+- `GetTalkgroupByComposite`/`GetUnitByComposite` (sqlc queries) don't exclude soft-deleted systems.
+- `PATCH /sites/{id}` doesn't invalidate the ingest identity cache.
+- `POST /query` runs as the engine's database role, which can `pg_read_file` if that role is privileged. It is admin-only now, and the docs recommend a dedicated non-superuser role; running queries under a separate read-only role would remove the risk.
+- CDN scripts in `web/` have no Subresource Integrity (SRI) hashes.
+- `audio-diagnostics.html` posts to a hard-coded external URL.
 
 ### Federation
 Multiple tr-engine instances sharing data across organizations. Cross-county coordination view.

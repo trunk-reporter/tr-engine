@@ -1,9 +1,27 @@
 package audio
 
 import (
+	"fmt"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/snarg/tr-engine/internal/auth"
 )
+
+// listener returns a principal holder for p, as the live-audio handler
+// passes to Subscribe.
+func listener(p *auth.Principal) *atomic.Pointer[auth.Principal] {
+	h := new(atomic.Pointer[auth.Principal])
+	h.Store(p)
+	return h
+}
+
+// unrestricted is a holder with an unrestricted listen principal.
+func unrestricted() *atomic.Pointer[auth.Principal] {
+	return listener(&auth.Principal{Kind: auth.KindKey, KeyID: 1, Scopes: auth.Scopes{auth.ScopeListen}})
+}
 
 func makeFrame(systemID, tgid int) AudioFrame {
 	return AudioFrame{
@@ -19,7 +37,7 @@ func makeFrame(systemID, tgid int) AudioFrame {
 
 func TestAudioBusPublishToSubscriber(t *testing.T) {
 	bus := NewAudioBus()
-	ch, cancel := bus.Subscribe(AudioFilter{TGIDs: []int{1001}})
+	ch, cancel := bus.Subscribe(AudioFilter{TGIDs: []int{1001}}, unrestricted())
 	defer cancel()
 
 	frame := makeFrame(1, 1001)
@@ -52,7 +70,7 @@ func TestAudioBusPublishToSubscriber(t *testing.T) {
 
 func TestAudioBusFilterByTGID(t *testing.T) {
 	bus := NewAudioBus()
-	ch, cancel := bus.Subscribe(AudioFilter{TGIDs: []int{1001}})
+	ch, cancel := bus.Subscribe(AudioFilter{TGIDs: []int{1001}}, unrestricted())
 	defer cancel()
 
 	// Publish frame with wrong TGID
@@ -68,7 +86,7 @@ func TestAudioBusFilterByTGID(t *testing.T) {
 
 func TestAudioBusFilterBySystem(t *testing.T) {
 	bus := NewAudioBus()
-	ch, cancel := bus.Subscribe(AudioFilter{SystemIDs: []int{1}, TGIDs: []int{1001}})
+	ch, cancel := bus.Subscribe(AudioFilter{SystemIDs: []int{1}, TGIDs: []int{1001}}, unrestricted())
 	defer cancel()
 
 	// Publish with wrong system
@@ -96,7 +114,7 @@ func TestAudioBusFilterBySystem(t *testing.T) {
 
 func TestAudioBusEmptyFilterReceivesAll(t *testing.T) {
 	bus := NewAudioBus()
-	ch, cancel := bus.Subscribe(AudioFilter{})
+	ch, cancel := bus.Subscribe(AudioFilter{}, unrestricted())
 	defer cancel()
 
 	bus.Publish(makeFrame(1, 1001))
@@ -116,7 +134,7 @@ func TestAudioBusEmptyFilterReceivesAll(t *testing.T) {
 
 func TestAudioBusCancelUnsubscribes(t *testing.T) {
 	bus := NewAudioBus()
-	ch, cancel := bus.Subscribe(AudioFilter{})
+	ch, cancel := bus.Subscribe(AudioFilter{}, unrestricted())
 
 	cancel()
 
@@ -137,7 +155,7 @@ func TestAudioBusCancelUnsubscribes(t *testing.T) {
 
 func TestAudioBusSlowSubscriberDropsFrames(t *testing.T) {
 	bus := NewAudioBus()
-	ch, cancel := bus.Subscribe(AudioFilter{})
+	ch, cancel := bus.Subscribe(AudioFilter{}, unrestricted())
 	defer cancel()
 
 	// Publish 300 frames without reading (buffer is 256)
@@ -169,9 +187,9 @@ done:
 func TestAudioBusMultipleSubscribers(t *testing.T) {
 	bus := NewAudioBus()
 
-	ch1, cancel1 := bus.Subscribe(AudioFilter{TGIDs: []int{1001}})
+	ch1, cancel1 := bus.Subscribe(AudioFilter{TGIDs: []int{1001}}, unrestricted())
 	defer cancel1()
-	ch2, cancel2 := bus.Subscribe(AudioFilter{TGIDs: []int{1001}})
+	ch2, cancel2 := bus.Subscribe(AudioFilter{TGIDs: []int{1001}}, unrestricted())
 	defer cancel2()
 
 	bus.Publish(makeFrame(1, 1001))
@@ -194,7 +212,7 @@ func TestAudioBusMultipleSubscribers(t *testing.T) {
 
 func TestAudioBusUpdateFilter(t *testing.T) {
 	bus := NewAudioBus()
-	ch, cancel := bus.Subscribe(AudioFilter{TGIDs: []int{1001}})
+	ch, cancel := bus.Subscribe(AudioFilter{TGIDs: []int{1001}}, unrestricted())
 	defer cancel()
 
 	// Update filter to TGID 2002
@@ -220,5 +238,122 @@ func TestAudioBusUpdateFilter(t *testing.T) {
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("timed out waiting for frame with updated filter")
+	}
+}
+
+// restrictedListener is a listen key restricted to system 1's talkgroups
+// except 1:1002, plus talkgroup 2:2001.
+func restrictedListener() *auth.Principal {
+	return &auth.Principal{
+		Kind:   auth.KindKey,
+		KeyID:  2,
+		Scopes: auth.Scopes{auth.ScopeListen},
+		Restrictions: []auth.Restriction{{
+			Systems:           []int{1},
+			Talkgroups:        []auth.TG{{SystemID: 2, Tgid: 2001}},
+			ExcludeTalkgroups: []auth.TG{{SystemID: 1, Tgid: 1002}},
+		}},
+	}
+}
+
+func TestPrincipalAllows(t *testing.T) {
+	restricted := restrictedListener()
+	ticket := &auth.Principal{Kind: auth.KindTicket, KeyID: 3, Scopes: auth.Scopes{auth.ScopeListen},
+		Restrictions: []auth.Restriction{*restricted.Restrictions[0].Normalize(), {Talkgroups: []auth.TG{{SystemID: 1, Tgid: 1001}}}}}
+	nothing := &auth.Principal{Kind: auth.KindTicket, KeyID: 3, Scopes: auth.Scopes{auth.ScopeListen},
+		Restrictions: []auth.Restriction{{}}}
+	for _, tc := range []struct {
+		name    string
+		p       *auth.Principal
+		sys, tg int
+		want    bool
+	}{
+		{"nil principal", nil, 1, 1001, false},
+		{"no scopes (anonymous, access off)", &auth.Principal{Kind: auth.KindAnonymous}, 1, 1001, false},
+		{"upload-only key", &auth.Principal{Kind: auth.KindKey, Scopes: auth.Scopes{auth.ScopeUpload}}, 1, 1001, false},
+		{"anonymous listen", &auth.Principal{Kind: auth.KindAnonymous, Scopes: auth.Scopes{auth.ScopeListen}}, 1, 1001, true},
+		{"admin key", &auth.Principal{Kind: auth.KindKey, Scopes: auth.Scopes{auth.ScopeAdmin}}, 7, 7, true},
+		{"unrestricted, no talkgroup", &auth.Principal{Kind: auth.KindKey, Scopes: auth.Scopes{auth.ScopeListen}}, 1, 0, true},
+		{"restricted: allowed system", restricted, 1, 1001, true},
+		{"restricted: excluded talkgroup", restricted, 1, 1002, false},
+		{"restricted: allowed talkgroup", restricted, 2, 2001, true},
+		{"restricted: other talkgroup of that system", restricted, 2, 2002, false},
+		{"restricted: other system", restricted, 3, 1001, false},
+		{"restricted: zero talkgroup", restricted, 1, 0, false},
+		{"restricted: zero system", restricted, 0, 1001, false},
+		{"ticket narrowing: both allow", ticket, 1, 1001, true},
+		{"ticket narrowing: key allows, narrowing doesn't", ticket, 1, 1003, false},
+		{"allow-nothing narrowing", nothing, 1, 1001, false},
+	} {
+		if got := PrincipalAllows(tc.p, makeFrame(tc.sys, tc.tg)); got != tc.want {
+			t.Errorf("%s: PrincipalAllows(%d:%d) = %v, want %v", tc.name, tc.sys, tc.tg, got, tc.want)
+		}
+	}
+}
+
+// TestAudioBusRestrictedSubscriber checks that a restricted subscriber hears
+// only allowed talkgroups whatever its filter says, including after a client
+// subscribe that tries to widen it, and that a nil principal hears nothing.
+func TestAudioBusRestrictedSubscriber(t *testing.T) {
+	bus := NewAudioBus()
+	holder := listener(restrictedListener())
+	ch, cancel := bus.Subscribe(AudioFilter{}, holder)
+	defer cancel()
+
+	publishAll := func() {
+		for _, f := range [][2]int{{1, 1001}, {1, 1002}, {2, 2001}, {2, 2002}, {3, 3001}, {1, 0}} {
+			bus.Publish(makeFrame(f[0], f[1]))
+		}
+	}
+	drain := func() []string {
+		var got []string
+		for {
+			select {
+			case f := <-ch:
+				got = append(got, fmt.Sprintf("%d:%d", f.SystemID, f.TGID))
+			case <-time.After(50 * time.Millisecond):
+				return got
+			}
+		}
+	}
+
+	// An empty filter ("everything") is clamped to the restriction.
+	publishAll()
+	if got := strings.Join(drain(), ","); got != "1:1001,2:2001" {
+		t.Errorf("empty filter: got %s, want 1:1001,2:2001", got)
+	}
+
+	// A subscribe naming forbidden systems and talkgroups doesn't widen it.
+	bus.UpdateFilter(ch, AudioFilter{SystemIDs: []int{1, 2, 3}, TGIDs: []int{1002, 2002, 3001, 2001}})
+	publishAll()
+	if got := strings.Join(drain(), ","); got != "2:2001" {
+		t.Errorf("widening filter: got %s, want 2:2001", got)
+	}
+	if holder.Load() == nil || !holder.Load().Restricted() {
+		t.Error("UpdateFilter changed the subscriber's principal")
+	}
+
+	// Swapping the principal takes effect on the next frame.
+	holder.Store(&auth.Principal{Kind: auth.KindKey, KeyID: 2, Scopes: auth.Scopes{auth.ScopeListen}})
+	publishAll()
+	if got := strings.Join(drain(), ","); got != "1:1002,2:2001,2:2002,3:3001" {
+		t.Errorf("after swap to unrestricted: got %s, want 1:1002,2:2001,2:2002,3:3001", got)
+	}
+
+	// A holder emptied by the re-check (listen lost) hears nothing.
+	holder.Store(nil)
+	publishAll()
+	if got := drain(); len(got) != 0 {
+		t.Errorf("nil principal heard %v", got)
+	}
+
+	// So does a subscriber registered without a holder.
+	ch2, cancel2 := bus.Subscribe(AudioFilter{}, nil)
+	defer cancel2()
+	bus.Publish(makeFrame(1, 1001))
+	select {
+	case f := <-ch2:
+		t.Errorf("subscriber without a principal heard %d:%d", f.SystemID, f.TGID)
+	case <-time.After(50 * time.Millisecond):
 	}
 }

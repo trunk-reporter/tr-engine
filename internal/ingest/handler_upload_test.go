@@ -1,7 +1,11 @@
 package ingest
 
 import (
+	"context"
+	"errors"
 	"testing"
+
+	"github.com/snarg/tr-engine/internal/api"
 )
 
 // Format detection is tested in api/upload_test.go (detectUploadFormat).
@@ -414,5 +418,26 @@ func TestFirstNonEmpty(t *testing.T) {
 	got = firstNonEmpty(fields, "c")
 	if got != "world" {
 		t.Errorf("firstNonEmpty = %q, want %q", got, "world")
+	}
+}
+
+// Field errors are the uploader's fault: they wrap api.ErrInvalidUpload so
+// the handler answers 400 rather than 500. They are found before the
+// pipeline touches anything.
+func TestProcessUpload_InvalidFieldsWrapErrInvalidUpload(t *testing.T) {
+	p := &Pipeline{}
+	for _, c := range []struct {
+		format string
+		fields map[string]string
+	}{
+		{"rdio-scanner", map[string]string{"systemLabel": "butco"}},
+		{"rdio-scanner", map[string]string{"talkgroup": "abc"}},
+		{"openmhz", map[string]string{"start_time": "1708881234"}},
+		{"bogus", map[string]string{"talkgroup": "1"}},
+	} {
+		_, err := p.ProcessUpload(context.Background(), "http-upload", c.format, c.fields, nil, "")
+		if !errors.Is(err, api.ErrInvalidUpload) {
+			t.Errorf("%s %v: err = %v, want one wrapping api.ErrInvalidUpload", c.format, c.fields, err)
+		}
 	}
 }

@@ -15,9 +15,10 @@ func NewSystemsHandler(db *database.DB) *SystemsHandler {
 	return &SystemsHandler{db: db}
 }
 
-// ListSystems returns all active systems with embedded sites.
+// ListSystems returns all active systems the caller may see, with embedded
+// sites.
 func (h *SystemsHandler) ListSystems(w http.ResponseWriter, r *http.Request) {
-	systems, err := h.db.ListSystemsWithSites(r.Context())
+	systems, err := h.db.ListSystemsWithSites(r.Context(), PrincipalFrom(r))
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "failed to list systems")
 		return
@@ -28,16 +29,17 @@ func (h *SystemsHandler) ListSystems(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetSystem returns a single system by ID with embedded sites.
+// GetSystem returns a single system by ID with embedded sites. A system the
+// caller may not see is 404, like one that doesn't exist.
 func (h *SystemsHandler) GetSystem(w http.ResponseWriter, r *http.Request) {
 	id, err := PathInt(r, "id")
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid system ID")
 		return
 	}
-	system, err := h.db.GetSystemByID(r.Context(), id)
+	system, err := h.db.GetSystemByID(r.Context(), PrincipalFrom(r), id)
 	if err != nil {
-		WriteError(w, http.StatusNotFound, "system not found")
+		writeLookupError(w, err, "system not found", "failed to get system")
 		return
 	}
 	WriteJSON(w, http.StatusOK, system)
@@ -66,7 +68,7 @@ func (h *SystemsHandler) UpdateSystem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	system, err := h.db.GetSystemByID(r.Context(), id)
+	system, err := h.db.GetSystemByID(r.Context(), PrincipalFrom(r), id)
 	if err != nil {
 		WriteError(w, http.StatusNotFound, "system not found")
 		return
@@ -74,16 +76,17 @@ func (h *SystemsHandler) UpdateSystem(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, system)
 }
 
-// GetSite returns a single site by ID.
+// GetSite returns a single site by ID. A site whose system the caller may not
+// see is 404, like one that doesn't exist.
 func (h *SystemsHandler) GetSite(w http.ResponseWriter, r *http.Request) {
 	id, err := PathInt(r, "id")
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid site ID")
 		return
 	}
-	site, err := h.db.GetSiteByID(r.Context(), id)
+	site, err := h.db.GetSiteByID(r.Context(), PrincipalFrom(r), id)
 	if err != nil {
-		WriteError(w, http.StatusNotFound, "site not found")
+		writeLookupError(w, err, "site not found", "failed to get site")
 		return
 	}
 	WriteJSON(w, http.StatusOK, site)
@@ -118,7 +121,7 @@ func (h *SystemsHandler) UpdateSite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	site, err := h.db.GetSiteByID(r.Context(), id)
+	site, err := h.db.GetSiteByID(r.Context(), PrincipalFrom(r), id)
 	if err != nil {
 		WriteError(w, http.StatusNotFound, "site not found")
 		return

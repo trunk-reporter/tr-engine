@@ -6,7 +6,9 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/database/sqlcdb"
 )
 
@@ -118,8 +120,16 @@ func talkgroupRowToAPI(r sqlcdb.GetTalkgroupByCompositeRow) TalkgroupAPI {
 	return tg
 }
 
-// GetTalkgroupByComposite returns a single talkgroup by system_id and tgid.
-func (db *DB) GetTalkgroupByComposite(ctx context.Context, systemID, tgid int) (*TalkgroupAPI, error) {
+// GetTalkgroupByComposite returns a single talkgroup by system_id and tgid. A
+// talkgroup p may not see is pgx.ErrNoRows, like one that doesn't exist
+// (§6.3). A nil p is ErrNoPrincipal.
+func (db *DB) GetTalkgroupByComposite(ctx context.Context, p *auth.Principal, systemID, tgid int) (*TalkgroupAPI, error) {
+	if p == nil {
+		return nil, ErrNoPrincipal
+	}
+	if !p.AllowsTG(systemID, tgid) {
+		return nil, pgx.ErrNoRows
+	}
 	row, err := db.Q.GetTalkgroupByComposite(ctx, sqlcdb.GetTalkgroupByCompositeParams{
 		SystemID: systemID,
 		Tgid:     tgid,
@@ -131,19 +141,28 @@ func (db *DB) GetTalkgroupByComposite(ctx context.Context, systemID, tgid int) (
 	return &tg, nil
 }
 
-// FindTalkgroupSystems returns systems where a talkgroup ID exists (for ambiguity resolution).
-func (db *DB) FindTalkgroupSystems(ctx context.Context, tgid int) ([]AmbiguousMatch, error) {
+// FindTalkgroupSystems returns systems where a talkgroup ID exists (for
+// ambiguity resolution), considering only the talkgroups p may see: a plain
+// ID then resolves among allowed talkgroups, and a 409 never names a system
+// whose talkgroup p can't see (§6.3). A nil p is ErrNoPrincipal.
+func (db *DB) FindTalkgroupSystems(ctx context.Context, p *auth.Principal, tgid int) ([]AmbiguousMatch, error) {
+	if p == nil {
+		return nil, ErrNoPrincipal
+	}
 	rows, err := db.Q.FindTalkgroupSystems(ctx, tgid)
 	if err != nil {
 		return nil, err
 	}
-	matches := make([]AmbiguousMatch, len(rows))
-	for i, r := range rows {
-		matches[i] = AmbiguousMatch{
+	matches := make([]AmbiguousMatch, 0, len(rows))
+	for _, r := range rows {
+		if !p.AllowsTG(r.SystemID, tgid) {
+			continue
+		}
+		matches = append(matches, AmbiguousMatch{
 			SystemID:   r.SystemID,
 			SystemName: r.SystemName,
 			Sysid:      r.Sysid,
-		}
+		})
 	}
 	return matches, nil
 }
@@ -262,14 +281,22 @@ func (db *DB) EnrichTalkgroupsFromDirectory(ctx context.Context, systemID, tgid 
 	})
 }
 
-// ListTalkgroups returns talkgroups with cached stats.
-func (db *DB) ListTalkgroups(ctx context.Context, filter TalkgroupFilter) ([]TalkgroupAPI, int, error) {
-	const whereClause = `
+// ListTalkgroups returns talkgroups with cached stats, limited to the
+// talkgroups p may see: the restriction is part of the WHERE shared by the
+// count and the rows (§7.2). A nil p is ErrNoPrincipal.
+func (db *DB) ListTalkgroups(ctx context.Context, p *auth.Principal, filter TalkgroupFilter) ([]TalkgroupAPI, int, error) {
+	const filterClause = `
 		WHERE ($1::int[] IS NULL OR t.system_id = ANY($1))
 		  AND ($2::text[] IS NULL OR s.sysid = ANY($2))
 		  AND ($3::text IS NULL OR t."group" = $3)
 		  AND ($4::text IS NULL OR t.alpha_tag ILIKE '%' || $4 || '%' OR t.description ILIKE '%' || $4 || '%' OR t.tag ILIKE '%' || $4 || '%' OR t."group" ILIKE '%' || $4 || '%' OR t.tgid::text = $4)`
 	args := []any{pqIntArray(filter.SystemIDs), pqStringArray(filter.Sysids), filter.Group, filter.Search}
+	restrict, restrictArgs, err := restrictSQL(p, "t.system_id", "t.tgid", len(args)+1)
+	if err != nil {
+		return nil, 0, err
+	}
+	whereClause := filterClause + restrict
+	args = append(args, restrictArgs...)
 
 	// Count
 	var total int
@@ -293,8 +320,8 @@ func (db *DB) ListTalkgroups(ctx context.Context, filter TalkgroupFilter) ([]Tal
 		JOIN systems s ON s.system_id = t.system_id AND s.deleted_at IS NULL
 		%s
 		ORDER BY %s
-		LIMIT $5 OFFSET $6
-	`, whereClause, orderBy)
+		LIMIT %s OFFSET %s
+	`, whereClause, orderBy, placeholder(len(args)+1), placeholder(len(args)+2))
 
 	rows, err := db.Pool.Query(ctx, dataQuery, append(args, filter.Limit, filter.Offset)...)
 	if err != nil {
@@ -334,27 +361,34 @@ func (db *DB) ListTalkgroups(ctx context.Context, filter TalkgroupFilter) ([]Tal
 	return talkgroups, total, rows.Err()
 }
 
-// ListTalkgroupUnits returns units affiliated with a talkgroup within a time window.
-func (db *DB) ListTalkgroupUnits(ctx context.Context, systemID, tgid, windowMinutes, limit, offset int) ([]UnitAPI, int, error) {
-	window := strconv.Itoa(windowMinutes) + " minutes"
-
-	var total int
-	err := db.Pool.QueryRow(ctx, `
-		SELECT count(DISTINCT u)
-		FROM calls c, unnest(c.unit_ids) AS u
-		WHERE c.system_id = $1 AND c.tgid = $2 AND c.start_time > now() - $3::interval
-	`, systemID, tgid, window).Scan(&total)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	rows, err := db.Pool.Query(ctx, `
+// talkgroupUnitCalls counts, per unit ID, the calls on one talkgroup
+// ($1 system, $2 tgid) within a window ($3).
+const talkgroupUnitCalls = `
 		WITH unit_calls AS (
 			SELECT uid, count(*) AS call_count
 			FROM calls c, unnest(c.unit_ids) AS uid
 			WHERE c.system_id = $1 AND c.tgid = $2 AND c.start_time > now() - $3::interval
 			GROUP BY uid
-		)
+		)`
+
+// ListTalkgroupUnits returns units affiliated with a talkgroup within a time
+// window. Units are matched within the talkgroup's system: a unit ID is only
+// unique per system, so the same number elsewhere is a different radio. The
+// total counts exactly the rows the list pages through.
+func (db *DB) ListTalkgroupUnits(ctx context.Context, systemID, tgid, windowMinutes, limit, offset int) ([]UnitAPI, int, error) {
+	window := strconv.Itoa(windowMinutes) + " minutes"
+
+	var total int
+	err := db.Pool.QueryRow(ctx, talkgroupUnitCalls+`
+		SELECT count(*)
+		FROM unit_calls uc
+		JOIN units u ON u.system_id = $1 AND u.unit_id = uc.uid
+	`, systemID, tgid, window).Scan(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	rows, err := db.Pool.Query(ctx, talkgroupUnitCalls+`
 		SELECT u.system_id, COALESCE(s.name, ''), s.sysid,
 			u.unit_id, COALESCE(u.alpha_tag, ''), COALESCE(u.alpha_tag_source, ''),
 			u.first_seen, u.last_seen,
@@ -362,9 +396,9 @@ func (db *DB) ListTalkgroupUnits(ctx context.Context, systemID, tgid, windowMinu
 			COALESCE(u.recorder_alpha_tag, ''), u.recorder_alpha_tag_seen,
 			COALESCE(u.ota_alpha_tag, ''), u.ota_alpha_tag_first_seen, u.ota_alpha_tag_last_seen,
 			uc.call_count
-		FROM units u
+		FROM unit_calls uc
+		JOIN units u ON u.system_id = $1 AND u.unit_id = uc.uid
 		JOIN systems s ON s.system_id = u.system_id
-		JOIN unit_calls uc ON uc.uid = u.unit_id
 		ORDER BY uc.call_count DESC, u.unit_id
 		LIMIT $4 OFFSET $5
 	`, systemID, tgid, window, limit, offset)
@@ -441,8 +475,10 @@ func (db *DB) GetEncryptionStats(ctx context.Context, hours int, sysid string) (
 	return stats, rows.Err()
 }
 
-// SearchTalkgroupDirectory searches the talkgroup directory reference table.
-func (db *DB) SearchTalkgroupDirectory(ctx context.Context, filter TalkgroupDirectoryFilter) ([]TalkgroupDirectoryRow, int, error) {
+// SearchTalkgroupDirectory searches the talkgroup directory reference table,
+// limited to the talkgroups p may see: the restriction is part of the WHERE
+// shared by the count and the rows (§7.2). A nil p is ErrNoPrincipal.
+func (db *DB) SearchTalkgroupDirectory(ctx context.Context, p *auth.Principal, filter TalkgroupDirectoryFilter) ([]TalkgroupDirectoryRow, int, error) {
 	// Convert empty-string filters to nil so IS NULL OR skips them
 	var search, category, mode any
 	if filter.Search != nil && *filter.Search != "" {
@@ -455,12 +491,18 @@ func (db *DB) SearchTalkgroupDirectory(ctx context.Context, filter TalkgroupDire
 		mode = *filter.Mode
 	}
 
-	const whereClause = `
+	const filterClause = `
 		WHERE ($1::int[] IS NULL OR td.system_id = ANY($1))
 		  AND ($2::text IS NULL OR td.search_vector @@ plainto_tsquery('english', $2))
 		  AND ($3::text IS NULL OR td.category = $3)
 		  AND ($4::text IS NULL OR td.mode = $4)`
 	args := []any{pqIntArray(filter.SystemIDs), search, category, mode}
+	restrict, restrictArgs, err := restrictSQL(p, "td.system_id", "td.tgid", len(args)+1)
+	if err != nil {
+		return nil, 0, err
+	}
+	whereClause := filterClause + restrict
+	args = append(args, restrictArgs...)
 
 	// Count
 	var total int
@@ -483,7 +525,7 @@ func (db *DB) SearchTalkgroupDirectory(ctx context.Context, filter TalkgroupDire
 		LEFT JOIN systems s ON s.system_id = td.system_id
 	` + whereClause + `
 		ORDER BY td.system_id, td.tgid
-		LIMIT $5 OFFSET $6`
+		LIMIT ` + placeholder(len(args)+1) + ` OFFSET ` + placeholder(len(args)+2)
 
 	rows, err := db.Pool.Query(ctx, query, append(args, limit, filter.Offset)...)
 	if err != nil {
@@ -491,7 +533,7 @@ func (db *DB) SearchTalkgroupDirectory(ctx context.Context, filter TalkgroupDire
 	}
 	defer rows.Close()
 
-	var results []TalkgroupDirectoryRow
+	results := []TalkgroupDirectoryRow{} // [] rather than null when nothing matches
 	for rows.Next() {
 		var r TalkgroupDirectoryRow
 		if err := rows.Scan(&r.SystemID, &r.SystemName, &r.Tgid,

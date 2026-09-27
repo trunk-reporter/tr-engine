@@ -2,7 +2,11 @@ package api
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -65,11 +69,12 @@ func (h *StorageHandler) PurgeTable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.OlderThan == "" {
-		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidParameter, "older_than is required (e.g. '48h')")
+		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidParameter, "older_than is required (e.g. '48h' or '7d')")
 		return
 	}
-	if _, err := time.ParseDuration(req.OlderThan); err != nil {
-		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidParameter, "expected duration like '48h' or '7d'")
+	olderThan, err := parsePurgeAge(req.OlderThan)
+	if err != nil {
+		WriteErrorWithCode(w, http.StatusBadRequest, ErrInvalidParameter, "older_than: "+err.Error())
 		return
 	}
 
@@ -82,7 +87,6 @@ func (h *StorageHandler) PurgeTable(w http.ResponseWriter, r *http.Request) {
 		"warning": "This action is irreversible.",
 	}
 
-	olderThan, _ := time.ParseDuration(req.OlderThan)
 	response["older_than"] = req.OlderThan
 
 	if spec.usePartitionDrop {
@@ -131,6 +135,34 @@ func (h *StorageHandler) PurgeTable(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusGatewayTimeout
 	}
 	WriteJSON(w, status, response)
+}
+
+// minPurgeAge is the youngest data a manual purge may delete. A zero or
+// negative age would delete every row, or drop the current raw-message
+// partition.
+const minPurgeAge = time.Hour
+
+// parsePurgeAge parses a purge age: a Go duration ("48h") or a whole number
+// of days ("7d"). It must be at least minPurgeAge.
+func parsePurgeAge(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	var d time.Duration
+	if days, ok := strings.CutSuffix(s, "d"); ok {
+		n, err := strconv.ParseInt(days, 10, 64)
+		if err != nil || n < 0 || n > int64(math.MaxInt64/int64(24*time.Hour)) {
+			return 0, fmt.Errorf("invalid age %q: use a duration like '48h' or days like '7d'", s)
+		}
+		d = time.Duration(n) * 24 * time.Hour
+	} else {
+		var err error
+		if d, err = time.ParseDuration(s); err != nil {
+			return 0, fmt.Errorf("invalid age %q: use a duration like '48h' or days like '7d'", s)
+		}
+	}
+	if d < minPurgeAge {
+		return 0, fmt.Errorf("must be at least %s", minPurgeAge)
+	}
+	return d, nil
 }
 
 func (h *StorageHandler) Routes(r chi.Router) {

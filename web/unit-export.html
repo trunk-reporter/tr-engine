@@ -7,7 +7,7 @@
   <meta name="card-description" content="Browse and export unit IDs and tags to CSV" />
   <title>Unit Export</title>
 
-  <script src="auth.js?v=1"></script>
+  <script src="auth.js?v=3"></script>
   <script src="theme-config.js"></script>
 
   <style>
@@ -703,10 +703,10 @@
       const tag = (u.alpha_tag || '').trim();
       const lastSeen = u.last_seen ? formatDate(u.last_seen) : '—';
       row.innerHTML = `
-        <td class="unit-id-cell">${u.unit_id}</td>
+        <td class="unit-id-cell">${escHtml(u.unit_id ?? '')}</td>
         <td class="tag-cell">${tag !== '' ? escHtml(tag) : '<span class="empty-tag">—</span>'}</td>
         <td class="system-cell">${escHtml(u.system_name || '—')}</td>
-        <td class="last-seen-cell">${lastSeen}</td>`;
+        <td class="last-seen-cell">${escHtml(lastSeen)}</td>`;
       tbody.appendChild(row);
     });
 
@@ -863,11 +863,7 @@
   }
 
   function escHtml(s) {
-    return String(s)
-      .replace(/&/g,'&amp;')
-      .replace(/</g,'&lt;')
-      .replace(/>/g,'&gt;')
-      .replace(/"/g,'&quot;');
+    return trAuth.escapeHTML(s);
   }
 
   function showToast(msg) {

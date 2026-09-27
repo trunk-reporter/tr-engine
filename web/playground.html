@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="auth.js?v=1"></script>
+<script src="auth.js?v=3"></script>
 <meta name="card-title" content="Page Builder">
 <meta name="card-description" content="Generate custom dashboard pages with AI">
 <meta name="card-order" content="11">
@@ -288,14 +288,14 @@
       <button data-mode="standalone">Standalone</button>
     </div>
     <div class="mode-hint" id="modeHint">
-      Page lives in tr-engine's web/ directory. Uses theme system and auto-auth.
+      Page lives in tr-engine's web/ directory. Uses the theme system; auth.js handles API keys and tickets.
     </div>
     <div class="option-row">
       <input type="checkbox" id="includeToken">
       <label for="includeToken">Include this instance URL for live preview</label>
     </div>
     <div class="option-hint" id="tokenHint" style="display:none">
-      Adds this instance's URL. Tokens are never included in generated prompts.
+      Adds this instance's URL. API keys are never included in generated prompts.
     </div>
     <button class="btn" id="buildBtn">Build Prompt</button>
   </div>
@@ -314,6 +314,7 @@
     <button class="btn" id="renderBtn">Render Preview</button>
     <div class="save-section" id="saveSection">
       <div class="save-warning">Saved pages live on disk only — they are not embedded in the binary and will be lost if the web/ directory is removed.</div>
+      <div class="save-warning">Saving needs an admin key. Connect on the <a href="admin.html" style="color:inherit">Admin page</a> in this tab first; the key stays in this tab only.</div>
       <div class="save-meta" id="saveMeta" style="display:none">
         <div class="save-meta-hint">The pasted HTML is missing page registration meta tags. Fill these in to make the page appear in the nav menu.</div>
         <div class="save-row">
@@ -363,7 +364,7 @@
 
   // ── Mode Hints ──
   const MODE_HINTS = {
-    integrated: "Page lives in tr-engine's web/ directory. Uses theme system and auto-auth.",
+    integrated: "Page lives in tr-engine's web/ directory. Uses the theme system; auth.js handles API keys and tickets.",
     standalone: "Self-contained HTML file. Works from anywhere — just needs the API URL."
   };
 
@@ -382,11 +383,20 @@ Read the full API spec here: https://raw.githubusercontent.com/trunk-reporter/tr
 
 Use any endpoints you need. All endpoints are under /api/v1. Responses use {items, total, limit, offset} pagination.
 
-## Authentication
+## Authentication (API keys)
 Include this as the FIRST script in <head>:
-<script src="auth.js?v=1"><\/script>
+<script src="auth.js?v=3"><\/script>
 
-This automatically patches fetch() and EventSource to include auth headers. No manual auth code needed — just use fetch('/api/v1/...') normally.
+tr-engine authenticates client software with API keys. auth.js handles them for this page:
+- fetch('/api/v1/...') gets "Authorization: Bearer <key>" when the visitor has stored a key, and no credential otherwise (the engine's anonymous access policy then decides what may be read). Use relative /api/v1 URLs.
+- new EventSource('/api/v1/events/stream?...') works as usual. With a key, auth.js connects with a short-lived ticket (?ticket=), renews it and reconnects without gaps.
+- <audio> can't send headers: set audio.src = trAuth.mediaUrl(call.audio_url). On the element's 'error' event, retry once with audio.src = await trAuth.ticketUrl(call.audio_url).
+- Never put an API key in the page source or in a URL, and never call /auth-init, /auth/* or /users (they no longer exist).
+- To show edit controls, await trAuth.ready() and check trAuth.hasScope('edit'). trAuth.showKeyPrompt() lets the visitor enter a key.
+- Keys restricted to some systems or talkgroups get 403 restricted_credential from the units, stats and recorder endpoints. Load each section separately (Promise.allSettled) so the rest of the page still works.
+
+## Rendering API data
+Alpha tags and other names can be edited by users. Render API strings with textContent, or pass them through trAuth.escapeHTML() when building HTML strings.
 
 ## Theme System
 Include these scripts:
@@ -427,28 +437,34 @@ Read the full API spec here: https://raw.githubusercontent.com/trunk-reporter/tr
 
 Use any endpoints you need. All endpoints are under /api/v1. Responses use {items, total, limit, offset} pagination.
 
-## Authentication
-The page needs to connect to a tr-engine instance. Include this auth bootstrap at the top of the page:
+## Authentication (API keys)
+tr-engine authenticates client software with API keys, sent as "Authorization: Bearer tre_...". A request without a key is answered according to the engine's anonymous access policy: "off" answers 401 key_required, "listen" allows reading. The API allows any origin and never uses cookies.
 
-1. Show a config bar with an API URL input (default: window.location.origin) and a "Connect" button
-2. On connect, fetch {apiUrl}/api/v1/auth-init to detect auth mode (this endpoint requires no auth)
-3. If mode is "full" and read_token is present, use it for read requests; if mode is "token", show a manual "Auth Token" input field
-4. If auth-init fails (CORS or network), show a manual "Auth Token" input field as fallback
-5. Create a helper function that wraps fetch to include the Authorization header only when a token is available:
+1. Show a config bar with an API URL input (default: window.location.origin), an optional "API key" input (type=password) and a "Connect" button. Never embed a key in the page source or put it in a URL; keep it in localStorage only if the user asks.
+2. On connect, call GET {API_URL}/api/v1/whoami (with the key, if given). 200 returns {credential, key, scopes, restricted, anonymous: {access}}; 401 invalid_key means the key was rejected; 404 means the engine is too old for API keys.
+3. Wrap fetch so the key is sent only when there is one:
 
 function apiFetch(path, opts = {}) {
-  return fetch(API_URL + path, {
-    ...opts,
-    headers: TOKEN ? { ...opts.headers, 'Authorization': 'Bearer ' + TOKEN } : opts.headers
-  });
+  const headers = { ...(opts.headers || {}) };
+  if (API_KEY) headers['Authorization'] = 'Bearer ' + API_KEY;
+  return fetch(API_URL + path, { ...opts, headers });
 }
 
-Use apiFetch('/api/v1/...') for all API calls.
+Use apiFetch('/api/v1/...') for all API calls. Keys restricted to some systems or talkgroups get 403 restricted_credential from the units, stats and recorder endpoints, so load each section separately (Promise.allSettled).
 
-## SSE Real-Time Events
-For live updates from a standalone page, prefer unauthenticated/open instances or same-origin integrated pages. Browser EventSource cannot set Authorization headers, so do not put bearer tokens in generated source or URLs. If auth is required, show a clear message asking the user to open the integrated page served by tr-engine.
-const es = new EventSource(API_URL + '/api/v1/events/stream?types=call_start,call_end');
-es.onmessage = (e) => { const data = JSON.parse(e.data); /* handle event */ };
+## Tickets for SSE and audio
+EventSource and <audio> can't send headers. With a key, mint a short-lived, listen-only ticket and put it in ?ticket= (never the key itself):
+POST {API_URL}/api/v1/tickets with the key header and body {} returns {"ticket": "trt_...", "expires_at": "..."}.
+- SSE: new EventSource(API_URL + '/api/v1/events/stream?types=call_start,call_end&ticket=' + encodeURIComponent(ticket)).
+  When the ticket expires the server sends "event: auth" with data {"code":"ticket_expired"} and closes the stream: mint a new ticket and reconnect, adding &last_event_id=<the last event's id> so nothing is missed. On any other auth code (invalid_key, key_required, insufficient_scope), stop and ask for a key. On error, reconnect with a fresh ticket and a backoff.
+- Audio: audio.src = API_URL + call.audio_url + '?ticket=' + encodeURIComponent(ticket). call.audio_url is a path on the engine. On a media error, mint a new ticket and retry once.
+- Without a key, use the same URLs without a ticket.
+
+const es = new EventSource(API_URL + '/api/v1/events/stream?types=call_start,call_end' + (ticket ? '&ticket=' + encodeURIComponent(ticket) : ''));
+es.addEventListener('call_end', (e) => { const data = JSON.parse(e.data); /* handle event */ });
+
+## Rendering API data
+Alpha tags and other names can be edited by users. Render API strings with textContent, never by concatenating them into innerHTML.
 
 ## Styling
 Use a clean, modern dark theme. No external CSS frameworks needed — inline styles are fine.
@@ -490,10 +506,10 @@ Suggested palette: #0a0a0f background, #e0e0e8 text, #00d4ff accent.
     return '\n\n## Live Instance (for testing)\n' +
       'API base URL: ' + baseUrl + '\n' +
       (currentMode === 'integrated'
-        ? 'The page will be served from this instance, so relative URLs work. Auth is handled by auth.js automatically.'
+        ? 'The page will be served from this instance, so relative URLs work. auth.js handles API keys and tickets.'
         : 'Pre-configure the page to connect to this instance on load:\n' +
           '- Set API_URL = \'' + baseUrl + '\'\n' +
-          '- Do not embed bearer tokens in source. Use auth-init or ask for a local token at runtime.');
+          '- Do not embed API keys in source. Ask for a key at runtime, or run without one where the anonymous access policy allows listening.');
   }
 
   buildBtn.addEventListener('click', function() {
@@ -613,13 +629,20 @@ Suggested palette: #0a0a0f background, #e0e0e8 text, #00d4ff accent.
     saveStatus.textContent = 'Saving...';
     saveStatus.className = 'save-status';
 
+    // Saving pages needs the admin scope. Use the admin key the Admin page
+    // keeps for this tab, if any; otherwise auth.js sends the stored key.
+    var headers = { 'Content-Type': 'application/json' };
+    var adminKey = '';
+    try { adminKey = sessionStorage.getItem('tr-engine-admin-key') || ''; } catch (e) { /* storage blocked */ }
+    if (adminKey) headers['Authorization'] = 'Bearer ' + adminKey;
+
     fetch('/api/v1/pages', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: headers,
       body: JSON.stringify({ filename: payload.filename, html: payload.html, overwrite: saveOverwrite.checked })
     })
     .then(function(resp) {
-      return resp.json().then(function(data) { return { ok: resp.ok, data: data }; });
+      return resp.json().catch(function() { return {}; }).then(function(data) { return { ok: resp.ok, status: resp.status, data: data || {} }; });
     })
     .then(function(result) {
       saveBtn.disabled = false;
@@ -630,6 +653,7 @@ Suggested palette: #0a0a0f background, #e0e0e8 text, #00d4ff accent.
       } else {
         var msg = result.data.error || 'Save failed';
         if (result.data.detail) msg += ' — ' + result.data.detail;
+        if (result.status === 401 || result.status === 403) msg += ' — saving pages needs an admin key (connect on the Admin page in this tab)';
         saveStatus.textContent = msg;
         saveStatus.className = 'save-status error';
       }

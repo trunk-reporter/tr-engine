@@ -132,11 +132,15 @@ export async function init(opts) {
   const startAligned = alignToBucket(start);
   const endAligned = alignToBucket(now);
 
-  // Run backfill and roster fetch in parallel
-  await Promise.all([
+  // Run backfill and roster fetch in parallel. Either may be unavailable
+  // (backfill needs an admin key; the roster is denied to restricted keys),
+  // so a failure of one never blocks the other or the live stream.
+  const [backfillRes, rosterRes] = await Promise.allSettled([
     backfill(apiBase, systemId, startAligned, endAligned),
     fetchRoster(apiBase, systemId),
   ]);
+  if (backfillRes.status === 'rejected') console.warn('[signal-flow-data] Backfill failed, starting from live data:', backfillRes.reason);
+  if (rosterRes.status === 'rejected') console.warn('[signal-flow-data] Roster fetch failed, starting empty:', rosterRes.reason);
 
   // Stamp roster snapshot into all backfill buckets.
   // Roster is a gauge — the current snapshot is the best approximation
@@ -186,14 +190,35 @@ export function getState() {
 // Query result shape: { columns: [...], rows: [[...], ...] }
 // We convert to column-indexed lookups for fast assembly.
 
+const EMPTY_RESULT = { columns: [], rows: [] };
+let queryAllowed = null;  // Promise<boolean>, decided once per page
+
+// POST /query needs an API key with the admin scope. Only ask when this
+// page's own engine is the target and the stored key is an admin key;
+// otherwise skip the historical backfill (live data still fills in).
+function canQuery(apiBase) {
+  if (!queryAllowed) {
+    queryAllowed = (async () => {
+      const auth = window.trAuth;
+      if (!auth) return false;
+      if (auth.isSameOriginAPI && !auth.isSameOriginAPI(`${apiBase}/query`)) return false;
+      try { await auth.ready(); } catch (e) { return false; }
+      return auth.hasScope('admin');
+    })();
+  }
+  return queryAllowed;
+}
+
 async function query(apiBase, sql, params, limit = 10000) {
+  if (!(await canQuery(apiBase))) return EMPTY_RESULT;
   const resp = await fetch(`${apiBase}/query`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ sql, params, limit }),
   });
   if (!resp.ok) {
-    if (resp.status === 403) return { columns: [], rows: [] }; // /query disabled — degrade gracefully
+    // No key, a key without admin, or /query disabled: degrade gracefully
+    if (resp.status === 401 || resp.status === 403) return EMPTY_RESULT;
     throw new Error(`Query failed: ${resp.status} ${await resp.text()}`);
   }
   return resp.json();
@@ -574,7 +599,7 @@ async function fetchRoster(apiBase, systemId) {
   // Build roster state from affiliation list
   rosterState.clear();
   unitTgMap.clear();
-  for (const aff of data.affiliations) {
+  for (const aff of (data.affiliations || [])) {
     const tg = String(aff.tgid);
     if (!rosterState.has(tg)) rosterState.set(tg, new Set());
     rosterState.get(tg).add(aff.unit_id);

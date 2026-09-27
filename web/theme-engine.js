@@ -72,6 +72,13 @@
   let currentTheme = null;
   let labelTimeout = null;
 
+  // The shared escape helper from auth.js, with a local fallback for pages
+  // that load the theme without it.
+  function escapeHTML(s) {
+    if (window.trAuth && typeof window.trAuth.escapeHTML === 'function') return window.trAuth.escapeHTML(s);
+    return s == null ? '' : String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
   // ── Feature flag → data attribute mapping ──
   const FEATURE_MAP = {
     scanlines:      'scanlines',
@@ -149,9 +156,9 @@
     // Read title/subtitle — options win, fall back to meta tags
     const metaTitle = (document.querySelector('meta[name="card-title"]') || {}).content || '';
     const metaDesc  = (document.querySelector('meta[name="card-description"]') || {}).content || '';
-    const pageTitle    = opts.pageTitle    || metaTitle    || 'Event Horizon';
-    const pageSubtitle = opts.pageSubtitle || metaDesc     || 'tr-engine';
-    const homeHref     = opts.homeHref     || 'index.html';
+    const pageTitle    = escapeHTML(opts.pageTitle    || metaTitle    || 'Event Horizon');
+    const pageSubtitle = escapeHTML(opts.pageSubtitle || metaDesc     || 'tr-engine');
+    const homeHref     = escapeHTML(opts.homeHref     || 'index.html');
 
     // Inject CSS
     const style = document.createElement('style');
@@ -441,7 +448,7 @@
 
     fetch('/api/v1/pages')
       .then(r => r.json())
-      .then(pages => { _navPages = pages; renderNavPages(); })
+      .then(pages => { _navPages = Array.isArray(pages) ? pages : []; renderNavPages(); })
       .catch(() => {
         const dropdown = document.getElementById('eh-nav-dropdown');
         dropdown.textContent = '';
@@ -449,7 +456,38 @@
         ph.className = 'eh-nav-placeholder';
         ph.textContent = 'could not load pages';
         dropdown.appendChild(ph);
+        appendKeyItem(dropdown);
       });
+  }
+
+  // "API key…" menu item: opens auth.js's paste-key dialog (set, replace or
+  // forget the key this browser uses). Only when auth.js is loaded.
+  function appendKeyItem(dropdown) {
+    if (!window.trAuth || typeof window.trAuth.showKeyPrompt !== 'function') return;
+    const keyBtn = document.createElement('button');
+    keyBtn.className = 'eh-nav-manage eh-nav-key';
+    keyBtn.type = 'button';
+    const keySvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    keySvg.setAttribute('viewBox', '0 0 24 24');
+    keySvg.setAttribute('fill', 'none');
+    keySvg.setAttribute('stroke', 'currentColor');
+    keySvg.setAttribute('stroke-width', '2');
+    keySvg.setAttribute('stroke-linecap', 'round');
+    keySvg.setAttribute('stroke-linejoin', 'round');
+    const keyPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    keyPath.setAttribute('d', 'M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4');
+    keySvg.appendChild(keyPath);
+    keyBtn.appendChild(keySvg);
+    const keyLabel = document.createElement('span');
+    keyLabel.textContent = window.trAuth.getKey && window.trAuth.getKey() ? 'API key\u2026 (set)' : 'API key\u2026';
+    keyBtn.appendChild(keyLabel);
+    keyBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const wrap = document.getElementById('eh-nav-wrap');
+      if (wrap) wrap.classList.remove('open');
+      window.trAuth.showKeyPrompt();
+    });
+    dropdown.appendChild(keyBtn);
   }
 
   function renderNavPages() {
@@ -468,6 +506,7 @@
       ph.className = 'eh-nav-placeholder';
       ph.textContent = 'no other pages';
       dropdown.appendChild(ph);
+      appendKeyItem(dropdown);
       return;
     }
 
@@ -596,6 +635,7 @@
     manageLabel.textContent = _navEditing ? 'Done' : 'Manage pages';
     manageBtn.appendChild(manageLabel);
     dropdown.appendChild(manageBtn);
+    appendKeyItem(dropdown);
 
     manageBtn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -678,7 +718,7 @@
         if (!right || right.querySelector('.eh-update-badge')) return;
         const badge = document.createElement('a');
         badge.className = 'eh-update-badge';
-        badge.href = d.release_url || '#';
+        badge.href = /^https?:\/\//i.test(d.release_url || '') ? d.release_url : '#';
         badge.target = '_blank';
         badge.rel = 'noopener';
         badge.textContent = 'Update: ' + (d.latest_version || 'new');

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <script src="auth.js?v=1"></script>
+  <script src="auth.js?v=3"></script>
   <title>Signal Flow — tr-engine</title>
   <meta name="card-title" content="Signal Flow">
   <meta name="card-description" content="Stream graph visualization of radio traffic by talkgroup over time">
@@ -823,9 +823,10 @@ function renderDetail(calls) {
     const unitStr = c.units.length ? c.units.join(', ') : '';
     const isEmg = c.emergency;
     html += `<div class="tt-call-row${isEmg ? ' emergency' : ''}">`;
-    html += `<span class="tt-call-time">${time}</span>`;
-    html += `<span class="tt-call-dur">${dur}</span>`;
-    if (unitStr) html += `<span class="tt-call-units">${unitStr}</span>`;
+    const esc = trAuth.escapeHTML;
+    html += `<span class="tt-call-time">${esc(time)}</span>`;
+    html += `<span class="tt-call-dur">${esc(dur)}</span>`;
+    if (unitStr) html += `<span class="tt-call-units">${esc(unitStr)}</span>`;
     if (isEmg) html += `<span class="tt-call-emg">EMG</span>`;
     html += `</div>`;
   }

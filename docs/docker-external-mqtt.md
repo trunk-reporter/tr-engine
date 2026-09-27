@@ -72,7 +72,7 @@ services:
     image: ghcr.io/trunk-reporter/tr-engine:latest
     ports:
       # This machine only. Set HTTP_BIND_IP in .env to open it to your LAN
-      # (set ADMIN_PASSWORD first).
+      # (decide on anonymous access first: docs/auth.md).
       - "${HTTP_BIND_IP:-127.0.0.1}:${HTTP_PORT:-8080}:8080"
     env_file:
       - path: ./.env
@@ -111,7 +111,13 @@ On macOS and Windows, `host.docker.internal` works without `extra_hosts`. On Lin
 docker compose up -d
 ```
 
-On first run, PostgreSQL starts with an empty database. tr-engine auto-applies the schema on first connect (takes a few seconds).
+On first run, PostgreSQL starts with an empty database. tr-engine auto-applies the schema on first connect (takes a few seconds), then creates an admin API key and prints it **once** to its log. Copy it now:
+
+```bash
+docker compose logs tr-engine | grep -A3 "no admin API key"
+```
+
+Anonymous access is off on a new install, so everything except `/api/v1/health` needs a key. Create named keys with `docker compose exec -T tr-engine tr-engine keys create --name "..." --scopes listen|edit|admin`, or let anyone who can reach tr-engine listen with `docker compose exec -T tr-engine tr-engine access set --anonymous listen`. See [auth.md](./auth.md).
 
 ## 5. Verify
 
@@ -119,11 +125,11 @@ On first run, PostgreSQL starts with an empty database. tr-engine auto-applies t
 # Check logs — look for "mqtt connected" and "subscribing"
 docker compose logs tr-engine --tail 30
 
-# Health check — database and mqtt should both show "connected"
+# Health check (public) — database and mqtt should both show "connected"
 curl http://localhost:8080/api/v1/health
 
-# Watch live events (Ctrl-C to stop)
-curl -N http://localhost:8080/api/v1/events/stream
+# Watch live events (Ctrl-C to stop); use the admin key from the log
+curl -N -H "Authorization: Bearer tre_..." http://localhost:8080/api/v1/events/stream
 ```
 
 Open http://localhost:8080 for the web UI (on the Docker host; see [Network exposure](./docker.md#network-exposure) to reach it from elsewhere). Systems and talkgroups auto-populate as trunk-recorder sends data — no manual configuration needed.
@@ -140,7 +146,7 @@ All data is stored in bind-mounted directories next to your `docker-compose.yml`
 To back up the database:
 
 ```bash
-docker compose exec postgres pg_dump -U trengine trengine > backup.sql
+docker compose exec -T postgres pg_dump -U trengine trengine > backup.sql
 ```
 
 ## Other settings
@@ -148,10 +154,6 @@ docker compose exec postgres pg_dump -U trengine trengine > backup.sql
 Everything else is optional and has sensible defaults. Add any variable from [sample.env](https://github.com/trunk-reporter/tr-engine/blob/master/sample.env) to your `.env` file:
 
 ```bash
-AUTH_TOKEN=my-secret                # token-mode shared API token
-ADMIN_PASSWORD=change-me            # enables full auth with JWT login and API keys
-# WRITE_TOKEN=my-write-secret       # deprecated legacy write token
-# CORS_ORIGINS=https://example.com  # restrict CORS (empty = allow all)
 LOG_LEVEL=debug                     # more verbose logging
 RAW_STORE=false                     # disable raw MQTT archival (saves disk)
 RAW_EXCLUDE_TOPICS=trunking_message # exclude high-volume raw archival
@@ -161,6 +163,8 @@ RAW_EXCLUDE_TOPICS=trunking_message # exclude high-volume raw archival
 ```
 
 Then restart: `docker compose up -d`
+
+Access control is not configured in `.env`: API keys and the anonymous access policy live in the database (`tr-engine keys`, `tr-engine access`; see [auth.md](./auth.md)).
 
 ### File watch mode and TR auto-discovery
 

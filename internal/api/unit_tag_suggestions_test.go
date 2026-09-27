@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/rs/zerolog"
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/database"
 )
 
@@ -182,13 +184,13 @@ func TestApproveUnitTagSuggestion(t *testing.T) {
 		}
 		h := &UnitTagSuggestionsHandler{db: m, csvPaths: map[int]string{1: csv}}
 		req := httptest.NewRequest("POST", "/unit-tag-suggestions/7/approve", nil)
-		req = setAuthContext(req, 3, "alice", "editor", "jwt")
+		req = withPrincipal(req, editorPrincipal("tr-dashboard at home", "alice"), nil)
 		rec := serveSuggestions(h, req)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
 		}
-		if m.approveTag != "" || m.decidedBy != "alice" {
-			t.Errorf("approve called with tag=%q by=%q, want proposed tag by alice", m.approveTag, m.decidedBy)
+		if m.approveTag != "" || m.decidedBy != "tr-dashboard at home / alice" {
+			t.Errorf("approve called with tag=%q by=%q, want proposed tag by the key / alice", m.approveTag, m.decidedBy)
 		}
 		var body struct {
 			Suggestion database.UnitTagSuggestionAPI `json:"suggestion"`
@@ -309,7 +311,7 @@ func TestApproveUnitTagSuggestion(t *testing.T) {
 func TestDismissUnitTagSuggestion(t *testing.T) {
 	t.Run("dismiss leaves the unit alone", func(t *testing.T) {
 		m := newPendingStore()
-		req := setAuthContext(httptest.NewRequest("POST", "/unit-tag-suggestions/7/dismiss", nil), 3, "bob", "editor", "jwt")
+		req := withPrincipal(httptest.NewRequest("POST", "/unit-tag-suggestions/7/dismiss", nil), editorPrincipal("review script", ""), nil)
 		rec := serveSuggestions(&UnitTagSuggestionsHandler{db: m}, req)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
@@ -318,7 +320,7 @@ func TestDismissUnitTagSuggestion(t *testing.T) {
 			Suggestion database.UnitTagSuggestionAPI `json:"suggestion"`
 		}
 		decodeSuggestionBody(t, rec, &body)
-		if body.Suggestion.Status != "dismissed" || m.decidedBy != "bob" || m.unitTag != "1001" || m.approveCalls != 0 {
+		if body.Suggestion.Status != "dismissed" || m.decidedBy != "review script" || m.unitTag != "1001" || m.approveCalls != 0 {
 			t.Errorf("suggestion = %+v decidedBy = %q unit = %q", body.Suggestion, m.decidedBy, m.unitTag)
 		}
 	})
@@ -357,43 +359,53 @@ func TestGetUnitTagSuggestion(t *testing.T) {
 	}
 }
 
-// TestUnitTagSuggestionWriteAuth checks the routes sit behind the same
-// middleware as PATCH /units/{id}: reads pass with a read token, approve and
-// dismiss need write access.
+// editorPrincipal is an edit key's principal, acting for actor ("" = none).
+func editorPrincipal(keyName, actor string) *auth.Principal {
+	return &auth.Principal{Kind: auth.KindKey, KeyID: 3, KeyName: keyName, Scopes: auth.Scopes{auth.ScopeEdit}, Actor: actor}
+}
+
+// TestUnitTagSuggestionWriteAuth checks the routes' policies through the
+// auth pipeline: reads need listen, approve and dismiss need edit (like
+// PATCH /units/{id}), and the decision records the key name and X-Actor.
 func TestUnitTagSuggestionWriteAuth(t *testing.T) {
-	const readToken, writeToken = "read-tok", "write-tok"
+	store := newStubAuthStore()
+	store.add("listen-key", database.APIKey{Scopes: auth.Scopes{auth.ScopeListen}})
+	store.add("edit-key", database.APIKey{Name: "tr-dashboard", Scopes: auth.Scopes{auth.ScopeEdit}})
+	a := newTestAuthenticator(store)
 	r := chi.NewRouter()
-	r.Use(JWTOrTokenAuth(nil, writeToken, readToken))
-	r.Use(WriteAuth(writeToken, readToken, false))
+	r.Use(Match(r, zerolog.Nop()), a.Resolve, a.Authorize, a.Audit)
 	m := newPendingStore()
-	(&UnitTagSuggestionsHandler{db: m}).Routes(r)
+	(&UnitTagSuggestionsHandler{db: m}).Routes(prefixRouter{Router: r, prefix: apiPrefix})
 
-	do := func(method, path, token string) int {
-		req := httptest.NewRequest(method, path, nil)
-		if token != "" {
-			req.Header.Set("Authorization", "Bearer "+token)
-		}
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-		return rec.Code
+	send := func(method, path string, headers map[string]string) int {
+		return do(r, method, apiPrefix+path, headers).Code
 	}
 
-	if code := do("GET", "/unit-tag-suggestions", readToken); code != http.StatusOK {
-		t.Errorf("list with read token = %d, want 200", code)
+	if code := send("GET", "/unit-tag-suggestions", bearer("listen-key")); code != http.StatusOK {
+		t.Errorf("list with a listen key = %d, want 200", code)
 	}
-	if code := do("POST", "/unit-tag-suggestions/7/approve", ""); code != http.StatusUnauthorized {
-		t.Errorf("approve without token = %d, want 401", code)
+	if code := send("POST", "/unit-tag-suggestions/7/approve", nil); code != http.StatusUnauthorized {
+		t.Errorf("approve without a key = %d, want 401", code)
 	}
-	if code := do("POST", "/unit-tag-suggestions/7/approve", readToken); code != http.StatusForbidden {
-		t.Errorf("approve with read token = %d, want 403", code)
+	if code := send("POST", "/unit-tag-suggestions/7/approve", bearer("listen-key")); code != http.StatusForbidden {
+		t.Errorf("approve with a listen key = %d, want 403", code)
 	}
-	if code := do("POST", "/unit-tag-suggestions/7/dismiss", readToken); code != http.StatusForbidden {
-		t.Errorf("dismiss with read token = %d, want 403", code)
+	if code := send("POST", "/unit-tag-suggestions/7/dismiss", bearer("listen-key")); code != http.StatusForbidden {
+		t.Errorf("dismiss with a listen key = %d, want 403", code)
 	}
 	if m.approveCalls != 0 || m.dismissCalled {
-		t.Fatal("store must not be reached without write access")
+		t.Fatal("store must not be reached without edit")
 	}
-	if code := do("POST", "/unit-tag-suggestions/7/approve", writeToken); code != http.StatusOK {
-		t.Errorf("approve with write token = %d, want 200", code)
+	if code := send("POST", "/unit-tag-suggestions/7/approve", map[string]string{
+		"Authorization": "Bearer edit-key", "X-Actor": " carol\u200e\n ",
+	}); code != http.StatusOK {
+		t.Errorf("approve with an edit key = %d, want 200", code)
+	}
+	if m.decidedBy != "tr-dashboard / carol" {
+		t.Errorf("decided_by = %q, want the key name and the sanitized actor", m.decidedBy)
+	}
+	if entries := store.auditEntries(); len(entries) != 1 || entries[0].Path != "/api/v1/unit-tag-suggestions/7/approve" ||
+		entries[0].Status != http.StatusOK || *entries[0].Actor != "carol" {
+		t.Errorf("audit log = %+v, want the approve", entries)
 	}
 }

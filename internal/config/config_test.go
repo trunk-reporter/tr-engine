@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -106,6 +107,20 @@ func TestLoadMissingRequired(t *testing.T) {
 	_, err := Load(Overrides{EnvFile: "nonexistent.env"})
 	if err == nil {
 		t.Error("expected error when required env vars are missing")
+	}
+}
+
+// TestLoadDatabaseURLFlagOnly checks that --database-url alone satisfies
+// the required DATABASE_URL.
+func TestLoadDatabaseURLFlagOnly(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	os.Unsetenv("DATABASE_URL")
+	cfg, err := Load(Overrides{EnvFile: "nonexistent.env", DatabaseURL: "postgres://flag/db"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DatabaseURL != "postgres://flag/db" {
+		t.Errorf("DatabaseURL = %q", cfg.DatabaseURL)
 	}
 }
 
@@ -219,90 +234,60 @@ func TestUnitTagSuggestionsConfig(t *testing.T) {
 	}
 }
 
-func TestLoad_NoAutoGenerateAuthToken(t *testing.T) {
-	t.Setenv("DATABASE_URL", "postgres://localhost/test")
-	t.Setenv("MQTT_BROKER_URL", "tcp://localhost:1883")
-	t.Setenv("AUTH_TOKEN", "")
-
-	cfg, err := Load(Overrides{EnvFile: "nonexistent.env"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.AuthToken != "" {
-		t.Errorf("expected empty AuthToken, got %q", cfg.AuthToken)
-	}
-	if cfg.AuthTokenGenerated {
-		t.Error("expected AuthTokenGenerated=false")
-	}
-}
-
-func TestLoad_AuthEnabledFalse_ClearsTokens(t *testing.T) {
+// TestLoad_LegacyAuthVariables checks the removed auth variables are read
+// verbatim into LegacyAuth (for the one-time import and the warnings) and
+// that nothing clears, derives or generates them any more.
+func TestLoad_LegacyAuthVariables(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://localhost/test")
 	t.Setenv("MQTT_BROKER_URL", "tcp://localhost:1883")
 	t.Setenv("AUTH_ENABLED", "false")
-	t.Setenv("AUTH_TOKEN", "should-be-cleared")
-	t.Setenv("WRITE_TOKEN", "should-be-cleared")
-
-	cfg, err := Load(Overrides{EnvFile: "nonexistent.env"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.AuthToken != "" {
-		t.Errorf("expected empty AuthToken after AUTH_ENABLED=false, got %q", cfg.AuthToken)
-	}
-	if cfg.WriteToken != "" {
-		t.Errorf("expected empty WriteToken after AUTH_ENABLED=false, got %q", cfg.WriteToken)
-	}
-}
-
-func TestLoad_AuthEnabledFalse_ClearsUserAuth(t *testing.T) {
-	t.Setenv("DATABASE_URL", "postgres://localhost/test")
-	t.Setenv("MQTT_BROKER_URL", "tcp://localhost:1883")
-	t.Setenv("AUTH_ENABLED", "false")
-	t.Setenv("ADMIN_PASSWORD", "should-be-cleared")
-	t.Setenv("JWT_SECRET", "should-be-cleared")
-
-	cfg, err := Load(Overrides{EnvFile: "nonexistent.env"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Middleware is skipped entirely when AUTH_ENABLED=false, so /auth-init
-	// must not advertise login ("full" mode) — both must be cleared.
-	if cfg.AdminPassword != "" || cfg.JWTSecret != "" {
-		t.Errorf("expected AdminPassword/JWTSecret cleared, got %q / %q", cfg.AdminPassword, cfg.JWTSecret)
-	}
-}
-
-func TestLoad_JWTSecretWithoutAdminPassword_Ignored(t *testing.T) {
-	t.Setenv("DATABASE_URL", "postgres://localhost/test")
-	t.Setenv("MQTT_BROKER_URL", "tcp://localhost:1883")
-	t.Setenv("JWT_SECRET", "orphan-secret")
-	t.Setenv("ADMIN_PASSWORD", "")
-
-	cfg, err := Load(Overrides{EnvFile: "nonexistent.env"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.JWTSecret != "" {
-		t.Errorf("expected JWTSecret ignored without ADMIN_PASSWORD, got %q", cfg.JWTSecret)
-	}
-	if !cfg.JWTSecretIgnored {
-		t.Error("expected JWTSecretIgnored=true")
-	}
-}
-
-func TestLoad_JWTSecretWithAdminPassword_Kept(t *testing.T) {
-	t.Setenv("DATABASE_URL", "postgres://localhost/test")
-	t.Setenv("MQTT_BROKER_URL", "tcp://localhost:1883")
-	t.Setenv("JWT_SECRET", "real-secret")
+	t.Setenv("AUTH_TOKEN", "read-token")
+	t.Setenv("WRITE_TOKEN", "write-token")
+	t.Setenv("ADMIN_USERNAME", "root")
 	t.Setenv("ADMIN_PASSWORD", "hunter22hunter22")
+	t.Setenv("JWT_SECRET", "jwt-secret")
+	t.Setenv("CORS_ORIGINS", "https://a.example")
 
 	cfg, err := Load(Overrides{EnvFile: "nonexistent.env"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.JWTSecret != "real-secret" || cfg.JWTSecretIgnored {
-		t.Errorf("expected JWTSecret kept, got %q (ignored=%v)", cfg.JWTSecret, cfg.JWTSecretIgnored)
+	want := LegacyAuthEnv{
+		AuthEnabled:   "false",
+		AuthToken:     "read-token",
+		WriteToken:    "write-token",
+		AdminUsername: "root",
+		AdminPassword: "hunter22hunter22",
+		JWTSecret:     "jwt-secret",
+		CORSOrigins:   "https://a.example",
+	}
+	if cfg.LegacyAuth != want {
+		t.Errorf("LegacyAuth = %+v, want %+v", cfg.LegacyAuth, want)
+	}
+	var names []string
+	for _, v := range cfg.LegacyAuth.Set() {
+		names = append(names, v.Name)
+	}
+	if got := strings.Join(names, ","); got != "AUTH_ENABLED,AUTH_TOKEN,WRITE_TOKEN,ADMIN_USERNAME,ADMIN_PASSWORD,JWT_SECRET,CORS_ORIGINS" {
+		t.Errorf("Set() = %s", got)
+	}
+}
+
+func TestLoad_LegacyAuthUnset(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/test")
+	t.Setenv("MQTT_BROKER_URL", "tcp://localhost:1883")
+	for _, v := range []string{"AUTH_ENABLED", "AUTH_TOKEN", "WRITE_TOKEN", "ADMIN_USERNAME", "ADMIN_PASSWORD", "JWT_SECRET", "CORS_ORIGINS"} {
+		t.Setenv(v, "") // restored after the test
+		os.Unsetenv(v)
+	}
+	cfg, err := Load(Overrides{EnvFile: "nonexistent.env"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No defaults: ADMIN_USERNAME used to default to "admin", which would
+	// now produce a warning for a variable nobody set.
+	if cfg.LegacyAuth != (LegacyAuthEnv{}) || len(cfg.LegacyAuth.Set()) != 0 {
+		t.Errorf("LegacyAuth = %+v, want all unset", cfg.LegacyAuth)
 	}
 }
 
@@ -316,23 +301,6 @@ func TestLoad_TrustedProxiesDefault(t *testing.T) {
 	}
 	if cfg.TrustedProxies != "loopback,private" {
 		t.Errorf("TrustedProxies = %q, want loopback,private", cfg.TrustedProxies)
-	}
-}
-
-func TestLoad_ExplicitAuthToken_Preserved(t *testing.T) {
-	t.Setenv("DATABASE_URL", "postgres://localhost/test")
-	t.Setenv("MQTT_BROKER_URL", "tcp://localhost:1883")
-	t.Setenv("AUTH_TOKEN", "my-explicit-token")
-
-	cfg, err := Load(Overrides{EnvFile: "nonexistent.env"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.AuthToken != "my-explicit-token" {
-		t.Errorf("expected AuthToken %q, got %q", "my-explicit-token", cfg.AuthToken)
-	}
-	if cfg.AuthTokenGenerated {
-		t.Error("expected AuthTokenGenerated=false for explicit token")
 	}
 }
 

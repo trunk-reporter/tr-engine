@@ -10,22 +10,28 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/snarg/tr-engine/internal/api"
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/metrics"
 )
 
 // EventBus provides pub-sub event distribution for SSE subscribers.
 // It maintains a ring buffer for replay on reconnect.
+//
+// One mutex covers the ring, the sequence counter and the subscriber set:
+// Publish holds it while it numbers an event, adds it to the ring and
+// distributes it, and SubscribeSince holds it while it snapshots the ring and
+// registers, so an event is either replayed to a new subscriber or sent to it
+// live, never both and never neither (§7.3).
 type EventBus struct {
 	mu          sync.RWMutex
-	subscribers map[uint64]subscriber
+	subscribers map[uint64]*subscriber
 	nextID      uint64
-	seq         atomic.Uint64
+	seq         uint64 // last published sequence number
 
 	// Ring buffer for replay (60s of events)
 	ring     []api.SSEEvent
 	ringSize int
 	ringHead int
-	ringMu   sync.RWMutex
 
 	log zerolog.Logger
 }
@@ -33,80 +39,104 @@ type EventBus struct {
 type subscriber struct {
 	ch     chan api.SSEEvent
 	filter api.EventFilter
+	// principal is who the subscriber acts as, kept apart from the client's
+	// filter; the stream re-check swaps it (§7.5).
+	principal *atomic.Pointer[auth.Principal]
+	// afterSeq is the last sequence number published before the subscriber
+	// registered, at or above the highest replayed one: only later events
+	// are sent live.
+	afterSeq uint64
 }
 
 // NewEventBus creates an event bus with the given ring buffer size.
 func NewEventBus(log zerolog.Logger, ringSize int) *EventBus {
 	return &EventBus{
-		subscribers: make(map[uint64]subscriber),
+		subscribers: make(map[uint64]*subscriber),
 		ring:        make([]api.SSEEvent, ringSize),
 		ringSize:    ringSize,
 		log:         log,
 	}
 }
 
-// Subscribe registers a new subscriber and returns a channel and cancel function.
-// When ctx is cancelled, the subscriber is automatically removed and the channel
-// is closed, preventing goroutine leaks if cancel is not called explicitly.
-func (eb *EventBus) Subscribe(filter api.EventFilter) (<-chan api.SSEEvent, func()) {
+// subscriberBuffer is the minimum channel buffer of a subscriber.
+const subscriberBuffer = 64
+
+// SubscribeSince registers a subscriber that receives the events principal
+// may see (api.SSEEventAllowed) and that match filter. principal is read for
+// every event, so the caller can swap it; a nil principal (or a nil pointer
+// in it) receives nothing.
+//
+// With a non-empty lastEventID it also returns the buffered events after
+// that ID that pass the same checks. If the ID is no longer buffered (the
+// ring wrapped, or the server restarted), every buffered event is returned
+// rather than none, so the client doesn't silently miss everything. The
+// snapshot and the registration happen under the lock Publish holds, and
+// live events are only those numbered after the last replayed one.
+//
+// The channel's buffer is max(64, len(replay)+64). cancel unsubscribes and
+// closes the channel; it may be called more than once.
+func (eb *EventBus) SubscribeSince(lastEventID string, filter api.EventFilter, principal *atomic.Pointer[auth.Principal]) ([]api.SSEEvent, <-chan api.SSEEvent, func()) {
+	if principal == nil {
+		principal = new(atomic.Pointer[auth.Principal]) // holds nil: nothing passes
+	}
+
 	eb.mu.Lock()
+	var replay []api.SSEEvent
+	if lastEventID != "" {
+		replay = eb.replayLocked(lastEventID, filter, principal.Load())
+	}
+	sub := &subscriber{
+		ch:        make(chan api.SSEEvent, max(subscriberBuffer, len(replay)+subscriberBuffer)),
+		filter:    filter,
+		principal: principal,
+		// Everything numbered so far is in the ring (and so replayable) or
+		// gone; only later events go out live.
+		afterSeq: eb.seq,
+	}
 	id := eb.nextID
 	eb.nextID++
-	ch := make(chan api.SSEEvent, 64)
-	eb.subscribers[id] = subscriber{ch: ch, filter: filter}
+	eb.subscribers[id] = sub
 	eb.mu.Unlock()
 
 	var once sync.Once
-	cleanup := func() {
+	cancel := func() {
 		once.Do(func() {
 			eb.mu.Lock()
 			delete(eb.subscribers, id)
-			close(ch)
+			close(sub.ch)
 			eb.mu.Unlock()
 		})
 	}
-	return ch, cleanup
+	return replay, sub.ch, cancel
 }
 
-// ReplaySince returns buffered events since the given event ID.
-// If lastEventID has been overwritten (ring buffer wrapped), all available events
-// are returned so the client doesn't silently miss everything.
-func (eb *EventBus) ReplaySince(lastEventID string, filter api.EventFilter) []api.SSEEvent {
-	eb.ringMu.RLock()
-	defer eb.ringMu.RUnlock()
+// replayLocked returns the buffered events after lastEventID, oldest first,
+// that p may see and that match filter; every buffered event if lastEventID
+// is not in the ring. eb.mu must be held.
+func (eb *EventBus) replayLocked(lastEventID string, filter api.EventFilter, p *auth.Principal) []api.SSEEvent {
+	found := false
+	for i := 0; i < eb.ringSize; i++ {
+		if eb.ring[(eb.ringHead+i)%eb.ringSize].ID == lastEventID {
+			found = true
+			break
+		}
+	}
 
 	var events []api.SSEEvent
-	found := lastEventID == ""
-
+	after := !found // not buffered: replay everything
 	for i := 0; i < eb.ringSize; i++ {
-		idx := (eb.ringHead + i) % eb.ringSize
-		e := eb.ring[idx]
+		e := eb.ring[(eb.ringHead+i)%eb.ringSize]
 		if e.ID == "" {
 			continue
 		}
-		if !found {
-			if e.ID == lastEventID {
-				found = true
-			}
+		if !after {
+			after = e.ID == lastEventID
 			continue
 		}
-		if matchesFilter(e, filter) {
+		if matchesFilter(e, filter, p) {
 			events = append(events, e)
 		}
 	}
-
-	// If the lastEventID was not found (overwritten by ring wrap), replay all
-	// available events rather than returning nothing.
-	if !found && lastEventID != "" {
-		for i := 0; i < eb.ringSize; i++ {
-			idx := (eb.ringHead + i) % eb.ringSize
-			e := eb.ring[idx]
-			if e.ID != "" && matchesFilter(e, filter) {
-				events = append(events, e)
-			}
-		}
-	}
-
 	return events
 }
 
@@ -133,44 +163,49 @@ func (eb *EventBus) Publish(e EventData) {
 
 	metrics.SSEEventsPublishedTotal.Inc()
 
-	seq := eb.seq.Add(1)
+	// Numbering, the ring and distribution happen under one lock, so ring
+	// order is sequence order and SubscribeSince sees a consistent cut.
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+
+	eb.seq++
+	seq := eb.seq
+	now := time.Now()
 	event := api.SSEEvent{
-		ID:        fmt.Sprintf("%d-%d", time.Now().UnixMilli(), seq),
+		ID:        fmt.Sprintf("%d-%d", now.UnixMilli(), seq),
 		Type:      e.Type,
 		SubType:   e.SubType,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Timestamp: now.UTC().Format(time.RFC3339),
 		SystemID:  e.SystemID,
 		SiteID:    e.SiteID,
 		Tgid:      e.Tgid,
 		UnitID:    e.UnitID,
 		Emergency: e.Emergency,
 		Data:      data,
+		Seq:       seq,
 	}
 
 	// Add to ring buffer
-	eb.ringMu.Lock()
 	if eb.ring[eb.ringHead].ID != "" {
 		metrics.SSEEventsDroppedTotal.WithLabelValues("ring_eviction").Inc()
 		eb.log.Warn().Str("evicted_id", eb.ring[eb.ringHead].ID).Str("event_type", e.Type).Msg("sse: ring buffer eviction — event lost from replay")
 	}
 	eb.ring[eb.ringHead] = event
 	eb.ringHead = (eb.ringHead + 1) % eb.ringSize
-	eb.ringMu.Unlock()
 
 	// Distribute to subscribers
-	eb.mu.RLock()
 	for _, sub := range eb.subscribers {
-		if matchesFilter(event, sub.filter) {
-			select {
-			case sub.ch <- event:
-			default:
-				// Drop if subscriber is slow
-				metrics.SSEEventsDroppedTotal.WithLabelValues("slow_subscriber").Inc()
-				eb.log.Warn().Str("event_type", e.Type).Str("event_id", event.ID).Int("subscriber_count", len(eb.subscribers)).Msg("sse: dropped event for slow subscriber")
-			}
+		if seq <= sub.afterSeq || !matchesFilter(event, sub.filter, sub.principal.Load()) {
+			continue
+		}
+		select {
+		case sub.ch <- event:
+		default:
+			// Drop if subscriber is slow
+			metrics.SSEEventsDroppedTotal.WithLabelValues("slow_subscriber").Inc()
+			eb.log.Warn().Str("event_type", e.Type).Str("event_id", event.ID).Int("subscriber_count", len(eb.subscribers)).Msg("sse: dropped event for slow subscriber")
 		}
 	}
-	eb.mu.RUnlock()
 }
 
 // SubscriberCount returns the current number of SSE subscribers.
@@ -181,7 +216,16 @@ func (eb *EventBus) SubscriberCount() int {
 	return n
 }
 
-func matchesFilter(e api.SSEEvent, f api.EventFilter) bool {
+// matchesFilter reports whether a subscriber acting as p, with the client
+// filter f, gets event e. The principal's per-type access comes first
+// (api.SSEEventAllowed, §7.3): it needs the type's scope, and a restricted p
+// gets only talkgroup-scoped types for non-zero systems and talkgroups its
+// restrictions allow. Only then do the client's filters apply, in which a
+// zero-valued event field passes that dimension.
+func matchesFilter(e api.SSEEvent, f api.EventFilter, p *auth.Principal) bool {
+	if !api.SSEEventAllowed(p, e.Type, e.SystemID, e.Tgid) {
+		return false
+	}
 	if f.EmergencyOnly && !e.Emergency {
 		return false
 	}

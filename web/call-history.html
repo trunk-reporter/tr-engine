@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="auth.js?v=1"></script>
+<script src="auth.js?v=3"></script>
 <meta name="card-title" content="Call History">
 <meta name="card-description" content="Searchable call log with audio playback">
 <meta name="card-order" content="6">
@@ -1115,11 +1115,27 @@
       return;
     }
     currentAudioId = callId;
-    var authToken = window.trAuth && window.trAuth.getToken();
-    audioEl.src = authToken ? url + '?token=' + encodeURIComponent(authToken) : url;
-    audioEl.play();
+    // <audio> can't send headers: same-origin URLs get a ticket (never cross-origin ones)
+    audioRetry = { callId: callId, url: url, done: false };
+    audioEl.src = trAuth.mediaUrl(url);
+    audioEl.play().catch(function() {});  // load failures are handled by the error listener
     setPlayingState(callId, true);
   }
+
+  // A missing or expired ticket fails the load: retry once with a fresh one.
+  var audioRetry = { callId: null, url: '', done: true };
+  audioEl.addEventListener('error', function() {
+    if (audioRetry.done || audioRetry.callId == null || audioRetry.callId !== currentAudioId) return;
+    audioRetry.done = true;
+    var callId = audioRetry.callId;
+    var pos = audioEl.currentTime;
+    trAuth.ticketUrl(audioRetry.url, { fresh: true }).then(function(u) {
+      if (currentAudioId !== callId) return;
+      audioEl.src = u;
+      if (pos) audioEl.currentTime = pos;
+      audioEl.play().catch(function() {});
+    });
+  });
 
   function stopAudio() {
     if (currentAudioId) setPlayingState(currentAudioId, false);

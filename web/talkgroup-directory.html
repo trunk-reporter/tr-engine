@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="auth.js?v=1"></script>
+<script src="auth.js?v=3"></script>
 <meta name="card-title" content="Talkgroup Directory">
 <meta name="card-description" content="Browse and import talkgroup reference data from CSV">
 <meta name="card-order" content="5">
@@ -401,13 +401,13 @@ function renderTable(rows) {
 
   tbody.innerHTML = rows.map(r => `
     <tr>
-      <td class="tgid">${r.tgid}</td>
+      <td class="tgid">${esc(r.tgid)}</td>
       <td class="alpha">${esc(r.alpha_tag || '')}</td>
       <td>${modeBadge(r.mode)}</td>
       <td class="desc-text">${esc(r.description || '')}</td>
       <td class="tag-text">${esc(r.tag || '')}</td>
       <td class="cat-text">${esc(r.category || '')}</td>
-      <td class="priority-text">${r.priority != null ? r.priority : ''}</td>
+      <td class="priority-text">${r.priority != null ? esc(r.priority) : ''}</td>
       <td class="sys-name">${esc(r.system_name || String(r.system_id))}</td>
     </tr>
   `).join('');
@@ -428,14 +428,12 @@ function renderPagination() {
 
 function modeBadge(mode) {
   if (!mode) return '';
-  const cls = mode.charAt(0).toLowerCase();
-  return `<span class="mode-badge ${cls}">${esc(mode)}</span>`;
+  const cls = String(mode).charAt(0).toLowerCase();
+  return `<span class="mode-badge ${esc(cls)}">${esc(mode)}</span>`;
 }
 
 function esc(s) {
-  const el = document.createElement('span');
-  el.textContent = s;
-  return el.innerHTML;
+  return trAuth.escapeHTML(s);
 }
 
 function updateCategoryFilter() {
@@ -530,13 +528,24 @@ importBtn.addEventListener('click', async () => {
     const form = new FormData();
     form.append('file', file);
 
+    // CSV imports need the admin scope. Use the admin key the Admin page
+    // keeps for this tab, if any; otherwise auth.js sends the stored key.
+    const headers = {};
+    let adminKey = '';
+    try { adminKey = sessionStorage.getItem('tr-engine-admin-key') || ''; } catch (e) { /* storage blocked */ }
+    if (adminKey) headers['Authorization'] = 'Bearer ' + adminKey;
+
     const res = await fetch(`${API}/talkgroup-directory/import?${params}`, {
       method: 'POST',
+      headers,
       body: form,
     });
 
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
+      if (res.status === 401 || res.status === 403) {
+        throw new Error((data.error || `HTTP ${res.status}`) + ' (imports need an admin key; connect on the Admin page in this tab first)');
+      }
       throw new Error(data.error || `HTTP ${res.status}`);
     }
 

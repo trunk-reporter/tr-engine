@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/snarg/tr-engine/internal/api"
 	"github.com/snarg/tr-engine/internal/audio"
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/database"
 	"github.com/snarg/tr-engine/internal/metrics"
 	"github.com/snarg/tr-engine/internal/storage"
@@ -113,6 +114,7 @@ type retentionConfig struct {
 	TrunkingMessages time.Duration
 	Checkpoints      time.Duration
 	StaleCalls       time.Duration
+	AuditLog         time.Duration
 }
 
 // retentionSource tracks where each retention setting originates.
@@ -123,6 +125,7 @@ type retentionSource struct {
 	TrunkingMessages string
 	Checkpoints      string
 	StaleCalls       string
+	AuditLog         string
 }
 
 func (s retentionSource) locked(key string) bool {
@@ -139,6 +142,8 @@ func (s retentionSource) locked(key string) bool {
 		return s.Checkpoints == "env"
 	case "retention_stale_calls":
 		return s.StaleCalls == "env"
+	case "retention_audit_log":
+		return s.AuditLog == "env"
 	}
 	return false
 }
@@ -151,6 +156,7 @@ var retentionKeyDefaults = map[string]time.Duration{
 	"retention_trunking_messages": 720 * time.Hour,
 	"retention_checkpoints":       168 * time.Hour,
 	"retention_stale_calls":       time.Hour,
+	"retention_audit_log":         8760 * time.Hour,
 }
 
 // bufferedMsg holds a message deferred during warmup.
@@ -181,6 +187,7 @@ type PipelineOptions struct {
 	RetentionTrunkingMessages time.Duration
 	RetentionCheckpoints     time.Duration
 	RetentionStaleCalls      time.Duration
+	RetentionAuditLog        time.Duration
 	// Live audio streaming
 	StreamListen      string
 	StreamInstanceID  string // TR instance ID for simplestream identity resolution
@@ -283,6 +290,7 @@ func NewPipeline(opts PipelineOptions) *Pipeline {
 			TrunkingMessages: opts.RetentionTrunkingMessages,
 			Checkpoints:      opts.RetentionCheckpoints,
 			StaleCalls:       opts.RetentionStaleCalls,
+			AuditLog:         opts.RetentionAuditLog,
 		},
 		retentionSources: retentionSource{
 			RawMessages:      detectRetentionSource("RETENTION_RAW_MESSAGES"),
@@ -291,6 +299,7 @@ func NewPipeline(opts PipelineOptions) *Pipeline {
 			TrunkingMessages: detectRetentionSource("RETENTION_TRUNKING_MESSAGES"),
 			Checkpoints:      detectRetentionSource("RETENTION_CHECKPOINTS"),
 			StaleCalls:       detectRetentionSource("RETENTION_STALE_CALLS"),
+			AuditLog:         detectRetentionSource("RETENTION_AUDIT_LOG"),
 		},
 		activeCalls:  newActiveCallMap(),
 		affiliations: newAffiliationMap(),
@@ -402,6 +411,8 @@ func (p *Pipeline) loadRetentionOverrides(ctx context.Context) {
 			p.retentionSources.Checkpoints = "db"
 		case "retention_stale_calls":
 			p.retentionSources.StaleCalls = "db"
+		case "retention_audit_log":
+			p.retentionSources.AuditLog = "db"
 		}
 	}
 }
@@ -445,6 +456,8 @@ func (p *Pipeline) setRetentionValue(key string, d time.Duration) {
 		p.retentionCfg.Checkpoints = d
 	case "retention_stale_calls":
 		p.retentionCfg.StaleCalls = d
+	case "retention_audit_log":
+		p.retentionCfg.AuditLog = d
 	}
 }
 
@@ -564,14 +577,15 @@ func (p *Pipeline) TranscriptionQueueStats() *api.TranscriptionQueueStatsData {
 	return result
 }
 
-// SubscribeAudio subscribes to live audio frames matching the filter.
-func (p *Pipeline) SubscribeAudio(filter audio.AudioFilter) (<-chan audio.AudioFrame, func()) {
+// SubscribeAudio subscribes to the live audio frames principal may hear
+// that match the filter.
+func (p *Pipeline) SubscribeAudio(filter audio.AudioFilter, principal *atomic.Pointer[auth.Principal]) (<-chan audio.AudioFrame, func()) {
 	if p.audioBus == nil {
 		ch := make(chan audio.AudioFrame)
 		close(ch)
 		return ch, func() {}
 	}
-	return p.audioBus.Subscribe(filter)
+	return p.audioBus.Subscribe(filter, principal)
 }
 
 // UpdateAudioFilter changes the filter for an existing audio subscriber.
@@ -945,6 +959,17 @@ func (p *Pipeline) runMaintenanceWithResult() (*api.MaintenanceRunData, error) {
 		}
 	}
 
+	// Audit log (RETENTION_AUDIT_LOG). Its purge refuses a retention that is
+	// not positive instead of emptying the log.
+	if n, err := p.db.PurgeAuditLogOlderThan(ctx, p.retentionCfg.AuditLog); err != nil {
+		log.Warn().Err(err).Str("table", "audit_log").Msg("purge failed")
+	} else {
+		if n > 0 {
+			log.Info().Str("table", "audit_log").Int64("deleted", n).Msg("purged old rows")
+		}
+		result.Purged["audit_log"] = n
+	}
+
 	// 5. Drop old weekly partitions (raw MQTT)
 	dropped, err := p.db.DropOldWeeklyPartitions(ctx, "mqtt_raw_messages", p.retentionCfg.RawMessages)
 	if err != nil {
@@ -1016,6 +1041,9 @@ func (p *Pipeline) MaintenanceStatus() *api.MaintenanceStatusData {
 			RetentionStaleCalls:                 p.retentionCfg.StaleCalls.String(),
 			RetentionStaleCallsSource:           p.retentionSources.StaleCalls,
 			RetentionStaleCallsLocked:           p.retentionSources.locked("retention_stale_calls"),
+			RetentionAuditLog:                   p.retentionCfg.AuditLog.String(),
+			RetentionAuditLogSource:             p.retentionSources.AuditLog,
+			RetentionAuditLogLocked:             p.retentionSources.locked("retention_audit_log"),
 			Schedule:                            "every 24h",
 		},
 		LastRun: p.lastMaintenance.Load(),
@@ -1495,6 +1523,7 @@ var retentionKeyToEnv = map[string]string{
 	"retention_trunking_messages": "RETENTION_TRUNKING_MESSAGES",
 	"retention_checkpoints":       "RETENTION_CHECKPOINTS",
 	"retention_stale_calls":       "RETENTION_STALE_CALLS",
+	"retention_audit_log":         "RETENTION_AUDIT_LOG",
 }
 
 // parseHandlerSet splits a comma-separated string into a set of handler names.
@@ -1733,9 +1762,10 @@ func (p *Pipeline) ActiveCalls() []api.ActiveCallData {
 	return calls
 }
 
-// LatestRecorders returns the most recent recorder state snapshot.
+// LatestRecorders returns the most recent recorder state snapshot, never nil
+// (GET /recorders answers [] rather than null).
 func (p *Pipeline) LatestRecorders() []api.RecorderStateData {
-	var recorders []api.RecorderStateData
+	recorders := []api.RecorderStateData{}
 	p.recorderCache.Range(func(key, value any) bool {
 		if r, ok := value.(api.RecorderStateData); ok {
 			recorders = append(recorders, r)
@@ -1745,14 +1775,10 @@ func (p *Pipeline) LatestRecorders() []api.RecorderStateData {
 	return recorders
 }
 
-// Subscribe registers a new SSE subscriber with the given filter.
-func (p *Pipeline) Subscribe(filter api.EventFilter) (<-chan api.SSEEvent, func()) {
-	return p.eventBus.Subscribe(filter)
-}
-
-// ReplaySince returns buffered events since the given event ID.
-func (p *Pipeline) ReplaySince(lastEventID string, filter api.EventFilter) []api.SSEEvent {
-	return p.eventBus.ReplaySince(lastEventID, filter)
+// SubscribeSince registers an SSE subscriber acting as principal, with the
+// buffered events after lastEventID it may see (EventBus.SubscribeSince).
+func (p *Pipeline) SubscribeSince(lastEventID string, filter api.EventFilter, principal *atomic.Pointer[auth.Principal]) ([]api.SSEEvent, <-chan api.SSEEvent, func()) {
+	return p.eventBus.SubscribeSince(lastEventID, filter, principal)
 }
 
 // RewriteSystemID updates the identity cache after a system merge,

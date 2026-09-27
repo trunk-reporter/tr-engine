@@ -25,6 +25,10 @@
 #   docker run --rm -e MQTT_USERNAME -e MQTT_PASSWORD -v "$PWD/mosquitto:/mosquitto/config" \
 #     eclipse-mosquitto:2 sh -c 'mosquitto_passwd -c -b /mosquitto/config/passwd "$MQTT_USERNAME" "$MQTT_PASSWORD" && chown mosquitto:mosquitto /mosquitto/config/passwd'
 #   docker compose up -d
+#   # tr-engine prints an admin API key once on first start:
+#   docker compose logs tr-engine | grep -A3 "no admin API key"
+#   # manage keys and anonymous access (docs/auth.md):
+#   docker compose exec -T tr-engine tr-engine keys --help
 ###############################################################################
 
 services:
@@ -95,9 +99,14 @@ services:
 
   tr-dashboard:
     image: ghcr.io/trunk-reporter/tr-dashboard:latest
-    environment:
-      TR_ENGINE_URL: http://tr-engine:8080
-      TR_AUTH_TOKEN: ${AUTH_TOKEN:-}
+    # Static app on :3000. It calls /api/v1 on its own origin, so the Caddyfile
+    # routes /api/* on the dashboard domain to tr-engine. To call tr-engine on
+    # another origin instead, set VITE_API_BASE (tr-engine allows any origin).
+    # Never inject an API key here or in the proxy: a key that reaches
+    # visitors' browsers is public. Users paste their own key in the dashboard;
+    # anonymous visitors get whatever the anonymous access policy allows.
+    # environment:
+    #   VITE_API_BASE: https://api.example.com/api/v1
     depends_on:
       - tr-engine
     restart: unless-stopped

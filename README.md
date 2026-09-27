@@ -50,7 +50,7 @@ Run this from your trunk-recorder directory (requires [Docker](https://docs.dock
 curl -sL https://raw.githubusercontent.com/trunk-reporter/tr-engine/master/install.sh | sh
 ```
 
-That's it. Open http://localhost:8080 — call recordings will appear as trunk-recorder captures them.
+That's it. The installer prints your **admin API key** (store it); open http://localhost:8080, paste the key when asked, and call recordings will appear as trunk-recorder captures them.
 
 To remove: `cd tr-engine && docker compose down -v && cd .. && rm -rf tr-engine`
 
@@ -71,25 +71,29 @@ docker compose pull && docker compose up -d
 
 Database and audio files persist in Docker volumes across updates.
 
+> **API keys replace `AUTH_TOKEN` / `WRITE_TOKEN` / `ADMIN_PASSWORD` (v0.10.0).** Back up the database, upgrade tr-engine, tr-dashboard and any bind-mounted `web/` together, and follow the [auth migration guide](docs/migrating-auth.md). The first start imports what it safely can of the old settings.
+
 > **Security defaults changed.** The shipped compose files no longer have a default database password (`POSTGRES_PASSWORD` is required), never publish PostgreSQL, require a login for the bundled MQTT broker, and bind published ports to `127.0.0.1` unless you set `HTTP_BIND_IP` / `MQTT_BIND_IP` / `BIND_IP`. Installs created with the old default database password (`trengine`) must rotate it before switching to the new files — see [Security defaults changed](docs/docker.md#security-defaults-changed).
 
 ## Authentication
 
-tr-engine has three auth modes, determined by which environment variables you set:
+tr-engine authenticates **client software, not people**. Every client (a tr-dashboard deployment, a script, a trunk-recorder upload plugin, a website's backend) holds its own **API key** and sends it as `Authorization: Bearer tre_...`. There are no user accounts, logins or cookies.
 
-| Config | Mode | Behavior |
-|--------|------|----------|
-| Neither `AUTH_TOKEN` nor `ADMIN_PASSWORD` | **Open** | No auth — all endpoints accessible |
-| `AUTH_TOKEN` set | **Token** | Shared API token required for all access |
-| `ADMIN_PASSWORD` set | **Full** | JWT login with role-based access. Optional public read access via `AUTH_TOKEN`. |
+| Scope | Grants |
+|-------|--------|
+| `listen` | Read radio data, live events and audio |
+| `edit` | Also change talkgroup/unit tags, transcriptions and unit-tag suggestions |
+| `admin` | Everything: keys, anonymous access, merges, maintenance, SQL query, audit log |
+| `upload` | Call upload only (for trunk-recorder's upload plugins) |
 
-The `GET /api/v1/auth-init` endpoint returns the current auth mode so clients (tr-dashboard, web UI) can automatically detect what's needed — no proxy injection or manual config required.
+- **First run:** tr-engine prints an admin key once to its log. Create a named key per client with `tr-engine keys create` (in Docker: `docker compose exec -T tr-engine tr-engine keys ...`), or from tr-dashboard's Access page.
+- **Anonymous access** (no key) is a policy you set: `off` (the default) or `listen`, optionally restricted to some systems or talkgroups (`tr-engine access set --anonymous listen`). Anonymous visitors can never edit.
+- **Restrictions:** `listen` keys can be limited to some systems or talkgroups.
+- **Tickets:** browsers can't send headers on `EventSource`, `<audio>` and WebSocket, so clients mint short-lived listen-only tickets (`POST /api/v1/tickets`) for those URLs. Keys never go in URLs.
+- `GET /api/v1/whoami` tells any client what its credential can do.
+- **A key that reaches other people's browsers is public.** Use anonymous access for public listening; never inject keys with a reverse proxy.
 
-**For public-facing deployments:** Set both `AUTH_TOKEN` (public read access) and `ADMIN_PASSWORD` (admin login for writes). Put behind a reverse proxy with TLS.
-
-**For private/local use:** Set `AUTH_TOKEN` for basic protection, or leave both unset for open access.
-
-See **[Auth Migration Guide](docs/migrating-auth.md)** if upgrading from `WRITE_TOKEN`/`AUTH_ENABLED` (both deprecated).
+Operator and client-developer guide: **[docs/auth.md](docs/auth.md)**. Upgrading from `AUTH_TOKEN`/`WRITE_TOKEN`/`ADMIN_PASSWORD`: **[docs/migrating-auth.md](docs/migrating-auth.md)**.
 
 ## Configuration
 
@@ -121,10 +125,8 @@ The `.env` file is auto-loaded from the current directory on startup. See `sampl
 | `TR_DIR` | * | | Path to trunk-recorder directory for auto-discovery |
 | `MQTT_TOPICS` | No | `#` | MQTT topic filter (match your TR plugin prefix with `/#`) |
 | `HTTP_ADDR` | No | `:8080` | HTTP listen address |
-| `AUTH_TOKEN` | No | | Shared API token (token mode) or public read token (full mode) |
-| `ADMIN_PASSWORD` | No | | Enables JWT login, seeds admin user on first run |
-| `CORS_ORIGINS` | No | `*` | Comma-separated allowed CORS origins |
-| `RATE_LIMIT_RPS` | No | `20` | Per-IP rate limit (requests/second) |
+| `RATE_LIMIT_RPS` | No | `20` | Per-IP rate limit (requests/second) for requests without a key, with a ticket or with a legacy key |
+| `TRUSTED_PROXIES` | No | `loopback,private` | Reverse proxies whose `X-Forwarded-For` is believed |
 | `AUDIO_DIR` | No | `./audio` | Audio file storage directory |
 | `STT_PROVIDER` | No | `whisper` | Transcription provider: `whisper`, `elevenlabs`, `deepinfra`, `imbe` |
 | `STREAM_LISTEN` | No | | UDP listen address for live audio (e.g., `:9123`) |
@@ -132,7 +134,7 @@ The `.env` file is auto-loaded from the current directory on startup. See `sampl
 
 \* At least one of `MQTT_BROKER_URL`, `WATCH_DIR`, or `TR_DIR` must be set. All three can run simultaneously.
 
-See `sample.env` for the full list including MQTT credentials, HTTP timeouts, transcription tuning, S3 storage, and retention settings.
+See `sample.env` for the full list including MQTT credentials, HTTP timeouts, transcription tuning, S3 storage, and retention settings. Access control is not configured with environment variables: API keys and the anonymous access policy live in the database ([docs/auth.md](docs/auth.md)).
 
 ### Audio Modes
 
@@ -153,7 +155,7 @@ tr-engine supports four ingest modes that can run independently or simultaneousl
 - **MQTT** — subscribes to trunk-recorder's MQTT status plugin for real-time call events, unit activity, recorder state, decode rates, trunking messages, and console logs. The richest data source.
 - **File Watch** (`WATCH_DIR`) — monitors trunk-recorder's audio output directory for new `.json` metadata files. Only produces `call_end` events. Backfills existing files on startup (`WATCH_BACKFILL_DAYS`).
 - **TR Auto-Discovery** (`TR_DIR`) — the simplest setup. Point at trunk-recorder's directory. Auto-discovers capture directory, system names, imports talkgroup and unit CSVs. With `CSV_WRITEBACK=true`, alpha_tag edits are written back to the CSV files.
-- **HTTP Upload** (`POST /api/v1/call-upload`) — accepts multipart uploads compatible with trunk-recorder's rdio-scanner and OpenMHz upload plugins. No local audio capture or MQTT broker required. Authenticates via API key (`tre_` prefix), bearer token, or form field key.
+- **HTTP Upload** (`POST /api/v1/call-upload`) — accepts multipart uploads compatible with trunk-recorder's rdio-scanner and OpenMHz upload plugins. No local audio capture or MQTT broker required. Authenticates with an API key that has the `upload` scope, sent in the plugin's `apiKey` (form field `key`/`api_key`) or as a Bearer header.
 
 ### Auto-Discovery
 
@@ -229,8 +231,12 @@ Before marking implementation work complete, follow the testing, API contract, a
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /health` | Service health, TR instance status, version |
-| `GET /auth-init` | Auth mode discovery (open/token/full) |
+| `GET /health` | Service health (public); TR instance status with a key |
+| `GET /whoami` | What the caller's credential can do (public) |
+| `GET/POST /keys`, `PATCH/DELETE /keys/{id}` | API key management (admin) |
+| `GET/PUT /anonymous-access` | Anonymous access policy (admin) |
+| `POST /tickets` | Short-lived listen-only ticket for `EventSource`/`<audio>`/WebSocket URLs |
+| `GET /admin/audit-log` | Changes made with API keys (admin) |
 | `GET /systems` | List radio systems |
 | `GET /talkgroups` | List talkgroups (filterable, sortable) |
 | `GET /units` | List radio units |
@@ -249,9 +255,11 @@ Before marking implementation work complete, follow the testing, API contract, a
 | `GET /stats` | System statistics |
 | `GET /talkgroup-directory` | Talkgroup reference directory |
 | `POST /call-upload` | Upload call recording (rdio-scanner/OpenMHz) |
-| `POST /query` | Ad-hoc read-only SQL queries |
-| `POST /admin/systems/merge` | Merge duplicate systems |
-| `POST /debug-report` | Submit diagnostic report |
+| `POST /query` | Ad-hoc read-only SQL queries (admin) |
+| `POST /admin/systems/merge` | Merge duplicate systems (admin) |
+| `POST /debug-report` | Submit diagnostic report (admin) |
+
+Every operation in `openapi.yaml` carries `x-scope` (`public`, `listen`, `edit`, `admin`, `upload`) and `x-restricted` (`enforced`, `deny`), so clients can tell what a key may call without hard-coding it.
 
 ## Web UI
 
@@ -272,15 +280,15 @@ tr-engine ships with built-in dashboards at `http://localhost:8080`. The index p
 | **Systems Overview** | System and site health dashboard |
 | **Signal Flow** | Stream graph of talkgroup activity over time (D3.js) |
 | **Analytics** | System-wide statistics and trends |
-| **Admin** | User management, API keys, maintenance controls |
+| **Admin** | API keys, anonymous access, audit log, maintenance controls (admin key) |
 | **API Docs** | Interactive Swagger UI for the REST API |
 | **Page Builder** | Generate custom dashboard pages with AI assistance |
 
-Pages are plain HTML with no build step. Add new pages by dropping an `.html` file in `web/` with a `<meta name="card-title">` tag — see [CLAUDE.md](CLAUDE.md#web-frontend-page-registration) for the spec.
+Pages are plain HTML with no build step. They ask for an API key when they need one (a `listen` or `edit` key; the "API key…" menu item changes it) and work without one when anonymous access is on. Add new pages by dropping an `.html` file in `web/` with a `<meta name="card-title">` tag — see [CLAUDE.md](CLAUDE.md#web-frontend-page-registration) for the spec.
 
 ### tr-dashboard
 
-For a full-featured React dashboard with talkgroup favorites, call playback, unit investigation, and live audio, see **[tr-dashboard](https://github.com/trunk-reporter/tr-dashboard)**. It connects to tr-engine's API and auto-detects auth mode via `/api/v1/auth-init`.
+For a full-featured React dashboard with talkgroup favorites, call playback, unit investigation, and live audio, see **[tr-dashboard](https://github.com/trunk-reporter/tr-dashboard)**. It connects to tr-engine's API with an API key you paste in (or anonymously, when the anonymous access policy allows it) and asks `/api/v1/whoami` what it may do.
 
 ## Storage Estimates
 
@@ -299,6 +307,7 @@ High-volume tables (calls, unit_events, trunking_messages) are automatically par
 ```
 cmd/tr-engine/main.go           Entry point with CLI flag parsing
 internal/
+  auth/                         Scopes, restrictions, principals, tickets (no tr-engine deps)
   config/config.go              .env + env var + CLI config loading
   database/                     PostgreSQL connection pool + query files
   mqttclient/client.go          MQTT client with auto-reconnect
@@ -319,7 +328,8 @@ internal/
     discover.go                 TR auto-discovery orchestrator
   api/
     server.go                   Chi router + HTTP server
-    middleware.go               Auth, rate limiting, CORS, body limits
+    policy.go                   Route policy table (scope, restrictions, tickets) + SSE per-type scopes
+    middleware.go               Auth pipeline, rate limiting, CORS, body limits
     events.go                   SSE event stream endpoint
     audio_stream.go             WebSocket live audio endpoint
     *.go                        Handler files for each resource

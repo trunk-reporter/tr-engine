@@ -8,14 +8,13 @@ tr-engine can ingest calls via HTTP upload, compatible with trunk-recorder's **r
 
 ## Quick Setup
 
-1. Create an upload credential in tr-engine.
-
-   Recommended for new installs: enable full auth with an admin password, then create an API key from the admin UI or API. Use that API key as the upload plugin credential.
-
-   Legacy token mode is still supported. If you have not enabled full auth, set `AUTH_TOKEN` in your tr-engine `.env` and use that token:
+1. Create an API key with the `upload` scope, one per trunk-recorder host:
+   ```bash
+   tr-engine keys create --name "trunk-recorder butco uploads" --scopes upload
+   # Docker:
+   docker compose exec -T tr-engine tr-engine keys create --name "trunk-recorder butco uploads" --scopes upload
    ```
-   AUTH_TOKEN=your-secret-upload-token
-   ```
+   It prints the key (`tre_...`) once. You can also create it from tr-dashboard's Access page, `web/admin.html`, or `POST /api/v1/keys` with an admin key. See [auth.md](auth.md).
 
 2. Add the rdio-scanner plugin to your trunk-recorder `config.json`:
    ```json
@@ -26,7 +25,7 @@ tr-engine can ingest calls via HTTP upload, compatible with trunk-recorder's **r
      "systems": [
        {
          "shortName": "butco",
-         "apiKey": "your-secret-upload-token",
+         "apiKey": "tre_your-upload-key",
          "systemId": 1
        }
      ]
@@ -37,23 +36,19 @@ tr-engine can ingest calls via HTTP upload, compatible with trunk-recorder's **r
 
 ## Authentication
 
-The upload endpoint checks credentials in this order:
+Uploads need an API key with the **`upload`** scope. Nothing else can upload: anonymous access never allows it (whatever the anonymous access policy says), and `listen`, `edit` and `admin` keys without `upload` are refused with `403 insufficient_scope`.
 
-1. `Authorization: Bearer <token>` header
-2. `?token=<token>` query parameter
-3. `key` form field (rdio-scanner convention)
-4. `api_key` form field (OpenMHz convention)
+The endpoint reads the key from, in order:
 
-**Which credential to use:**
+1. the `Authorization: Bearer <key>` header;
+2. the `key` form field (rdio-scanner convention);
+3. the `api_key` form field (OpenMHz convention).
 
-| Auth mode | Upload authenticates with | Web UI / read API uses |
-|-----------|--------------------------|------------------------|
-| Open mode | No credential required | No credential required |
-| Token mode | `AUTH_TOKEN` | `AUTH_TOKEN` entered by the user |
-| Full mode | API key (`tre_...`) or `WRITE_TOKEN` — never the public read `AUTH_TOKEN` | Public read token or JWT session |
-| Legacy write-token mode | `WRITE_TOKEN` | `AUTH_TOKEN` |
+Form fields are read from the multipart body only, never from the URL query string. A field that holds an unknown, revoked or expired key is rejected with `401 invalid_key`; the other field is not tried.
 
-For new public-facing installs, prefer full mode: set `ADMIN_PASSWORD`, log in, and create a service API key for trunk-recorder uploads. `WRITE_TOKEN` remains accepted for backward compatibility, but it is deprecated.
+Give each trunk-recorder host its own `upload`-only key, so you can revoke one without touching the others, and so a leaked plugin config can't read or change anything. When an upload is rejected, tr-engine logs a WARN (at most once a minute per client IP) with the IP, the system name from the form, and the reason: no key, unknown key, or "key #N lacks upload".
+
+Upgrading from a version that used `AUTH_TOKEN` or `WRITE_TOKEN` for uploads? See [migrating-auth.md](migrating-auth.md#upload-plugins) for which old credentials still work.
 
 ## Choosing a Plugin
 
@@ -101,14 +96,14 @@ Add to the `plugins` array in trunk-recorder's `config.json`:
   "systems": [
     {
       "shortName": "butco",
-      "apiKey": "your-secret-upload-token",
+      "apiKey": "tre_your-upload-key",
       "systemId": 1
     }
   ]
 }
 ```
 
-The `shortName` must match the system's `shortName` in your trunk-recorder config. The `apiKey` is your tr-engine API key (`tre_...`) in full auth mode, or `AUTH_TOKEN` in token mode. The deprecated `WRITE_TOKEN` also works during the transition. The `systemId` is sent but not used by tr-engine — identity resolution uses `shortName` instead.
+The `shortName` must match the system's `shortName` in your trunk-recorder config. The `apiKey` is a tr-engine API key with the `upload` scope (`tre_...`). The `systemId` is sent but not used by tr-engine — identity resolution uses `shortName` instead.
 
 **Multiple systems:**
 
@@ -118,8 +113,8 @@ The `shortName` must match the system's `shortName` in your trunk-recorder confi
   "library": "librdioscanner_uploader.so",
   "server": "https://your-tr-engine.example.com/api/v1/call-upload",
   "systems": [
-    { "shortName": "butco", "apiKey": "your-secret-upload-token", "systemId": 1 },
-    { "shortName": "warco", "apiKey": "your-secret-upload-token", "systemId": 2 }
+    { "shortName": "butco", "apiKey": "tre_your-upload-key", "systemId": 1 },
+    { "shortName": "warco", "apiKey": "tre_your-upload-key", "systemId": 2 }
   ]
 }
 ```
@@ -143,7 +138,7 @@ And set the upload server and per-system API keys at the top level and system le
   "systems": [
     {
       "shortName": "butco",
-      "apiKey": "your-secret-upload-token",
+      "apiKey": "tre_your-upload-key",
       ...
     }
   ]
@@ -173,7 +168,7 @@ If you're already sending to OpenMHz/Broadcastify and want to add tr-engine, kee
       "library": "librdioscanner_uploader.so",
       "server": "https://your-tr-engine.example.com/api/v1/call-upload",
       "systems": [
-        { "shortName": "butco", "apiKey": "your-tr-engine-write-token", "systemId": 1 }
+        { "shortName": "butco", "apiKey": "tre_your-upload-key", "systemId": 1 }
       ]
     }
   ],
@@ -193,7 +188,7 @@ Each call is uploaded to both services independently. The `apiKey` in the `syste
 
 1. trunk-recorder finishes recording a call
 2. The upload plugin POSTs the audio file + metadata as a multipart form to `/api/v1/call-upload`
-3. tr-engine auto-detects the format, parses the metadata, and authenticates via the form `key`/`api_key` field
+3. tr-engine checks the key (`upload` scope), auto-detects the format and parses the metadata
 4. The call goes through the standard ingest pipeline: identity resolution (auto-creates systems/sites), dedup check, call record creation, audio file storage, source/frequency processing, unit upserts, SSE event publishing, and transcription enqueue
 5. Returns `201 Created` with the call ID, or `409 Conflict` if the call is a duplicate
 
@@ -203,7 +198,8 @@ Each call is uploaded to both services independently. The `apiKey` in the `syste
 |--------|---------|
 | `201 Created` | Call ingested successfully. Response body contains `call_id`, `system_id`, `tgid`, `start_time`. |
 | `400 Bad Request` | Invalid multipart form, unrecognized format, or missing required fields. |
-| `401 Unauthorized` | Missing or invalid auth token. |
+| `401 Unauthorized` | `key_required` (no key) or `invalid_key` (unknown, revoked or expired key). |
+| `403 Forbidden` | `insufficient_scope`: the key is valid but lacks the `upload` scope. |
 | `409 Conflict` | Duplicate call (same system, talkgroup, and start time within 5 seconds). |
 | `413 Request Too Large` | Upload exceeds the 50 MB limit. |
 
@@ -211,7 +207,6 @@ Each call is uploaded to both services independently. The `apiKey` in the `syste
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AUTH_TOKEN` | _(empty)_ | Shared token for token-mode deployments. In full mode, this can act as a public read token. |
-| `ADMIN_PASSWORD` | _(empty)_ | Enables full auth mode and JWT/API-key based write access. Recommended for public-facing deployments. |
-| `WRITE_TOKEN` | _(empty)_ | Deprecated legacy write token. Still accepted during the transition; prefer API keys. |
 | `UPLOAD_INSTANCE_ID` | `http-upload` | Instance ID assigned to uploaded calls for identity resolution. |
+
+Upload credentials are API keys, managed with `tr-engine keys` or the keys API, not environment variables.

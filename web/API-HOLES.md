@@ -146,14 +146,14 @@ const audioSrc = `${API_BASE}/calls/${callId}/audio`;
 
 ---
 
-### GAP 11: /query endpoint is behind auth
+### GAP 11: /query endpoint needs an admin key
 **Pages**: `stream-graph.html`, `signal-flow-data.js`
 
 ```js
-if (resp.status === 403) return { columns: [], rows: [] }; // /query disabled
+if (!trAuth.hasScope('admin')) return { columns: [], rows: [] }; // /query unavailable
 ```
 
-**Reason**: The `POST /query` endpoint requires admin/editor role (JWT or WRITE_TOKEN). Pages must handle 403 and fall back — but there's no alternative endpoint that provides the same functionality with read-only auth. The /query endpoint is gated behind writer permissions unnecessarily.
+**Reason**: `POST /query` needs the `admin` scope (401/403 otherwise). That is deliberate: raw SQL can read every table and can't honour a key's system/talkgroup restriction. Pages check `trAuth.hasScope('admin')` before calling it and degrade on 401/403, but there's no read-only endpoint that provides the same analytical data to `listen` keys or anonymous visitors.
 
 ---
 
@@ -199,8 +199,8 @@ GET /calls?limit=50&offset=0&q=dispatch&search_fields=transcription_text
 ### Priority 3: `POST /call-heatmap` with `tgid` filter + `GET /stats/talkgroup-activity?top=50`
 **Impact**: Pages want per-TG heatmaps and "top talkgroups" lists in a single response. Currently they make 3-4 calls.
 
-### Priority 4: Lower auth requirement on `POST /query`
-**Impact**: signal-flow-data.js (stream-graph.html) and any future analytical pages need read-only SQL access. The endpoint is currently gated behind write permissions. A `READ_QUERY` role or `?read_only=true` param would help.
+### Priority 4: Purpose-built analytics endpoints instead of `POST /query`
+**Impact**: signal-flow-data.js (stream-graph.html) and any future analytical pages need aggregate data that today only `/query` (admin) provides. `/query` stays admin-only (raw SQL can't enforce restrictions), so these pages need dedicated `listen` endpoints that apply the caller's restriction.
 
 ### Priority 5: Add `Range:` header support to audio endpoints
 **Impact**: Enables seeking in long recordings. Low-effort server change, high user-value.
@@ -215,7 +215,7 @@ The API already provides most of what's needed — these are mostly surface-leve
 - ✅ `/stats/call-heatmap` — good for day/hour patterns  
 - ✅ `/stats/daily-overview` — good for daily totals
 - ✅ `/stats/talkgroup-activity` — good for TG rankings
-- ✅ `/query` — powerful but behind auth gate
+- ✅ `/query` — powerful but admin-only
 - ✅ `/transcriptions/batch` — exists and works
 - ✅ `/unit-affiliations` — complete real-time snapshot
 - ✅ `/events/stream` — full-featured with filtering

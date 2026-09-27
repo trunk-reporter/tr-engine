@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/database/sqlcdb"
 )
 
@@ -522,20 +523,53 @@ func (db *DB) FindCallBySystemName(ctx context.Context, systemName string, tgid 
 	}, nil
 }
 
-// GetCallAudioPath returns the audio file path and call_filename for a call.
-// audio_file_path is the tr-engine managed path; call_filename is TR's original absolute path.
-func (db *DB) GetCallAudioPath(ctx context.Context, callID int64) (audioPath string, callFilename string, err error) {
-	row, err := db.Q.GetCallAudioPath(ctx, callID)
+// GetCallAccess returns the system and talkgroup of a call, so that a route
+// serving one call can check the caller's restriction before doing anything
+// else (§7.2). A call that doesn't exist is pgx.ErrNoRows. Like the other
+// single-call lookups it reads the newest row with that call_id.
+func (db *DB) GetCallAccess(ctx context.Context, callID int64) (systemID, tgid int, err error) {
+	err = db.Pool.QueryRow(ctx,
+		`SELECT system_id, tgid FROM calls WHERE call_id = $1 ORDER BY start_time DESC LIMIT 1`, callID,
+	).Scan(&systemID, &tgid)
+	if err != nil {
+		return 0, 0, err
+	}
+	return systemID, tgid, nil
+}
+
+// callColumn reads one column (a code constant) of the newest row with
+// callID, when p may see the call's talkgroup; a call outside p's restriction
+// is pgx.ErrNoRows, like one that doesn't exist (§6.3). The per-call routes
+// check GetCallAccess first; the clause here keeps these readers safe on their
+// own. A nil p is ErrNoPrincipal.
+func (db *DB) callColumn(ctx context.Context, p *auth.Principal, callID int64, column string, dest ...any) error {
+	restrict, restrictArgs, err := restrictSQL(p, "c.system_id", "c.tgid", 2)
+	if err != nil {
+		return err
+	}
+	return db.Pool.QueryRow(ctx,
+		`SELECT `+column+` FROM calls c WHERE c.call_id = $1`+restrict+` ORDER BY c.start_time DESC LIMIT 1`,
+		append([]any{callID}, restrictArgs...)...,
+	).Scan(dest...)
+}
+
+// GetCallAudioPath returns the audio file path and call_filename for a call
+// p may see. audio_file_path is the tr-engine managed path; call_filename is
+// TR's original absolute path.
+func (db *DB) GetCallAudioPath(ctx context.Context, p *auth.Principal, callID int64) (audioPath string, callFilename string, err error) {
+	err = db.callColumn(ctx, p, callID,
+		`COALESCE(c.audio_file_path, ''), COALESCE(c.call_filename, '')`, &audioPath, &callFilename)
 	if err != nil {
 		return "", "", err
 	}
-	return row.AudioFilePath, row.CallFilename, nil
+	return audioPath, callFilename, nil
 }
 
-// GetCallFrequencies returns frequency entries for a call by reading the freq_list JSONB column.
-func (db *DB) GetCallFrequencies(ctx context.Context, callID int64) ([]CallFrequencyAPI, error) {
-	raw, err := db.Q.GetCallFreqList(ctx, callID)
-	if err != nil {
+// GetCallFrequencies returns frequency entries for a call p may see by reading
+// the freq_list JSONB column.
+func (db *DB) GetCallFrequencies(ctx context.Context, p *auth.Principal, callID int64) ([]CallFrequencyAPI, error) {
+	var raw []byte
+	if err := db.callColumn(ctx, p, callID, "c.freq_list", &raw); err != nil {
 		return nil, err
 	}
 	if len(raw) == 0 || string(raw) == "null" {
@@ -552,10 +586,11 @@ func (db *DB) GetCallFrequencies(ctx context.Context, callID int64) ([]CallFrequ
 	return freqs, nil
 }
 
-// GetCallTransmissions returns transmission entries for a call by reading the src_list JSONB column.
-func (db *DB) GetCallTransmissions(ctx context.Context, callID int64) ([]CallTransmissionAPI, error) {
-	raw, err := db.Q.GetCallSrcList(ctx, callID)
-	if err != nil {
+// GetCallTransmissions returns transmission entries for a call p may see by
+// reading the src_list JSONB column.
+func (db *DB) GetCallTransmissions(ctx context.Context, p *auth.Principal, callID int64) ([]CallTransmissionAPI, error) {
+	var raw []byte
+	if err := db.callColumn(ctx, p, callID, "c.src_list", &raw); err != nil {
 		return nil, err
 	}
 	if len(raw) == 0 || string(raw) == "null" {

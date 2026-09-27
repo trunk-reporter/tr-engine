@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/database"
 )
 
@@ -38,7 +39,7 @@ func Export(ctx context.Context, db *database.DB, w io.Writer, opts ExportOption
 	defer tw.Close()
 
 	// Load all systems with sites
-	systems, err := db.ListSystemsWithSites(ctx)
+	systems, err := db.ListSystemsWithSites(ctx, auth.Internal)
 	if err != nil {
 		return fmt.Errorf("load systems: %w", err)
 	}

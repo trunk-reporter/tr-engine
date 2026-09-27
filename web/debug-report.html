@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="auth.js?v=1"></script>
+<script src="auth.js?v=3"></script>
 <!-- No card-title meta tag — this page is hidden from the nav dropdown -->
 <title>Debug Report — tr-engine</title>
 
@@ -323,14 +323,24 @@ async function sendReport() {
     clientData.problem = problem;
     clientData.additionalContext = additionalContext;
 
+    // Sending a report needs the admin scope. Use the admin key the Admin
+    // page keeps for this tab, if any; otherwise auth.js sends the stored key.
+    const headers = { 'Content-Type': 'application/json' };
+    let adminKey = '';
+    try { adminKey = sessionStorage.getItem('tr-engine-admin-key') || ''; } catch (e) { /* storage blocked */ }
+    if (adminKey) headers['Authorization'] = 'Bearer ' + adminKey;
+
     const resp = await fetch('/api/v1/debug-report', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(clientData)
     });
 
     if (!resp.ok) {
       const text = await resp.text();
+      if (resp.status === 401 || resp.status === 403) {
+        throw new Error('sending a debug report needs an admin key; connect on the Admin page in this tab first. ' + text);
+      }
       throw new Error(text || `HTTP ${resp.status}`);
     }
 

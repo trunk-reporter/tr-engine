@@ -11,9 +11,16 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-// WriteJSON writes a JSON response with the given status code.
+// wwwAuthenticate is sent with every 401 (§4.7).
+const wwwAuthenticate = `Bearer realm="tr-engine"`
+
+// WriteJSON writes a JSON response with the given status code. A 401 also
+// gets the WWW-Authenticate challenge.
 func WriteJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	if status == http.StatusUnauthorized {
+		w.Header().Set("WWW-Authenticate", wwwAuthenticate)
+	}
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
 }
@@ -37,6 +44,14 @@ const (
 	ErrAmbiguousID      ErrorCode = "ambiguous_id"
 	ErrDuplicate        ErrorCode = "duplicate"
 	ErrRequestTimeout   ErrorCode = "request_timeout"
+
+	// Auth codes (§4.7). The auth layer emits ErrForbidden only for a matched
+	// route without a policy.
+	ErrKeyRequired          ErrorCode = "key_required"          // 401: no credential, and anonymous access doesn't allow this
+	ErrInvalidKey           ErrorCode = "invalid_key"           // 401: unknown, revoked or expired key
+	ErrInvalidTicket        ErrorCode = "invalid_ticket"        // 401: bad, expired or orphaned ticket
+	ErrInsufficientScope    ErrorCode = "insufficient_scope"    // 403: the credential lacks the route's scope
+	ErrRestrictedCredential ErrorCode = "restricted_credential" // 403: restricted credential on a route that can't enforce it
 )
 
 // codeFromStatus returns a default error code for an HTTP status code.

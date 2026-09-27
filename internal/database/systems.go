@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/database/sqlcdb"
 )
 
@@ -144,6 +145,8 @@ const mergeTagSource = `CASE WHEN NULLIF($3, '') IS NULL THEN %[2]s.alpha_tag_so
 
 // MergeSystems moves all child records from sourceID to targetID and soft-deletes the source.
 // Talkgroup and unit tags are combined by alpha_tag_source priority (mergeSourceWins).
+// API key and anonymous-policy restrictions that name the source are rewritten to
+// the target in the same transaction, and the auth generation is bumped after commit.
 // Returns counts of moved records for the merge log.
 //
 // NOTE: UPDATE statements on partitioned tables (calls, unit_events, trunking_messages)
@@ -461,6 +464,12 @@ func (db *DB) MergeSystems(ctx context.Context, sourceID, targetID int, performe
 		return 0, 0, 0, 0, 0, 0, fmt.Errorf("soft-delete source: %w", err)
 	}
 
+	// Point API key and anonymous-policy restrictions at the target, so that
+	// allow lists keep their data and exclusions keep excluding (§3.2).
+	if _, _, err := rewriteRestrictionsForMerge(ctx, tx, sourceID, targetID); err != nil {
+		return 0, 0, 0, 0, 0, 0, fmt.Errorf("rewrite restrictions: %w", err)
+	}
+
 	// Log the merge
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO system_merge_log (source_id, target_id, calls_moved, talkgroups_moved, talkgroups_merged, units_moved, units_merged, events_moved, performed_by)
@@ -472,6 +481,9 @@ func (db *DB) MergeSystems(ctx context.Context, sourceID, targetID int, performe
 	if err := tx.Commit(ctx); err != nil {
 		return 0, 0, 0, 0, 0, 0, fmt.Errorf("commit merge: %w", err)
 	}
+	// Cached keys, the anonymous policy and open streams must see the
+	// rewritten restrictions.
+	auth.Bump()
 
 	return callsMoved, tgMoved, tgMerged, unitsMoved, unitsMerged, eventsMoved, nil
 }
@@ -486,8 +498,16 @@ type SystemAPI struct {
 	Sites      []SiteAPI `json:"sites"`
 }
 
-// GetSystemByID returns a single system with its sites.
-func (db *DB) GetSystemByID(ctx context.Context, systemID int) (*SystemAPI, error) {
+// GetSystemByID returns a single system with its sites. A system p may not
+// see is pgx.ErrNoRows, like one that doesn't exist (§6.3). A nil p is
+// ErrNoPrincipal.
+func (db *DB) GetSystemByID(ctx context.Context, p *auth.Principal, systemID int) (*SystemAPI, error) {
+	if p == nil {
+		return nil, ErrNoPrincipal
+	}
+	if !p.SystemVisible(systemID) {
+		return nil, pgx.ErrNoRows
+	}
 	row, err := db.Q.GetSystemByID(ctx, systemID)
 	if err != nil {
 		return nil, err
@@ -507,22 +527,29 @@ func (db *DB) GetSystemByID(ctx context.Context, systemID int) (*SystemAPI, erro
 	return s, nil
 }
 
-// ListSystemsWithSites returns all active systems with their sites.
-func (db *DB) ListSystemsWithSites(ctx context.Context) ([]SystemAPI, error) {
+// ListSystemsWithSites returns all active systems p may see with their sites
+// (§6.3). A nil p is ErrNoPrincipal.
+func (db *DB) ListSystemsWithSites(ctx context.Context, p *auth.Principal) ([]SystemAPI, error) {
+	if p == nil {
+		return nil, ErrNoPrincipal
+	}
 	sysRows, err := db.Q.ListActiveSystems(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	systems := make([]SystemAPI, len(sysRows))
-	for i, r := range sysRows {
-		systems[i] = SystemAPI{
+	systems := make([]SystemAPI, 0, len(sysRows))
+	for _, r := range sysRows {
+		if !p.SystemVisible(r.SystemID) {
+			continue
+		}
+		systems = append(systems, SystemAPI{
 			SystemID:   r.SystemID,
 			SystemType: r.SystemType,
 			Name:       r.Name,
 			Sysid:      r.Sysid,
 			Wacn:       r.Wacn,
-		}
+		})
 	}
 
 	// Load sites for each system

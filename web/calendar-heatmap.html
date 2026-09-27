@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <script src="auth.js?v=1"></script>
+  <script src="auth.js?v=3"></script>
   <meta name="card-title" content="Calendar Heatmap">
   <meta name="card-description" content="Daily call volume calendar heatmap">
   <meta name="card-order" content="25">
@@ -122,7 +122,7 @@
 
         renderChart(calendarData, range, maxCalls);
       } catch(e) {
-        el.innerHTML = '<span class="loading-text">Error: ' + e.message + '</span>';
+        el.innerHTML = '<span class="loading-text">Error: ' + trAuth.escapeHTML(e.message) + '</span>';
         el.classList.remove('loading');
         console.error('Calendar heatmap error:', e);
       }
@@ -139,7 +139,8 @@
       chartInstance.setOption({
         tooltip: {
           formatter: function(params) {
-            return params.name + '<br/>Calls: ' + params.value[1] + '<br/>Emergency: ' + params.value[2];
+            var esc = trAuth.escapeHTML;
+            return esc(params.name) + '<br/>Calls: ' + esc(params.value[1]) + '<br/>Emergency: ' + esc(params.value[2]);
           },
           backgroundColor: 'rgba(0,0,0,0.85)',
           borderColor: 'rgba(255,255,255,0.1)',

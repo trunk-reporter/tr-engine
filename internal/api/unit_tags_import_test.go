@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/rs/zerolog"
+	"github.com/snarg/tr-engine/internal/auth"
 	"github.com/snarg/tr-engine/internal/database"
 )
 
@@ -31,7 +33,7 @@ type mockUnitTagImporter struct {
 	imported   []importedUnitTag
 }
 
-func (m *mockUnitTagImporter) GetSystemByID(_ context.Context, systemID int) (*database.SystemAPI, error) {
+func (m *mockUnitTagImporter) GetSystemByID(_ context.Context, _ *auth.Principal, systemID int) (*database.SystemAPI, error) {
 	if !m.systems[systemID] {
 		return nil, errors.New("no rows in result set")
 	}
@@ -233,36 +235,43 @@ func TestImportUnitTags(t *testing.T) {
 	})
 }
 
-// TestImportUnitTags_RouteWriteProtected checks the route is registered on the
-// units router and sits behind WriteAuth like the talkgroup-directory import.
-func TestImportUnitTags_RouteWriteProtected(t *testing.T) {
+// TestImportUnitTags_RouteAdminOnly checks the route is registered on the
+// units router and needs admin (§6.3), like the talkgroup-directory import.
+func TestImportUnitTags_RouteAdminOnly(t *testing.T) {
 	mock := &mockUnitTagImporter{systems: map[int]bool{1: true}}
 	h := &UnitsHandler{tags: mock}
 
+	store := newStubAuthStore()
+	store.add("edit-key", database.APIKey{Scopes: auth.Scopes{auth.ScopeEdit}})
+	store.add("admin-key", database.APIKey{Scopes: auth.Scopes{auth.ScopeAdmin}})
+	a := newTestAuthenticator(store)
 	r := chi.NewRouter()
-	r.Use(WriteAuth("", "read-token", true)) // full mode: writes need editor+
-	h.Routes(r)
+	r.Use(Match(r, zerolog.Nop()), a.Resolve, a.Authorize)
+	h.Routes(prefixRouter{Router: r, prefix: apiPrefix})
 
-	send := func(req *http.Request) int {
+	send := func(key string) int {
+		body, ct := buildMultipartForm(t, nil, "file", []byte("1001,Engine 1\n"), "u.csv")
+		req := httptest.NewRequest("POST", "/api/v1/unit-tags/import?system_id=1", body)
+		req.Header.Set("Content-Type", ct)
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)
 		return rec.Code
 	}
-	newReq := func() *http.Request {
-		body, ct := buildMultipartForm(t, nil, "file", []byte("1001,Engine 1\n"), "u.csv")
-		req := httptest.NewRequest("POST", "/unit-tags/import?system_id=1", body)
-		req.Header.Set("Content-Type", ct)
-		return req
-	}
 
-	if code := send(setAuthContext(newReq(), 0, "", "viewer", "token")); code != http.StatusForbidden {
-		t.Errorf("viewer POST status = %d, want 403", code)
+	if code := send(""); code != http.StatusUnauthorized {
+		t.Errorf("no key: status = %d, want 401", code)
+	}
+	if code := send("edit-key"); code != http.StatusForbidden {
+		t.Errorf("edit key: status = %d, want 403", code)
 	}
 	if len(mock.imported) != 0 {
-		t.Fatalf("viewer request imported %+v", mock.imported)
+		t.Fatalf("refused requests imported %+v", mock.imported)
 	}
-	if code := send(setAuthContext(newReq(), 1, "editor-user", "editor", "jwt")); code != http.StatusOK {
-		t.Errorf("editor POST status = %d, want 200", code)
+	if code := send("admin-key"); code != http.StatusOK {
+		t.Errorf("admin key: status = %d, want 200", code)
 	}
 	if len(mock.imported) != 1 {
 		t.Errorf("imported = %+v, want 1 row", mock.imported)

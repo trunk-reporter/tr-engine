@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"net/http"
@@ -49,9 +50,23 @@ type subscribeMsg struct {
 }
 
 // HandleStream upgrades to WebSocket and streams live audio frames to the client.
+//
+// Frames reach the client only if the connection's principal may hear them
+// (audio.PrincipalAllows, §7.4), whatever its subscribe messages ask for. The
+// principal is re-checked every 60 s and when the auth generation moves
+// (§7.5): a change that keeps listen is applied in place; otherwise the
+// socket is closed with 4401 or 4403 and the signal as the reason. A ticket
+// connection is closed when its ticket expires.
 func (h *AudioStreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 	if h.streamer == nil || !h.streamer.AudioStreamEnabled() {
 		WriteError(w, http.StatusNotFound, "live audio streaming is not enabled")
+		return
+	}
+
+	guard := newStreamGuard(r, h.log)
+	if guard == nil {
+		// Only reachable without the auth pipeline: fail closed.
+		WriteErrorWithCode(w, http.StatusForbidden, ErrForbidden, "no credential was resolved for this stream")
 		return
 	}
 
@@ -72,9 +87,15 @@ func (h *AudioStreamHandler) HandleStream(w http.ResponseWriter, r *http.Request
 
 	connStart := time.Now()
 
-	// Subscribe with empty filter (receives nothing until client sends subscribe)
-	frameCh, cancel := h.streamer.SubscribeAudio(audio.AudioFilter{TGIDs: []int{-1}})
+	// Subscribe with empty filter (receives nothing until client sends
+	// subscribe). The principal is fixed here, apart from the filter the
+	// client controls.
+	frameCh, cancel := h.streamer.SubscribeAudio(audio.AudioFilter{TGIDs: []int{-1}}, &guard.principal)
 	defer cancel()
+
+	ctx, stop := context.WithCancel(r.Context())
+	defer stop()
+	authLost := guard.watch(ctx)
 
 	// Control channel for messages from the reader goroutine
 	controlCh := make(chan subscribeMsg, 4)
@@ -114,6 +135,15 @@ func (h *AudioStreamHandler) HandleStream(w http.ResponseWriter, r *http.Request
 			h.log.Info().Str("remote", r.RemoteAddr).Msg("audio stream client disconnected")
 			return
 
+		case signal := <-authLost:
+			msg := websocket.FormatCloseMessage(wsCloseCode(signal), signal)
+			if err := conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(time.Second)); err != nil {
+				h.log.Debug().Err(err).Msg("write close frame failed")
+			}
+			h.log.Info().Str("remote", r.RemoteAddr).Str("code", signal).
+				Msg("audio stream closed: its credential no longer allows it")
+			return
+
 		case ctrl := <-controlCh:
 			switch ctrl.Type {
 			case "subscribe":
@@ -135,6 +165,11 @@ func (h *AudioStreamHandler) HandleStream(w http.ResponseWriter, r *http.Request
 		case frame, ok := <-frameCh:
 			if !ok {
 				return
+			}
+			// The principal may have been narrowed since the frame was
+			// queued.
+			if !audio.PrincipalAllows(guard.principal.Load(), frame) {
+				continue
 			}
 
 			// Binary frame format (14-byte header + audio data):

@@ -5,8 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/snarg/tr-engine/internal/auth"
 )
 
 // mockLiveData implements LiveDataSource for testing affiliations.
@@ -15,11 +19,12 @@ type mockLiveData struct {
 }
 
 func (m *mockLiveData) ActiveCalls() []ActiveCallData                   { return nil }
-func (m *mockLiveData) LatestRecorders() []RecorderStateData            { return nil }
+func (m *mockLiveData) LatestRecorders() []RecorderStateData            { return []RecorderStateData{} }
 func (m *mockLiveData) TRInstanceStatus() []TRInstanceStatusData        { return nil }
 func (m *mockLiveData) UnitAffiliations() []UnitAffiliationData         { return m.affiliations }
-func (m *mockLiveData) Subscribe(EventFilter) (<-chan SSEEvent, func()) { return nil, func() {} }
-func (m *mockLiveData) ReplaySince(string, EventFilter) []SSEEvent      { return nil }
+func (m *mockLiveData) SubscribeSince(string, EventFilter, *atomic.Pointer[auth.Principal]) ([]SSEEvent, <-chan SSEEvent, func()) {
+	return nil, nil, func() {}
+}
 func (m *mockLiveData) WatcherStatus() *WatcherStatusData               { return nil }
 func (m *mockLiveData) TranscriptionStatus() *TranscriptionStatusData   { return nil }
 func (m *mockLiveData) EnqueueTranscription(int64) bool                 { return false }
@@ -272,7 +277,13 @@ func TestListAffiliations(t *testing.T) {
 	})
 
 	t.Run("summary_counts_only_affiliated", func(t *testing.T) {
-		h := NewAffiliationsHandler(&mockLiveData{affiliations: sampleAffiliations()})
+		// A unit on talkgroup 100 of system 2 as well, which must not be
+		// counted with talkgroup 100 of system 1.
+		affs := append(sampleAffiliations(), UnitAffiliationData{
+			SystemID: 2, Sysid: "BEE01", UnitID: 52, Tgid: 100, Status: "affiliated",
+			LastEventTime: time.Now().UTC(), AffiliatedSince: time.Now().UTC(),
+		})
+		h := NewAffiliationsHandler(&mockLiveData{affiliations: affs})
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/unit-affiliations", nil)
 		h.ListAffiliations(rec, req)
@@ -287,15 +298,36 @@ func TestListAffiliations(t *testing.T) {
 			t.Fatal("talkgroup_counts is not a map")
 		}
 
-		// tgid 100: 2 affiliated (items 0,4; item 2 is "off"), tgid 200: 1, tgid 300: 1
-		if v, ok := counts["100"]; !ok || int(v.(float64)) != 2 {
-			t.Errorf("talkgroup_counts[100] = %v, want 2", v)
+		// Keyed system_id:tgid. 1:100: 2 affiliated (items 0,4); 2:100: 1
+		// (item 2 is "off", item 5 affiliated); 1:200: 1; 2:300: 1.
+		want := map[string]int{"1:100": 2, "2:100": 1, "1:200": 1, "2:300": 1}
+		if len(counts) != len(want) {
+			t.Errorf("talkgroup_counts = %v, want %v", counts, want)
 		}
-		if v, ok := counts["200"]; !ok || int(v.(float64)) != 1 {
-			t.Errorf("talkgroup_counts[200] = %v, want 1", v)
-		}
-		if v, ok := counts["300"]; !ok || int(v.(float64)) != 1 {
-			t.Errorf("talkgroup_counts[300] = %v, want 1", v)
+		for k, n := range want {
+			if v, ok := counts[k]; !ok || int(v.(float64)) != n {
+				t.Errorf("talkgroup_counts[%s] = %v, want %d", k, v, n)
+			}
 		}
 	})
+
+	t.Run("summary_counts_empty_is_object", func(t *testing.T) {
+		h := NewAffiliationsHandler(&mockLiveData{})
+		rec := httptest.NewRecorder()
+		h.ListAffiliations(rec, httptest.NewRequest("GET", "/unit-affiliations", nil))
+		if !strings.Contains(rec.Body.String(), `"talkgroup_counts":{}`) {
+			t.Errorf("body = %s, want an empty talkgroup_counts object", rec.Body.String())
+		}
+	})
+}
+
+func TestListRecordersEmpty(t *testing.T) {
+	// The pipeline returns [] when it knows no recorders; the handler must
+	// keep it an array, never null.
+	h := NewRecordersHandler(&mockLiveData{})
+	rec := httptest.NewRecorder()
+	h.ListRecorders(rec, httptest.NewRequest("GET", "/recorders", nil))
+	if !strings.Contains(rec.Body.String(), `"recorders":[]`) {
+		t.Errorf("body = %s, want \"recorders\":[]", rec.Body.String())
+	}
 }

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <script src="auth.js?v=1"></script>
+  <script src="auth.js?v=3"></script>
   <meta name="card-title" content="Drift">
   <meta name="card-description" content="Logarithmic timeline — events drift from now into the past">
   <meta name="card-order" content="1">
@@ -672,15 +672,14 @@
       const el = document.createElement('div');
       el.className = 'lane-label';
       el.style.top = laneY(entry.lane) + 'px';
-      el.innerHTML = escHTML(entry.label) + (tgid ? `<span class="lane-tgid">${tgid}</span>` : '');
+      el.innerHTML = escHTML(entry.label) + (tgid ? `<span class="lane-tgid">${escHTML(tgid)}</span>` : '');
       laneLabelsEl.appendChild(el);
     }
     statTg.textContent = tgLaneMap.size;
   }
 
   function escHTML(s) {
-    if (s == null) return '';
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return trAuth.escapeHTML(s);
   }
 
   // ── Age formatting ──────────────────────────────────

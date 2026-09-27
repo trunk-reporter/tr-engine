@@ -23,7 +23,6 @@ import (
 	"github.com/snarg/tr-engine/internal/transcribe"
 	"github.com/snarg/tr-engine/internal/trconfig"
 	"github.com/snarg/tr-engine/internal/unittags"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // version, commit, and buildTime are injected at build time via ldflags.
@@ -56,13 +55,17 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Check for subcommands (export, import)
+	// Check for subcommands (export, import, keys, access)
 	if args := flag.Args(); len(args) > 0 {
 		switch args[0] {
 		case "export":
 			runExport(args[1:], overrides)
 		case "import":
 			runImport(args[1:], overrides)
+		case "keys":
+			os.Exit(runKeys(args[1:], overrides))
+		case "access":
+			os.Exit(runAccess(args[1:], overrides))
 		default:
 			fmt.Fprintf(os.Stderr, "unknown subcommand: %s\n", args[0])
 			os.Exit(1)
@@ -125,8 +128,11 @@ func main() {
 	}
 	defer db.Close()
 
-	// Auto-apply schema on fresh database (no-op if tables already exist)
-	if err := db.InitSchema(ctx, trengine.SchemaSQL); err != nil {
+	// Auto-apply schema on fresh database (no-op if tables already exist).
+	// freshDatabase: this process created the schema, so there is no old
+	// auth configuration to carry over.
+	freshDatabase, err := db.ApplySchemaIfEmpty(ctx, trengine.SchemaSQL)
+	if err != nil {
 		log.Fatal().Err(err).Msg("schema initialization failed")
 	}
 
@@ -141,28 +147,12 @@ func main() {
 	// Fatal on failure: continuing would silently replace those edits.
 	keepPreUpgradeTagEdits(ctx, db, discovered, cfg.WatchInstanceID, log)
 
-	// Seed admin user if ADMIN_PASSWORD is set and no users exist
-	if cfg.AdminPassword != "" {
-		count, err := db.CountUsers(ctx)
-		if err != nil {
-			log.Warn().Err(err).Msg("failed to check user count for seeding")
-		} else if count == 0 {
-			hash, err := bcrypt.GenerateFromPassword([]byte(cfg.AdminPassword), bcrypt.DefaultCost)
-			if err != nil {
-				log.Fatal().Err(err).Msg("failed to hash admin password")
-			}
-			if _, err := db.CreateUser(ctx, cfg.AdminUsername, string(hash), "admin"); err != nil {
-				if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "unique constraint") {
-					log.Info().Str("username", cfg.AdminUsername).Msg("admin user already exists (seeded by another instance)")
-				} else {
-					log.Fatal().Err(err).Msg("failed to seed admin user")
-				}
-			} else {
-				log.Info().Str("username", cfg.AdminUsername).Msg("admin user seeded")
-			}
-		}
-	} else {
-		log.Info().Msg("ADMIN_PASSWORD not set — user auth not configured (legacy token mode)")
+	// Access control: the one-time legacy import, warnings for the removed
+	// auth variables, the ticket secret and the bootstrap admin key.
+	_, dockerErr := os.Stat("/.dockerenv")
+	isDocker := dockerErr == nil
+	if err := setupAuth(ctx, db, cfg, freshDatabase, isDocker, os.Stderr, log); err != nil {
+		log.Fatal().Err(err).Msg("auth setup failed")
 	}
 
 	// Audio storage (local disk default, optional S3)
@@ -290,6 +280,7 @@ func main() {
 		RetentionTrunkingMessages: cfg.RetentionTrunkingMessages,
 		RetentionCheckpoints:      cfg.RetentionCheckpoints,
 		RetentionStaleCalls:       cfg.RetentionStaleCalls,
+		RetentionAuditLog:         cfg.RetentionAuditLog,
 		StreamListen:      cfg.StreamListen,
 		StreamInstanceID:  cfg.StreamInstanceID,
 		StreamIdleTimeout: cfg.StreamIdleTimeout,
@@ -407,32 +398,6 @@ func main() {
 		}
 	}
 
-	// Auth mode detection and deprecation warnings
-	switch {
-	case cfg.AuthToken == "" && cfg.AdminPassword == "":
-		log.Warn().Msg("WARNING: running in open mode — API is completely unprotected. Set AUTH_TOKEN or ADMIN_PASSWORD to enable authentication.")
-	case cfg.AuthToken != "" && cfg.AdminPassword == "":
-		log.Info().Msg("auth mode: token (shared API token)")
-	case cfg.AdminPassword != "":
-		if cfg.AuthToken != "" {
-			log.Info().Msg("auth mode: full (JWT login + public read via AUTH_TOKEN)")
-		} else {
-			log.Info().Msg("auth mode: full (JWT login required for all access)")
-		}
-	}
-	if !cfg.AuthEnabled {
-		log.Warn().Msg("AUTH_ENABLED=false: API authentication is disabled — AUTH_TOKEN, WRITE_TOKEN, ADMIN_PASSWORD and JWT_SECRET are ignored. AUTH_ENABLED is deprecated; remove AUTH_TOKEN and ADMIN_PASSWORD instead")
-	}
-	if cfg.JWTSecretIgnored {
-		log.Warn().Msg("JWT_SECRET is set without ADMIN_PASSWORD and has been ignored — set ADMIN_PASSWORD to enable user login")
-	}
-	if cfg.WriteToken != "" {
-		log.Warn().Msg("WRITE_TOKEN is deprecated — use ADMIN_PASSWORD for write access control. WRITE_TOKEN will be ignored in a future release.")
-	}
-	if cfg.JWTSecret != "" {
-		log.Info().Msg("JWT user authentication enabled")
-	}
-
 	// Detect ingest modes and Docker for update checker
 	var ingestModes []string
 	if cfg.MQTTBrokerURL != "" {
@@ -442,8 +407,6 @@ func main() {
 		ingestModes = append(ingestModes, "watch")
 	}
 	ingestModes = append(ingestModes, "upload") // always available
-	_, dockerErr := os.Stat("/.dockerenv")
-	isDocker := dockerErr == nil
 
 	// HTTP Server
 	httpLog := log.With().Str("component", "http").Logger()

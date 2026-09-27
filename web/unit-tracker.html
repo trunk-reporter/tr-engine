@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<script src="auth.js?v=1"></script>
+<script src="auth.js?v=3"></script>
 <meta name="card-title" content="Unit Tracker">
 <meta name="card-description" content="Real-time unit affiliations and activity tracking">
 <meta name="card-order" content="7">
@@ -334,8 +334,10 @@ table-wrap { overflow-x: auto; }
     return Math.round(diff / 86400) + 'd ago';
   }
 
+  var esc = function(s) { return trAuth.escapeHTML(s); };
+
   function loadError(msg) {
-    errorPanel.innerHTML = '<div class="error-card">Failed to load data: ' + msg + '</div>';
+    errorPanel.innerHTML = '<div class="error-card">Failed to load data: ' + esc(msg) + '</div>';
   }
 
   function renderAffiliations(data) {
@@ -391,19 +393,19 @@ table-wrap { overflow-x: auto; }
       var isAff = primary.status === 'affiliated';
       html += '<div class="unit-card ' + (isAff ? 'affiliated' : 'inactive') + '">';
       html += '<div class="card-top">';
-      html += '<span class="unit-id">' + uid + '</span>';
+      html += '<span class="unit-id">' + esc(uid) + '</span>';
       html += '<span class="badge ' + (isAff ? 'affiliated' : 'inactive') + '">' + (isAff ? 'ACTIVE' : 'INACTIVE') + '</span>';
       html += '</div>';
-      html += '<div class="alpha-tag">' + (primary.unit_alpha_tag || '—') + '</div>';
+      html += '<div class="alpha-tag">' + esc(primary.unit_alpha_tag || '—') + '</div>';
       if (isAff && primary.tgid) {
-        html += '<div class="card-row"><span class="label">Talkgroup</span><span class="value">' + primary.tgid;
-        html += (primary.tg_alpha_tag ? ' — ' + primary.tg_alpha_tag : '') + '</span></div>';
+        html += '<div class="card-row"><span class="label">Talkgroup</span><span class="value">' + esc(primary.tgid);
+        html += (primary.tg_alpha_tag ? ' — ' + esc(primary.tg_alpha_tag) : '') + '</span></div>';
       }
-      html += '<div class="card-row"><span class="label">Last seen</span><span class="value">' + formatTime(primary.last_change) + ' (' + timeAgo(primary.last_change) + ')</span></div>';
+      html += '<div class="card-row"><span class="label">Last seen</span><span class="value">' + esc(formatTime(primary.last_change)) + ' (' + esc(timeAgo(primary.last_change)) + ')</span></div>';
       if (primary.site_short_name) {
-        html += '<div class="card-row"><span class="label">Site</span><span class="value">' + primary.site_short_name + '</span></div>';
+        html += '<div class="card-row"><span class="label">Site</span><span class="value">' + esc(primary.site_short_name) + '</span></div>';
       } else if (primary.system_name) {
-        html += '<div class="card-row"><span class="label">System</span><span class="value">' + primary.system_name + '</span></div>';
+        html += '<div class="card-row"><span class="label">System</span><span class="value">' + esc(primary.system_name) + '</span></div>';
       }
       html += '</div>';
     });
@@ -416,10 +418,10 @@ table-wrap { overflow-x: auto; }
     // Render matrix table
     var matrixHtml = '';
     affiliations.forEach(function(a) {
-      matrixHtml += '<tr><td><b>' + a.unit_id + '</b></td><td>' + (a.unit_alpha_tag || '—') + '</td>';
-      matrixHtml += '<td>' + (a.tgid ? a.tgid + (a.tg_alpha_tag ? ' — ' + a.tg_alpha_tag : '') : '—') + '</td>';
-      matrixHtml += '<td>' + (a.tg_alpha_tag ? '' : (a.tag || '—')) + '</td>';
-      matrixHtml += '<td>' + formatTime(a.last_change) + '</td></tr>';
+      matrixHtml += '<tr><td><b>' + esc(a.unit_id) + '</b></td><td>' + esc(a.unit_alpha_tag || '—') + '</td>';
+      matrixHtml += '<td>' + esc(a.tgid ? a.tgid + (a.tg_alpha_tag ? ' — ' + a.tg_alpha_tag : '') : '—') + '</td>';
+      matrixHtml += '<td>' + esc(a.tg_alpha_tag ? '' : (a.tag || '—')) + '</td>';
+      matrixHtml += '<td>' + esc(formatTime(a.last_change)) + '</td></tr>';
     });
     matrixBody.innerHTML = matrixHtml || '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:32px;">No data</td></tr>';
   }

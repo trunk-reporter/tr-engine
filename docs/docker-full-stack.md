@@ -82,11 +82,6 @@ DASHBOARD_DOMAIN=dashboard.example.com
 MQTT_USERNAME=trengine
 MQTT_PASSWORD=your-mqtt-password-here
 
-# STRONGLY RECOMMENDED — full API auth
-ADMIN_PASSWORD=$(openssl rand -base64 32)
-# Optional public read token returned by /auth-init.
-AUTH_TOKEN=$(openssl rand -base64 32)
-
 # Optional — match your TR plugin's topic prefix
 MQTT_TOPICS=trengine/#
 ```
@@ -94,14 +89,13 @@ MQTT_TOPICS=trengine/#
 Generate secure random secrets:
 
 ```bash
-# Run these and paste the output into .env
-openssl rand -base64 32   # → ADMIN_PASSWORD
-openssl rand -base64 32   # → AUTH_TOKEN (optional public read token)
+# Run these and paste the output into .env (.env files are not run by a
+# shell: a literal $(openssl ...) would become the password itself)
 openssl rand -hex 24      # → POSTGRES_PASSWORD
 openssl rand -hex 16      # → MQTT_PASSWORD
 ```
 
-> **Important:** For public deployments, set `ADMIN_PASSWORD` so writes require login, role checks, or API keys. `AUTH_TOKEN` is optional in full mode; when set, it acts as a public read token returned by `/auth-init`.
+> **Access control is not in `.env`.** tr-engine uses API keys and an anonymous access policy stored in the database. On first start it prints an admin key to its log ([step 7](#7-verify)); you then decide whether visitors without a key may listen. See [auth.md](./auth.md).
 
 Key variables:
 
@@ -114,9 +108,7 @@ Key variables:
 | `DASHBOARD_DOMAIN` | Yes | Domain for the tr-dashboard frontend |
 | `MQTT_USERNAME` | Yes | MQTT broker credentials (shared with trunk-recorder) |
 | `MQTT_PASSWORD` | Yes | MQTT broker password |
-| `ADMIN_PASSWORD` | Strongly recommended | Enables full auth, admin login, JWT sessions, and API keys |
-| `AUTH_TOKEN` | Optional | Public read token in full mode, or shared token in token mode |
-| `WRITE_TOKEN` | No | Deprecated legacy write token |
+| `TRUSTED_PROXIES` | No | Proxies whose `X-Forwarded-For` is believed for per-IP rate limits (default `loopback,private`, which covers Caddy on the compose network) |
 
 See [`sample.env`](https://github.com/trunk-reporter/tr-engine/blob/master/sample.env) for all available options. Settings like `TR_DIR`, transcription, file watch, and S3 storage are documented in the [Docker Compose guide](./docker.md).
 
@@ -155,11 +147,19 @@ api.example.com {
 }
 
 dashboard.example.com {
-    reverse_proxy tr-dashboard:3000
+    # The dashboard calls /api/v1 on its own origin; send that to tr-engine.
+    handle /api/* {
+        reverse_proxy tr-engine:8080
+    }
+    handle {
+        reverse_proxy tr-dashboard:3000
+    }
 }
 ```
 
-The dashboard and built-in web pages discover auth mode through `GET /api/v1/auth-init`, so Caddy does not need to inject auth headers. If you are upgrading from an older config that has an `@no_auth` injection block, it is harmless to leave in place during migration, but it is no longer required.
+(Alternatively, set `VITE_API_BASE: https://api.example.com/api/v1` on the `tr-dashboard` service and drop the `/api/*` block: tr-engine answers requests from any origin.)
+
+**Never make Caddy add an `Authorization` header.** Older configs had an `@no_auth` / `request_header ... Authorization "Bearer ..."` block that injected a token into anonymous requests. Remove it: an injected key is a key every visitor has. To let visitors listen without a key, set the anonymous access policy instead ([step 7](#7-verify)).
 
 ## 5. DNS records
 
@@ -192,7 +192,7 @@ On first run:
 - PostgreSQL initializes and tr-engine auto-applies the database schema
 - Caddy obtains HTTPS certificates (may take 30-60 seconds)
 - Mosquitto starts with authentication enabled
-- tr-engine connects to PostgreSQL and Mosquitto
+- tr-engine connects to PostgreSQL and Mosquitto, creates an admin API key and prints it once to its log
 
 ## 7. Verify
 
@@ -209,6 +209,32 @@ curl -s https://api.example.com/api/v1/health | python3 -m json.tool
 # Test MQTT login (anonymous clients get "not authorised")
 docker compose exec mosquitto mosquitto_pub -h localhost -u trengine -P 'YOUR_MQTT_PASSWORD' -t test -m hello
 ```
+
+**Get your admin key.** tr-engine printed it once, in a box, on its first start:
+
+```bash
+docker compose logs tr-engine | grep -A3 "no admin API key"
+curl -s -H "Authorization: Bearer tre_..." https://api.example.com/api/v1/whoami
+```
+
+Store it in a password manager, then create a named key for each client and revoke the bootstrap key:
+
+```bash
+docker compose exec -T tr-engine tr-engine keys create --name "admin (me)" --scopes admin
+docker compose exec -T tr-engine tr-engine keys create --name "tr-dashboard (me)" --scopes edit
+docker compose exec -T tr-engine tr-engine keys list
+docker compose exec -T tr-engine tr-engine keys revoke --prefix tre_xxxxxxxx   # the bootstrap key's prefix
+```
+
+**Decide on public access.** Anonymous access is off, so visitors see the dashboard's "Connect to tr-engine" screen. For a public listening site:
+
+```bash
+docker compose exec -T tr-engine tr-engine access set --anonymous listen
+# or everything except sensitive talkgroups:
+docker compose exec -T tr-engine tr-engine access set --anonymous listen --all-talkgroups --exclude-talkgroups 1:5001
+```
+
+Visitors without a key can then browse and listen read-only; you paste your `edit` or `admin` key into the dashboard (Settings → API key) to make changes. Never put an `edit` or `admin` key into a page other people load. See [auth.md](./auth.md).
 
 Access your deployment:
 - **API + Web UI:** `https://api.example.com`
@@ -259,6 +285,8 @@ docker compose pull && docker compose up -d
 
 All persistent data lives in bind-mounted directories (`pgdata/`, `audio/`) and named volumes (`mosquitto-data`, `caddy-data`). Check release notes for schema migrations.
 
+> **Upgrading from `AUTH_TOKEN` / `ADMIN_PASSWORD` (before v0.10.0):** back up the database, pin matching tr-engine and tr-dashboard versions, remove any Caddy `Authorization` injection block, and follow [migrating-auth.md](./migrating-auth.md).
+
 > **Security defaults changed.** `BIND_IP` and `POSTGRES_PASSWORD` are now required, Mosquitto and postgres-exporter bind to `127.0.0.1` (set `MQTT_BIND_IP` if remote trunk-recorders publish to this broker), and MQTT requires a login. If your database was created without `POSTGRES_PASSWORD`, its password is still `trengine`: rotate it before switching to the new compose file. See [Security defaults changed](./docker.md#security-defaults-changed).
 
 ## Logs
@@ -298,8 +326,10 @@ docker compose restart mosquitto
 
 If Mosquitto logs `Unable to open pwfile`, the file is missing or not owned by the `mosquitto` user; rerun the command above.
 
-**Write operations failing (403):** Log in with an editor/admin user, or use an API key with write access. For upload plugins, create a `tre_...` API key and use it as the plugin API key. The legacy `WRITE_TOKEN` path still works during the deprecation period.
+**Changes failing with 403 `insufficient_scope`:** the key in use lacks the scope (the message names it). Tag edits need an `edit` key; merges, maintenance and key management need `admin`. Upload plugins need a key with the `upload` scope (`tr-engine keys create --name "tr uploads" --scopes upload`).
 
-**Dashboard can't reach the API:** The tr-dashboard container connects to tr-engine via the Docker network (`http://tr-engine:8080`). Check that `TR_AUTH_TOKEN` in the compose file matches your `AUTH_TOKEN`.
+**Every request fails with 401 `invalid_key`:** the key was revoked, expired or mistyped, or a proxy injects an `Authorization` header. Check `docker compose exec -T tr-engine tr-engine keys list --all` and remove any injection block from the Caddyfile.
 
-**Web UI prompts for token:** In token mode, enter `AUTH_TOKEN`. In full mode, log in with your admin user. If you intended open mode, make sure both `AUTH_TOKEN` and `ADMIN_PASSWORD` are unset and the service has been restarted with `docker compose up -d`.
+**Dashboard can't reach the API:** the dashboard calls `/api/v1` on its own domain, so the Caddyfile must route `/api/*` on the dashboard domain to `tr-engine:8080` (see [step 4](#4-set-up-caddy)), or `VITE_API_BASE` must point at the API domain.
+
+**Visitors see a "Connect to tr-engine" / API key prompt:** anonymous access is `off`. Paste a key, or allow anonymous listening with `docker compose exec -T tr-engine tr-engine access set --anonymous listen`. More in [auth.md](./auth.md#troubleshooting).

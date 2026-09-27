@@ -1,5 +1,7 @@
 # auth.js Consolidation Design
 
+> **Superseded by [2026-09-26-api-key-auth-design.md](2026-09-26-api-key-auth-design.md).** tr-engine now uses API keys, an anonymous access policy and tickets; the modes, tokens, logins and users described here no longer exist. Kept as a historical record. Current docs: `docs/auth.md`, `docs/migrating-auth.md`.
+
 ## Problem
 
 The web UI has inconsistent auth handling across pages. Each page that does write operations re-implements its own 403 handling, write-token prompting, and token storage. Some pages (units.html, irc-radio-live.html) are broken — they don't handle 403 at all or lose the write token on reload. Meanwhile, the JWT user auth system (login/roles/API keys) was added server-side but none of the embedded web pages know about it.

@@ -712,7 +712,7 @@ CREATE TABLE unit_tag_suggestions (
     previous_tag         text,        -- units.alpha_tag before approval
     previous_tag_source  text,        -- units.alpha_tag_source before approval
     decided_at           timestamptz,
-    decided_by           text,        -- username / API key label, if authenticated
+    decided_by           text,        -- key name (+ " / <actor>") that decided
     created_at           timestamptz  NOT NULL DEFAULT now(),
     updated_at           timestamptz  NOT NULL DEFAULT now(),
 
@@ -733,6 +733,66 @@ CREATE TABLE scan_cursors (
     last_id     bigint       NOT NULL DEFAULT 0,
     updated_at  timestamptz  NOT NULL DEFAULT now()
 );
+
+-- ============================================================
+-- 24. api_keys (client credentials, permanent, low volume)
+--     Every client (dashboard, script, upload plugin, website
+--     backend) holds one. Only the SHA-256 of the secret is
+--     stored; revocation is a soft delete (revoked_at).
+-- ============================================================
+
+CREATE TABLE api_keys (
+    id              serial       PRIMARY KEY,
+    key_hash        text         UNIQUE NOT NULL,   -- SHA-256 hex of the secret
+    key_prefix      text         NOT NULL,          -- 'tre_' + 8 hex, or 'legacy_' + 6 hex of key_hash
+    name            text         NOT NULL,
+    scopes          text[]       NOT NULL,          -- sorted: admin, edit, listen, upload
+    restriction     jsonb,                          -- NULL = unrestricted (listen-only keys)
+    expires_at      timestamptz,                    -- NULL = never
+    revoked_at      timestamptz,
+    rate_limit_rps  real,                           -- NULL = no per-key limit
+    legacy          boolean      NOT NULL DEFAULT false, -- imported AUTH_TOKEN/WRITE_TOKEN
+    created_at      timestamptz  NOT NULL DEFAULT now(),
+    last_used_at    timestamptz,
+
+    CONSTRAINT api_keys_scopes_check CHECK (cardinality(scopes) > 0)
+);
+
+CREATE INDEX idx_api_keys_key_hash ON api_keys (key_hash);
+
+-- ============================================================
+-- 25. auth_settings (engine-wide auth state, permanent)
+--     anonymous_access      {"access": "off"|"listen", "restriction": ...}
+--     ticket_secret         base64 of 32 random bytes (delete to rotate)
+--     retired_public_token  SHA-256 hex of the pre-upgrade public AUTH_TOKEN
+--     weak_legacy_keys      [{"id", "length"}] imported keys under 16 characters
+-- ============================================================
+
+CREATE TABLE auth_settings (
+    name        text         PRIMARY KEY,
+    value       jsonb        NOT NULL,
+    updated_at  timestamptz  NOT NULL DEFAULT now()
+);
+
+-- ============================================================
+-- 26. audit_log (state-changing API requests made with a key)
+--     Retention: RETENTION_AUDIT_LOG (default 1 year).
+-- ============================================================
+
+CREATE TABLE audit_log (
+    id          bigserial    PRIMARY KEY,
+    "time"      timestamptz  NOT NULL DEFAULT now(),
+    key_id      int          NOT NULL,
+    key_name    text         NOT NULL,
+    actor       text,                    -- sanitized X-Actor header, if any
+    method      text         NOT NULL,
+    path        text         NOT NULL,   -- without the query string
+    status      int          NOT NULL,   -- as received by the client
+    request_id  text
+);
+
+CREATE INDEX idx_audit_log_time     ON audit_log ("time" DESC);
+CREATE INDEX idx_audit_log_key_time ON audit_log (key_id, "time" DESC);
 
 -- ============================================================
 -- Helper: create_monthly_partition()

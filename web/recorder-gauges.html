@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <script src="auth.js?v=1"></script>
+  <script src="auth.js?v=3"></script>
   <meta name="card-title" content="Recorder Gauges">
   <meta name="card-description" content="Recorder health dashboard with signal, TG, and call metrics">
   <meta name="card-order" content="23">
@@ -202,7 +202,7 @@
         document.getElementById('totalRecorders').textContent = ' · ' + recorders.length + ' recorders';
 
       } catch(e) {
-        grid.innerHTML = '<div class="error-msg">Error loading recorder data: ' + e.message + '</div>';
+        grid.innerHTML = '<div class="error-msg">Error loading recorder data: ' + trAuth.escapeHTML(e.message) + '</div>';
         console.error('Recorder gauges load error:', e);
       }
     }

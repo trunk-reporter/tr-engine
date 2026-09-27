@@ -12,11 +12,13 @@ Live demo: [tr-engine.luxprimatech.com/playground.html](https://tr-engine.luxpri
 
 ### Integrated (recommended for tr-engine users)
 
-Pages live in tr-engine's `web/` directory and use the built-in theme system and auto-auth. They appear in the nav dropdown automatically.
+Pages live in tr-engine's `web/` directory and use the built-in theme system and `auth.js`, which handles API keys and tickets for them. They appear in the nav dropdown automatically.
 
 ### Standalone
 
-Self-contained HTML files that work from anywhere. The page connects to your tr-engine instance by URL and bootstraps auth via the `/auth-init` endpoint. Good for sharing, embedding, or running locally.
+Self-contained HTML files that work from anywhere. The page connects to your tr-engine instance by URL, checks what it may do with `GET /api/v1/whoami`, and uses an API key the user pastes in (or none, if the instance allows anonymous listening). Good for running locally or for your own use.
+
+> **A key in a page other people load is public.** Don't embed a key in a page you share. Shared or public pages should use no key (the operator's anonymous access policy decides what they can read), or talk to a server of your own that holds the key. See [auth.md](auth.md#the-one-rule-a-key-that-reaches-other-peoples-browsers-is-public).
 
 ## Manual Prompt Template
 
@@ -34,9 +36,25 @@ Use any endpoints you need. All endpoints are under /api/v1. Responses use {item
 
 ## Authentication
 Include this as the FIRST script in <head>:
-<script src="auth.js?v=1"></script>
+<script src="auth.js?v=3"></script>
 
-This automatically patches fetch() and EventSource to include auth headers. No manual auth code needed — just use fetch('/api/v1/...') normally.
+auth.js keeps the user's API key (if any) and handles auth for same-origin /api/ URLs:
+- fetch('/api/v1/...') gets the Authorization header automatically; call it normally.
+- new EventSource('/api/v1/events/stream?...') is replaced by a wrapper that mints a
+  short-lived ticket, reconnects with a fresh one and resumes without gaps.
+- For <audio>, set src to trAuth.mediaUrl('/api/v1/calls/' + id + '/audio'); if the
+  element fires 'error', retry once with: el.src = await trAuth.ticketUrl(url).
+- For WebSocket URLs, use: await trAuth.ticketUrl('/api/v1/audio/live').
+- await trAuth.ready() before the first request if the page needs to know who it is;
+  trAuth.hasScope('edit') / trAuth.hasScope('admin') gate edit and admin features.
+- Never put a key or token in a URL yourself, and never call /api/v1/auth-init
+  (it no longer exists).
+
+Handle errors: 401 key_required (no key and anonymous access is off: auth.js
+prompts for a key), 403 insufficient_scope (hide the feature), 403
+restricted_credential (the credential only sees some talkgroups; that endpoint is
+unavailable, so use Promise.allSettled when mixing calls).
+Render all API text with textContent, never innerHTML: names and tags can contain HTML.
 
 ## Theme System
 Include these scripts:
@@ -65,7 +83,9 @@ const es = new EventSource('/api/v1/events/stream?types=call_start,call_end');
 es.onmessage = (e) => { const data = JSON.parse(e.data); /* handle event */ };
 
 Filter options: systems, sites, tgids, units, types, emergency_only (all optional, AND-ed).
-Event types: call_start, call_end, unit_event, recorder_update, rate_update
+Event types: call_start, call_end, transcription, unit_event, recorder_update, rate_update
+(listen these with es.addEventListener('call_end', ...); console events reach admin keys only).
+call_end carries call_id but no audio_url: the audio is at /api/v1/calls/{call_id}/audio.
 
 ## What to Build
 {DESCRIPTION}
@@ -82,28 +102,59 @@ Read the full API spec here: https://raw.githubusercontent.com/trunk-reporter/tr
 Use any endpoints you need. All endpoints are under /api/v1. Responses use {items, total, limit, offset} pagination.
 
 ## Authentication
-The page needs to connect to a tr-engine instance. Include this auth bootstrap at the top of the page:
+tr-engine authenticates with API keys sent as "Authorization: Bearer <key>". There are
+no logins. CORS allows any origin (no cookies), so the page can call the engine directly.
 
-1. Show a config bar with an API URL input (default: window.location.origin) and a "Connect" button
-2. On connect, fetch {apiUrl}/api/v1/auth-init to get the Bearer token (this endpoint requires no auth)
-3. If successful, store the token and show a green connected indicator
-4. If it fails (CORS or network), show a manual "Auth Token" input field as fallback
-5. Create a helper function that wraps fetch to include the Authorization header:
+1. Show a config bar with an API URL input (default: window.location.origin), an optional
+   "API key" password field (keep the key in localStorage only if the user ticks
+   "remember"), and a "Connect" button.
+2. On connect, GET {apiUrl}/api/v1/whoami, with the Authorization header if a key was
+   entered. 200 → show a green indicator plus whoami.scopes. 401 invalid_key → "key
+   rejected". 404 → "this tr-engine is too old". If there is no key and
+   whoami.anonymous.access is "off", ask for a key.
+3. Wrap fetch:
 
 function apiFetch(path, opts = {}) {
-  return fetch(API_URL + path, {
-    ...opts,
-    headers: { ...opts.headers, 'Authorization': 'Bearer ' + TOKEN }
-  });
+  const headers = { ...opts.headers };
+  if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+  return fetch(API_URL + path, { ...opts, headers });
 }
 
-Use apiFetch('/api/v1/...') for all API calls.
+Use apiFetch('/api/v1/...') for all API calls. Never put the key in a URL.
+
+4. Browsers can't send headers on EventSource, <audio> or WebSocket. With a key, mint a
+   ticket first and put it in ?ticket= (tickets are short-lived and listen-only):
+
+async function ticketUrl(path) {
+  if (!KEY) return API_URL + path;               // anonymous: plain URL
+  const r = await apiFetch('/api/v1/tickets', { method: 'POST' });
+  const { ticket } = await r.json();
+  return API_URL + path + (path.includes('?') ? '&' : '?') + 'ticket=' + encodeURIComponent(ticket);
+}
+
+Error codes: 401 key_required / invalid_key / invalid_ticket, 403 insufficient_scope /
+restricted_credential (the key only sees some talkgroups; use Promise.allSettled when
+mixing calls). Render all API text with textContent, never innerHTML.
 
 ## SSE Real-Time Events
-For live updates:
-const url = API_URL + '/api/v1/events/stream?types=call_start,call_end&token=' + encodeURIComponent(TOKEN);
-const es = new EventSource(url);
-es.onmessage = (e) => { const data = JSON.parse(e.data); /* handle event */ };
+For live updates, create the EventSource yourself and reconnect with a fresh ticket:
+
+let lastId = null;
+async function connect() {
+  let path = '/api/v1/events/stream?types=call_start,call_end';
+  if (lastId) path += '&last_event_id=' + encodeURIComponent(lastId);
+  const es = new EventSource(await ticketUrl(path));
+  es.addEventListener('call_end', (e) => { lastId = e.lastEventId; const data = JSON.parse(e.data); /* handle */ });
+  es.addEventListener('auth', (e) => {           // the server is closing the stream
+    es.close();
+    if (JSON.parse(e.data).code === 'ticket_expired') connect();   // otherwise ask for a key
+  });
+  es.onerror = () => { es.close(); setTimeout(connect, 3000); };
+}
+connect();
+
+call_end carries call_id but no audio_url: play API_URL + '/api/v1/calls/{call_id}/audio'
+through ticketUrl() when a key is set.
 
 ## Styling
 Use a clean, modern dark theme. No external CSS frameworks needed — inline styles are fine.

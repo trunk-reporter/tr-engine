@@ -19,6 +19,19 @@ func (db *DB) CreateMonthlyPartition(ctx context.Context, table string, partitio
 	return result, err
 }
 
+// CreateMonthlyPartitionForTime creates the partition containing an instant.
+// Resolve its month in PostgreSQL, using the same session timezone that the SQL
+// helper uses for partition bounds. Formatting a date in Go can select another
+// month when the engine and database use different timezones.
+func (db *DB) CreateMonthlyPartitionForTime(ctx context.Context, table string, timestamp time.Time) (string, error) {
+	var result string
+	err := db.Pool.QueryRow(ctx,
+		`SELECT create_monthly_partition($1, date_trunc('month', $2::timestamptz)::date)`,
+		table, timestamp,
+	).Scan(&result)
+	return result, err
+}
+
 // CreateWeeklyPartition calls the SQL helper to create a weekly partition.
 // The function auto-aligns to Monday and is idempotent.
 func (db *DB) CreateWeeklyPartition(ctx context.Context, table string, partitionStart time.Time) (string, error) {

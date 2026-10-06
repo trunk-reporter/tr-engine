@@ -110,6 +110,8 @@ psql -U trengine -d trengine -f schema.sql
 
 This creates all tables, indexes, triggers, partition functions, and initial partitions (current month + 3 months ahead). Partition maintenance runs automatically within tr-engine after that.
 
+If an incoming call needs a missing monthly partition, tr-engine creates it and retries the insert. On-demand creation selects the timestamp's month in the PostgreSQL session timezone, which also determines the partition boundaries. The engine host can use a different timezone without selecting the wrong month at a boundary.
+
 ## 3. trunk-recorder
 
 [trunk-recorder](https://github.com/robotastic/trunk-recorder) captures P25/SmartNet/conventional radio traffic using SDR hardware (RTL-SDR, HackRF, etc.). Full setup is covered in the [trunk-recorder docs](https://trunkrecorder.com/docs/Install). This section covers only the MQTT plugin configuration that tr-engine needs.

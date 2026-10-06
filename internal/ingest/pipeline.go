@@ -1185,18 +1185,17 @@ func beginningOfMonth(t time.Time) time.Time {
 }
 
 // ensurePartitionsFor creates monthly partitions for all partitioned tables for
-// the month containing the given timestamp. Called on-demand when an insert
-// fails with "no partition found".
+// the month containing the given timestamp in the database timezone. Called
+// on-demand when an insert fails with "no partition found".
 func (p *Pipeline) ensurePartitionsFor(t time.Time) {
 	ctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
 	defer cancel()
 
-	month := beginningOfMonth(t)
 	tables := []string{"calls", "call_frequencies", "call_transmissions", "unit_events", "trunking_messages"}
 	for _, table := range tables {
-		result, err := p.db.CreateMonthlyPartition(ctx, table, month)
+		result, err := p.db.CreateMonthlyPartitionForTime(ctx, table, t)
 		if err != nil {
-			p.log.Warn().Err(err).Str("table", table).Time("month", month).Msg("failed to create on-demand partition")
+			p.log.Warn().Err(err).Str("table", table).Time("timestamp", t).Msg("failed to create on-demand partition")
 		} else if !strings.Contains(result, "already exists") {
 			p.log.Info().Str("result", result).Str("table", table).Msg("created on-demand partition")
 		}
